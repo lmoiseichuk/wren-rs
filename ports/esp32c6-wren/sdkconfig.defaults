@@ -1,0 +1,16 @@
+# Console on the built-in USB Serial/JTAG, not a UART -- the C6 exposes it on
+# the same connector that flashes it, so no extra wiring.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# **Wren recurses, in the compiler and in the VM.** The default 3.5 KB main task
+# stack is not enough for a recursive benchmark, and the failure mode is a stack
+# overflow that reads like a Wren bug rather than a configuration one.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Optimise for size. This is the reference implementation and the comparison is
+# partly about footprint, so building it the way somebody shipping it would.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# Panic straight to a reboot rather than into the debug monitor: a benchmark run
+# that dies should say so and come back, not sit waiting for a human.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y

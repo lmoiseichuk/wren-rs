@@ -101,9 +101,30 @@ one has to provide.
 | | |
 |---|---|
 | upstream submodule | pinned at 0.4.0 |
+| **step 1 — C reference on the C6** | **running, measured** |
+| step 2 — MicroPython baseline | not started |
 | Rust lexer | first pass written, host-tested |
 | Rust compiler, VM, GC | not started |
-| all three ports | not started |
+
+### What step 1 already established
+
+Upstream Wren runs on an ESP32-C6, and getting it there produced four findings
+that the Rust implementation inherits as requirements — see
+[`ports/esp32c6-wren`](ports/esp32c6-wren) for the detail.
+
+| | |
+|---|---|
+| image | 274 KB |
+| **VM resident** | **83 KB** |
+| **compiler stack** | **33 KB** |
+| `fib` / `tree` / `loop` | 752 / 1,898 / 1,901 ms |
+
+**Two of them bear on whether the small parts are reachable at all.** The
+compiler needs 33 KB of stack, which is four times a CH32V006's entire RAM — the
+strongest argument yet for step 4, where bytecode is built on a host so the part
+never carries a compiler. And upstream's default garbage-collector thresholds
+(10 MB before the first collection) mean that **out of the box it crashes on
+this class of part**, with a null store rather than a diagnostic.
 
 The lexer came first because it needs no hardware and is where the host tests
 start. Everything else waits on a board.
