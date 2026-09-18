@@ -1,0 +1,38 @@
+# The boards on this bench: `name  MAC  [hub  port]  [flags]  [# why]`.
+#
+# Copy to `devices.list` (gitignored) and put your own in. Every script that can
+# write to or power-cycle a device looks the board up here first, because
+# /dev/ttyACM<n> numbering shuffles between plug-ins and a guard keyed to
+# anything but the MAC is one replug away from protecting the wrong device.
+#
+# **The same file and the same scripts as the `moisture` and `lightning`
+# projects**, deliberately. Those benches share a workstation and a USB hub with
+# this one, so a wren-rs script that did not know about their boards could
+# happily reflash one. `tools/board.sh` and `tools/power.sh` are carried over
+# unchanged for that reason -- the guard is only worth having if every project
+# on the bench uses it.
+#
+# The MAC is on the by-id path the board enumerates as:
+#
+#     ls /dev/serial/by-id/
+#     usb-Espressif_USB_JTAG_serial_debug_unit_AA:BB:CC:DD:EE:FF-if00
+#                                              ^^^^^^^^^^^^^^^^^
+#
+# ## flags
+#
+#   forbidden   never write to it, never cut its power, wherever it is plugged.
+#               For a device belonging to another project, or a live one whose
+#               interruption costs more than the convenience of reaching it.
+#               The text after `#` is quoted back when a script refuses.
+#
+# The first entry is the default when no name is given.
+
+# name       MAC                  flags       # why
+c6           AA:BB:CC:DD:EE:FF                # the development board
+
+# **List the other projects' boards here too, flagged.** They are on the same
+# hub; this is what stops a wren-rs flash from landing on a live sensor.
+# lightning  B0:A6:04:06:E6:D4    forbidden   # a live lightning monitor, another project
+# mcp        10:BD:A3:CF:3D:A0    forbidden   # the moisture control panel
+# relay      80:F1:B2:51:36:E8    forbidden   # the moisture relay
+# ls         AC:27:6E:5C:38:84    forbidden   # the moisture large sensor
