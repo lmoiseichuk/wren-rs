@@ -8,7 +8,11 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::vec::Vec;
+
+use crate::bytecode::Chunk;
 
 use crate::value::Value;
 
@@ -22,11 +26,14 @@ pub use crate::handle::ObjectId;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObjectType {
     Class,
+    Closure,
+    Fn,
     Instance,
     List,
     Map,
     Range,
     String,
+    Upvalue,
 }
 
 /// A heap object.
@@ -62,6 +69,12 @@ pub enum Object {
     /// the right way round -- but it is a real cost on the dispatch path, which
     /// reaches a class on every single method call.
     Class(Box<ObjClass>),
+    /// A compiled function body. Boxed for the same reason a class is.
+    Fn(Box<ObjFn>),
+    /// A function plus the variables it captured.
+    Closure(Box<ObjClosure>),
+    /// One captured variable. See [`ObjUpvalue`].
+    Upvalue(ObjUpvalue),
     Instance(ObjInstance),
     List(ObjList),
     Map(ObjMap),
@@ -73,6 +86,9 @@ impl Object {
     pub fn object_type(&self) -> ObjectType {
         match self {
             Object::Class(_) => ObjectType::Class,
+            Object::Closure(_) => ObjectType::Closure,
+            Object::Fn(_) => ObjectType::Fn,
+            Object::Upvalue(_) => ObjectType::Upvalue,
             Object::Instance(_) => ObjectType::Instance,
             Object::List(_) => ObjectType::List,
             Object::Map(_) => ObjectType::Map,
@@ -100,6 +116,30 @@ impl Object {
                 // from under a class that is still in use.
                 if let Some(metaclass) = class.metaclass {
                     gray.push(metaclass);
+                }
+            }
+            Object::Fn(function) => {
+                // **A function's constants are references like any other.** A
+                // string literal in a function body is a heap object reachable
+                // only from here; missing it frees the literal out from under
+                // code that is about to load it.
+                for constant in &function.chunk.constants {
+                    if let Some(id) = constant.as_object() {
+                        gray.push(id);
+                    }
+                }
+            }
+            Object::Closure(closure) => {
+                gray.push(closure.function);
+                for upvalue in &closure.upvalues {
+                    gray.push(*upvalue);
+                }
+            }
+            Object::Upvalue(upvalue) => {
+                if let Some(value) = upvalue.closed {
+                    if let Some(id) = value.as_object() {
+                        gray.push(id);
+                    }
                 }
             }
             Object::Instance(instance) => {
@@ -154,6 +194,14 @@ impl Object {
             Object::Map(map) => map.entries.capacity() * core::mem::size_of::<MapEntry>(),
             Object::Range(_) => 0,
             Object::String(string) => string.bytes.capacity(),
+            // The chunk is shared through an `Rc`, so charging its full size
+            // to every closure over it would count the same bytes many times.
+            Object::Fn(_) => core::mem::size_of::<ObjFn>(),
+            Object::Closure(closure) => {
+                core::mem::size_of::<ObjClosure>()
+                    + closure.upvalues.capacity() * core::mem::size_of::<ObjectId>()
+            }
+            Object::Upvalue(_) => 0,
         };
         slot + inner
     }
@@ -335,11 +383,10 @@ impl ObjClass {
 }
 
 /// What a method call actually runs.
-///
-/// Only primitives so far. A method written in Wren is a closure, and closures
-/// arrive with the part of the compiler that can compile a function body.
 #[derive(Clone, Copy)]
 pub enum Method {
+    /// Implemented in Wren: a handle to an [`ObjClosure`].
+    Closure(ObjectId),
     /// Implemented in Rust.
     ///
     /// Takes the stack index of the receiver rather than a slice of arguments.
@@ -353,6 +400,7 @@ pub enum Method {
 impl core::fmt::Debug for Method {
     fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Method::Closure(id) => write!(out, "Closure({})", id.raw()),
             Method::Primitive(_) => out.write_str("Primitive"),
         }
     }
@@ -403,4 +451,57 @@ mod layout {
     const _: () = assert!(core::mem::size_of::<Box<ObjClass>>() == 4);
     const _: () = assert!(core::mem::size_of::<ObjInstance>() == 16);
     const _: () = assert!(core::mem::size_of::<MapEntry>() == 16);
+}
+
+/// A compiled function body.
+///
+/// The chunk is behind an `Rc` so that a call frame can hold onto it without
+/// borrowing the heap for the duration of the call — the interpreter loop
+/// mutates the stack on every instruction, and a `&Chunk` borrowed out of the
+/// heap would conflict with that on the very first push.
+#[derive(Debug)]
+pub struct ObjFn {
+    pub chunk: Rc<Chunk>,
+    pub arity: usize,
+    pub num_upvalues: usize,
+    /// For error messages and stack traces.
+    pub name: String,
+    /// Added to every field index this function's body uses.
+    ///
+    /// **A method's fields are numbered from zero by the compiler**, which
+    /// cannot know how many fields the superclass has — the superclass is a
+    /// runtime expression. The offset is filled in when the method is bound to
+    /// its class, at which point the superclass is known. Upstream solves the
+    /// same problem by rewriting the bytecode at bind time; a field added here
+    /// is the same fix without mutating a shared chunk.
+    pub field_offset: usize,
+    /// Where a `super` call in this body starts looking. Set at bind time,
+    /// alongside [`ObjFn::field_offset`], for the same reason.
+    pub super_class: Option<ObjectId>,
+}
+
+/// A function together with the variables it captured.
+///
+/// Every callable in Wren is one of these, even a function that captures
+/// nothing — upstream does the same, so there is one kind of call rather than
+/// two.
+#[derive(Debug)]
+pub struct ObjClosure {
+    pub function: ObjectId,
+    pub upvalues: Vec<ObjectId>,
+}
+
+/// One variable captured by a closure.
+///
+/// **Open** while the frame that owns it is still running: the variable is
+/// still a live stack slot, and reads go there, so an assignment in the
+/// enclosing function is visible to the closure. **Closed** once that frame
+/// returns: the value is copied in here, because the stack slot is about to be
+/// reused by something else.
+#[derive(Clone, Copy, Debug)]
+pub struct ObjUpvalue {
+    /// The absolute stack slot, while open.
+    pub slot: usize,
+    /// The captured value, once closed.
+    pub closed: Option<Value>,
 }

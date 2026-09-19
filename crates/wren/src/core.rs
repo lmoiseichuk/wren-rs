@@ -66,6 +66,7 @@ macro_rules! arithmetic {
 /// Install the core library into a fresh VM.
 pub fn install(vm: &mut Vm) {
     install_object(vm);
+    install_fn(vm);
     install_num(vm);
     install_bool(vm);
     install_null(vm);
@@ -97,6 +98,94 @@ fn install_object(vm: &mut Vm) {
         let text = vm.to_string(receiver(vm, at));
         Ok(vm.new_string(&text))
     });
+
+    // `a is B` walks up from `a`'s class looking for `B`, so it answers true
+    // for a superclass as well as for the exact class.
+    define(vm, class, "is(_)", |vm, at| {
+        let Some(wanted) = argument(vm, at, 1).as_object() else {
+            return Err(RuntimeError::new("Right operand must be a class."));
+        };
+        if !matches!(vm.heap.get(wanted), Some(Object::Class(_))) {
+            return Err(RuntimeError::new("Right operand must be a class."));
+        }
+        let mut current = vm.class_of(receiver(vm, at));
+        while let Some(class) = current {
+            if class == wanted {
+                return Ok(Value::TRUE);
+            }
+            current = match vm.heap.get(class) {
+                Some(Object::Class(class)) => class.superclass,
+                _ => None,
+            };
+        }
+        Ok(Value::FALSE)
+    });
+
+    define(vm, class, "type", |vm, at| match vm.class_of(receiver(vm, at)) {
+        Some(class) => Ok(Value::object(class)),
+        None => Ok(Value::NULL),
+    });
+}
+
+/// `Fn`: what a function literal is an instance of.
+fn install_fn(vm: &mut Vm) {
+    let class = vm.fn_class;
+
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Fn metaclass")));
+    let metaclass = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+    if let Some(Object::Class(function)) = vm.heap.get_mut(class) {
+        function.metaclass = Some(metaclass);
+    }
+
+    // `Fn.new { ... }` -- the block is already a function, so this hands it
+    // back. It exists because that is how a function literal is written in
+    // Wren: there is no bare block expression, only a block argument.
+    define(vm, metaclass, "new(_)", |vm, at| {
+        let block = argument(vm, at, 1);
+        match block.as_object().map(|id| vm.heap.get(id)) {
+            Some(Some(Object::Closure(_))) => Ok(block),
+            _ => Err(RuntimeError::new("Argument must be a function.")),
+        }
+    });
+
+    define(vm, class, "arity", |vm, at| {
+        let Some(id) = receiver(vm, at).as_object() else {
+            return Err(RuntimeError::new("Receiver must be a function."));
+        };
+        let arity = vm.arity_of(id).unwrap_or(0);
+        Ok(Value::num(arity as f64))
+    });
+
+    // **One `call` per arity, because a Wren signature includes its arity.**
+    // `call()` and `call(1)` are different methods, not an overload, so each
+    // needs its own entry in the table.
+    for arity in 0..=16usize {
+        let name = signature_for("call", arity);
+        define(vm, class, &name, move |vm, at| {
+            let Some(closure) = receiver(vm, at).as_object() else {
+                return Err(RuntimeError::new("Receiver must be a function."));
+            };
+            vm.call_closure(closure, at)
+        });
+    }
+}
+
+/// `call`, `call(_)`, `call(_,_)`, ...
+fn signature_for(name: &str, arity: usize) -> alloc::string::String {
+    let mut out = alloc::string::String::from(name);
+    if arity > 0 {
+        out.push('(');
+        for index in 0..arity {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push('_');
+        }
+        out.push(')');
+    }
+    out
 }
 
 fn install_num(vm: &mut Vm) {
@@ -474,7 +563,7 @@ fn install_system(vm: &mut Vm) {
 
     define(vm, metaclass, "print(_)", |vm, at| {
         let value = argument(vm, at, 1);
-        let text = vm.to_string(value);
+        let text = vm.stringify(value)?;
         vm.output.extend_from_slice(text.as_bytes());
         vm.output.push(b'\n');
         // `System.print(x)` returns x, so it can be dropped into an expression.
@@ -488,12 +577,29 @@ fn install_system(vm: &mut Vm) {
 
     define(vm, metaclass, "write(_)", |vm, at| {
         let value = argument(vm, at, 1);
-        let text = vm.to_string(value);
+        let text = vm.stringify(value)?;
         vm.output.extend_from_slice(text.as_bytes());
         Ok(value)
     });
 
     vm.module.define("System", Value::object(system));
+
+    // **The core classes have to be reachable by name.** `class Foo {}` with no
+    // `is` clause compiles to a load of `Object`, and `x is Num` needs `Num`.
+    for (name, class) in [
+        ("Object", vm.object_class),
+        ("Bool", vm.bool_class),
+        ("Class", vm.class_class),
+        ("Fn", vm.fn_class),
+        ("List", vm.list_class),
+        ("Map", vm.map_class),
+        ("Null", vm.null_class),
+        ("Num", vm.num_class),
+        ("Range", vm.range_class),
+        ("String", vm.string_class),
+    ] {
+        vm.module.define(name, Value::object(class));
+    }
 }
 
 /// Build a list value from elements, for the compiler's list literals.

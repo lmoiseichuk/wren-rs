@@ -24,8 +24,11 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use alloc::boxed::Box;
+use alloc::rc::Rc;
+
 use crate::bytecode::{Chunk, Op};
-use crate::core;
+use crate::object::{ObjFn, Object};
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::value::Value;
 use crate::vm::Vm;
@@ -46,6 +49,7 @@ enum Precedence {
     LogicalOr,  // ||
     LogicalAnd, // &&
     Equality,   // == !=
+    Is,         // is
     Comparison, // < > <= >=
     Range,      // .. ...
     Term,       // + -
@@ -58,6 +62,72 @@ enum Precedence {
 struct Local {
     name: String,
     depth: i32,
+    /// Whether a nested function captured it, so the scope's end has to close
+    /// the upvalue rather than simply popping the slot.
+    is_captured: bool,
+}
+
+/// Where a captured variable comes from, as the `Closure` instruction records
+/// it: either a local of the immediately enclosing function, or one of *its*
+/// upvalues — which is how a variable two or more levels up is reached, one
+/// hop at a time.
+#[derive(PartialEq, Eq)]
+struct UpvalueRef {
+    is_local: bool,
+    index: usize,
+}
+
+/// One function being compiled.
+///
+/// **A stack of these rather than upstream's linked list of `Compiler`s.** The
+/// same structure, but resolving an upvalue means walking a `Vec` instead of
+/// following parent pointers, which in Rust would mean either lifetimes that
+/// do not work out or `Rc<RefCell<_>>` on the hot path of the compiler.
+struct FnState {
+    chunk: Chunk,
+    locals: Vec<Local>,
+    upvalues: Vec<UpvalueRef>,
+    scope_depth: i32,
+    arity: usize,
+    name: String,
+    /// A constructor body returns `this` rather than null.
+    is_initializer: bool,
+}
+
+impl FnState {
+    /// `receiver` names slot zero: `this` in a method, and an unreferencable
+    /// empty name in a plain function so that nothing can name that slot.
+    fn new(name: String, receiver: &str, is_initializer: bool) -> FnState {
+        FnState {
+            chunk: Chunk::new(),
+            locals: alloc::vec![Local {
+                name: receiver.to_string(),
+                depth: 0,
+                is_captured: false,
+            }],
+            upvalues: Vec::new(),
+            scope_depth: 0,
+            arity: 0,
+            name,
+            is_initializer,
+        }
+    }
+}
+
+/// The class whose body is being compiled.
+struct ClassState {
+    /// Field names in declaration order; the index is the field's slot.
+    fields: Vec<String>,
+    in_static: bool,
+    /// Where the class itself lives, so each method can reload it.
+    variable: Variable,
+}
+
+/// Where a variable lives.
+#[derive(Clone, Copy)]
+struct Variable {
+    index: usize,
+    is_local: bool,
 }
 
 /// Compile `source` into a chunk that [`Vm::run`](crate::vm::Vm::run) can
@@ -73,8 +143,8 @@ pub fn compile(vm: &mut Vm, source: &str) -> Result<Chunk, CompileError> {
     }
 
     let line = clamp_line(compiler.current.line);
-    compiler.chunk.emit_op(Op::End, line);
-    Ok(compiler.chunk)
+    compiler.chunk_mut().emit_op(Op::End, line);
+    Ok(compiler.states.pop().expect("the module's own state").chunk)
 }
 
 struct Compiler<'a> {
@@ -83,26 +153,52 @@ struct Compiler<'a> {
     lexer: Lexer<'a>,
     previous: Token,
     current: Token,
-    chunk: Chunk,
-    locals: Vec<Local>,
-    /// `-1` means module level, where a `var` becomes a module variable rather
-    /// than a stack slot. Upstream uses the same sentinel for the same reason.
-    scope_depth: i32,
+    /// Functions being compiled, innermost last. There is always at least one:
+    /// the module's own body.
+    states: Vec<FnState>,
+    /// Classes being compiled, innermost last.
+    classes: Vec<ClassState>,
+    /// How deep the state stack was when the innermost method body started.
+    ///
+    /// A field reference is a one-instruction affair only when it is *directly*
+    /// in a method, because `this` is slot zero there. Inside a function nested
+    /// in a method, slot zero belongs to that function, and `this` has to come
+    /// through the upvalue chain.
+    method_depth: usize,
+    /// Parameter names parsed by the signature, waiting for the body's scope.
+    pending_parameters: Vec<String>,
 }
 
 impl<'a> Compiler<'a> {
     fn new(vm: &'a mut Vm, source: &'a str) -> Compiler<'a> {
         let placeholder = Token { kind: TokenKind::Eof, start: 0, end: 0, line: 1 };
+        let mut module = FnState::new("(module)".to_string(), "", false);
+        // **Module level is scope -1**, where a `var` becomes a module variable
+        // rather than a stack slot. Upstream uses the same sentinel.
+        module.scope_depth = -1;
         Compiler {
             vm,
             source,
             lexer: Lexer::new(source),
             previous: placeholder,
             current: placeholder,
-            chunk: Chunk::new(),
-            locals: Vec::new(),
-            scope_depth: -1,
+            states: alloc::vec![module],
+            classes: Vec::new(),
+            method_depth: 0,
+            pending_parameters: Vec::new(),
         }
+    }
+
+    fn state(&self) -> &FnState {
+        self.states.last().expect("a function being compiled")
+    }
+
+    fn state_mut(&mut self) -> &mut FnState {
+        self.states.last_mut().expect("a function being compiled")
+    }
+
+    fn chunk_mut(&mut self) -> &mut Chunk {
+        &mut self.state_mut().chunk
     }
 
     // --- tokens -------------------------------------------------------------
@@ -168,7 +264,7 @@ impl<'a> Compiler<'a> {
     // --- scopes and variables -----------------------------------------------
 
     fn begin_scope(&mut self) {
-        self.scope_depth += 1;
+        self.state_mut().scope_depth += 1;
     }
 
     /// Close a scope, discarding the locals it held.
@@ -178,19 +274,27 @@ impl<'a> Compiler<'a> {
     /// VM's have to agree exactly.
     fn end_scope(&mut self) {
         let line = self.line();
-        while let Some(local) = self.locals.last() {
-            if local.depth < self.scope_depth {
+        let depth = self.state().scope_depth;
+        loop {
+            let Some(local) = self.state().locals.last() else { break };
+            if local.depth < depth {
                 break;
             }
-            self.chunk.emit_op(Op::Pop, line);
-            self.locals.pop();
+            // **A captured local cannot simply be popped.** A closure may still
+            // refer to the slot, so the value has to be moved into the upvalue
+            // before the slot is reused -- which is what `CloseUpvalue` does,
+            // and it pops as well.
+            let captured = local.is_captured;
+            self.chunk_mut()
+                .emit_op(if captured { Op::CloseUpvalue } else { Op::Pop }, line);
+            self.state_mut().locals.pop();
         }
-        self.scope_depth -= 1;
+        self.state_mut().scope_depth -= 1;
     }
 
     fn resolve_local(&self, name: &str) -> Option<usize> {
         // Backwards, so an inner scope's variable shadows an outer one.
-        self.locals.iter().rposition(|local| local.name == name)
+        self.state().locals.iter().rposition(|local| local.name == name)
     }
 
     /// Declare a local occupying the slot the value on top of the stack is in.
@@ -199,17 +303,62 @@ impl<'a> Compiler<'a> {
     /// height equals the number of locals already declared.** Every statement
     /// leaves the stack as it found it, which is what keeps that true.
     fn add_local(&mut self, name: &str) -> Result<usize, CompileError> {
-        if self.locals.len() >= u8::MAX as usize {
+        if self.state().locals.len() >= u8::MAX as usize {
             return Err(self.error_at(self.previous, "Too many local variables in scope."));
         }
-        self.locals.push(Local { name: name.to_string(), depth: self.scope_depth });
-        Ok(self.locals.len() - 1)
+        let depth = self.state().scope_depth;
+        self.state_mut()
+            .locals
+            .push(Local { name: name.to_string(), depth, is_captured: false });
+        Ok(self.state().locals.len() - 1)
+    }
+
+    /// Find a captured variable, adding upvalues along the way.
+    ///
+    /// **This is the part that makes closures work across more than one level.**
+    /// A variable two functions up is not reachable directly: each function in
+    /// between has to capture it as an upvalue of its own, so the chain can be
+    /// followed one hop at a time at run time. The recursion here builds that
+    /// chain.
+    fn resolve_upvalue(&mut self, name: &str, level: usize) -> Option<usize> {
+        if level == 0 {
+            return None;
+        }
+        let enclosing = level - 1;
+
+        if let Some(slot) = self.states[enclosing]
+            .locals
+            .iter()
+            .rposition(|local| local.name == name)
+        {
+            self.states[enclosing].locals[slot].is_captured = true;
+            return Some(self.add_upvalue(level, true, slot));
+        }
+
+        let found = self.resolve_upvalue(name, enclosing)?;
+        Some(self.add_upvalue(level, false, found))
+    }
+
+    /// Record an upvalue on a function, reusing one it already has.
+    fn add_upvalue(&mut self, level: usize, is_local: bool, index: usize) -> usize {
+        let wanted = UpvalueRef { is_local, index };
+        if let Some(existing) = self.states[level]
+            .upvalues
+            .iter()
+            .position(|upvalue| *upvalue == wanted)
+        {
+            return existing;
+        }
+        self.states[level].upvalues.push(wanted);
+        self.states[level].upvalues.len() - 1
     }
 
     // --- declarations and statements ----------------------------------------
 
     fn declaration(&mut self) -> Result<(), CompileError> {
-        if self.match_token(TokenKind::Var)? {
+        if self.match_token(TokenKind::Class)? {
+            self.class_definition()?;
+        } else if self.match_token(TokenKind::Var)? {
             self.var_declaration()?;
         } else {
             self.statement()?;
@@ -230,15 +379,15 @@ impl<'a> Compiler<'a> {
             self.skip_newlines()?;
             self.expression()?;
         } else {
-            self.chunk.emit_op(Op::Null, line);
+            self.chunk_mut().emit_op(Op::Null, line);
         }
 
-        if self.scope_depth < 0 {
+        if self.state().scope_depth < 0 {
             // Module level: the variable lives in the module, not on the stack.
             let index = self.vm.module.define(&name, Value::NULL);
-            self.chunk.emit_op(Op::StoreModuleVar, line);
-            self.chunk.emit_short(index as u16, line);
-            self.chunk.emit_op(Op::Pop, line);
+            self.chunk_mut().emit_op(Op::StoreModuleVar, line);
+            self.chunk_mut().emit_short(index as u16, line);
+            self.chunk_mut().emit_op(Op::Pop, line);
         } else {
             // The value is already in the right slot; the local just names it.
             self.add_local(&name)?;
@@ -262,6 +411,9 @@ impl<'a> Compiler<'a> {
         if self.match_token(TokenKind::For)? {
             return self.for_statement();
         }
+        if self.match_token(TokenKind::Return)? {
+            return self.return_statement();
+        }
         self.expression_statement()
     }
 
@@ -282,13 +434,13 @@ impl<'a> Compiler<'a> {
         self.consume(TokenKind::RightParen, "Expect ')' after if condition.")?;
 
         let line = self.line();
-        let else_jump = self.chunk.emit_jump(Op::JumpIf, line);
+        let else_jump = self.chunk_mut().emit_jump(Op::JumpIf, line);
         self.skip_newlines()?;
         self.statement()?;
 
         if self.match_token(TokenKind::Else)? {
             let line = self.line();
-            let end_jump = self.chunk.emit_jump(Op::Jump, line);
+            let end_jump = self.chunk_mut().emit_jump(Op::Jump, line);
             self.patch(else_jump)?;
             self.skip_newlines()?;
             self.statement()?;
@@ -300,7 +452,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn while_statement(&mut self) -> Result<(), CompileError> {
-        let loop_start = self.chunk.code.len();
+        let loop_start = self.chunk_mut().code.len();
         self.consume(TokenKind::LeftParen, "Expect '(' after 'while'.")?;
         self.skip_newlines()?;
         self.expression()?;
@@ -308,12 +460,12 @@ impl<'a> Compiler<'a> {
         self.consume(TokenKind::RightParen, "Expect ')' after while condition.")?;
 
         let line = self.line();
-        let exit = self.chunk.emit_jump(Op::JumpIf, line);
+        let exit = self.chunk_mut().emit_jump(Op::JumpIf, line);
         self.skip_newlines()?;
         self.statement()?;
 
         let line = self.line();
-        if !self.chunk.emit_loop(loop_start, line) {
+        if !self.chunk_mut().emit_loop(loop_start, line) {
             return Err(self.error_at(self.previous, "Loop body too large."));
         }
         self.patch(exit)
@@ -349,24 +501,24 @@ impl<'a> Compiler<'a> {
         let sequence_slot = self.add_local("seq ")?;
 
         let line = self.line();
-        self.chunk.emit_op(Op::Null, line);
+        self.chunk_mut().emit_op(Op::Null, line);
         let iterator_slot = self.add_local("iter ")?;
 
         self.consume(TokenKind::RightParen, "Expect ')' after loop expression.")?;
 
-        let loop_start = self.chunk.code.len();
+        let loop_start = self.chunk_mut().code.len();
 
         // iter_ = seq_.iterate(iter_)
         let line = self.line();
         self.emit_load_local(sequence_slot, line);
         self.emit_load_local(iterator_slot, line);
         self.emit_call("iterate(_)", 1, line)?;
-        self.chunk.emit_op(Op::StoreLocal, line);
-        self.chunk.emit_byte(iterator_slot as u8, line);
+        self.chunk_mut().emit_op(Op::StoreLocal, line);
+        self.chunk_mut().emit_byte(iterator_slot as u8, line);
 
         // `StoreLocal` leaves the value, and `JumpIf` consumes it -- so the
         // assignment is also the loop condition, with nothing extra emitted.
-        let exit = self.chunk.emit_jump(Op::JumpIf, line);
+        let exit = self.chunk_mut().emit_jump(Op::JumpIf, line);
 
         // The loop variable is a fresh local in a scope of its own, so that a
         // closure capturing it would get this iteration's value. (Closures do
@@ -382,7 +534,7 @@ impl<'a> Compiler<'a> {
         self.end_scope();
 
         let line = self.line();
-        if !self.chunk.emit_loop(loop_start, line) {
+        if !self.chunk_mut().emit_loop(loop_start, line) {
             return Err(self.error_at(self.previous, "Loop body too large."));
         }
         self.patch(exit)?;
@@ -394,7 +546,7 @@ impl<'a> Compiler<'a> {
     fn expression_statement(&mut self) -> Result<(), CompileError> {
         self.expression()?;
         let line = self.line();
-        self.chunk.emit_op(Op::Pop, line);
+        self.chunk_mut().emit_op(Op::Pop, line);
         Ok(())
     }
 
@@ -439,18 +591,21 @@ impl<'a> Compiler<'a> {
             }
             TokenKind::Interpolation => self.interpolation(),
             TokenKind::True => {
-                self.chunk.emit_op(Op::True, line);
+                self.chunk_mut().emit_op(Op::True, line);
                 Ok(())
             }
             TokenKind::False => {
-                self.chunk.emit_op(Op::False, line);
+                self.chunk_mut().emit_op(Op::False, line);
                 Ok(())
             }
             TokenKind::Null => {
-                self.chunk.emit_op(Op::Null, line);
+                self.chunk_mut().emit_op(Op::Null, line);
                 Ok(())
             }
             TokenKind::Name => self.variable(can_assign),
+            TokenKind::This => self.load_this(),
+            TokenKind::Field => self.field(can_assign),
+            TokenKind::Super => self.super_call(),
             TokenKind::LeftParen => {
                 self.skip_newlines()?;
                 self.expression()?;
@@ -478,13 +633,13 @@ impl<'a> Compiler<'a> {
         // have to be able to *not* evaluate their right side.
         match token.kind {
             TokenKind::AmpAmp => {
-                let jump = self.chunk.emit_jump(Op::And, line);
+                let jump = self.chunk_mut().emit_jump(Op::And, line);
                 self.skip_newlines()?;
                 self.parse_precedence(Precedence::LogicalAnd)?;
                 return self.patch(jump);
             }
             TokenKind::PipePipe => {
-                let jump = self.chunk.emit_jump(Op::Or, line);
+                let jump = self.chunk_mut().emit_jump(Op::Or, line);
                 self.skip_newlines()?;
                 self.parse_precedence(Precedence::LogicalOr)?;
                 return self.patch(jump);
@@ -506,6 +661,7 @@ impl<'a> Compiler<'a> {
             TokenKind::GtEq => ">=",
             TokenKind::EqEq => "==",
             TokenKind::BangEq => "!=",
+            TokenKind::Is => "is",
             TokenKind::DotDot => "..",
             TokenKind::DotDotDot => "...",
             _ => return Err(self.error_at(token, "Expected operator.")),
@@ -529,8 +685,21 @@ impl<'a> Compiler<'a> {
         let line = self.line();
 
         if self.match_token(TokenKind::LeftParen)? {
-            let arity = self.argument_list()?;
+            let mut arity = self.argument_list()?;
+            // **A block after the arguments is one more argument.** This is how
+            // `list.each { |x| ... }` works: there is no block syntax in the
+            // language, only a function literal in the last argument position,
+            // and the signature grows a `_` to match.
+            if self.match_token(TokenKind::LeftBrace)? {
+                self.block_argument()?;
+                arity += 1;
+            }
             return self.emit_call(&signature(&name, arity), arity, line);
+        }
+
+        if self.match_token(TokenKind::LeftBrace)? {
+            self.block_argument()?;
+            return self.emit_call(&signature(&name, 1), 1, line);
         }
 
         if self.check(TokenKind::Eq) {
@@ -592,28 +761,205 @@ impl<'a> Compiler<'a> {
             self.expression()?;
 
             if let Some(slot) = self.resolve_local(&name) {
-                self.chunk.emit_op(Op::StoreLocal, line);
-                self.chunk.emit_byte(slot as u8, line);
+                self.chunk_mut().emit_op(Op::StoreLocal, line);
+                self.chunk_mut().emit_byte(slot as u8, line);
                 return Ok(());
             }
-            let Some(index) = self.vm.module.names.find(&name) else {
-                return Err(self.error_at(self.previous, "Variable is not defined."));
-            };
-            self.chunk.emit_op(Op::StoreModuleVar, line);
-            self.chunk.emit_short(index as u16, line);
+            if let Some(slot) = self.resolve_upvalue(&name, self.states.len() - 1) {
+                self.chunk_mut().emit_op(Op::StoreUpvalue, line);
+                self.chunk_mut().emit_byte(slot as u8, line);
+                return Ok(());
+            }
+            if self.vm.module.names.find(&name).is_none() && self.is_this_call(&name) {
+                // Rewind: this is `name = value` on the receiver, a setter.
+                return self.named_call(&name, true, line);
+            }
+            let index = self.module_variable(&name)?;
+            self.chunk_mut().emit_op(Op::StoreModuleVar, line);
+            self.chunk_mut().emit_short(index as u16, line);
             return Ok(());
         }
 
-        if let Some(slot) = self.resolve_local(&name) {
+        if self.resolve_local(&name).is_none()
+            && self.resolve_upvalue(&name, self.states.len() - 1).is_none()
+            && self.vm.module.names.find(&name).is_none()
+            && self.is_this_call(&name)
+        {
+            return self.named_call(&name, can_assign, line);
+        }
+
+        self.load_named(&name, line)
+    }
+
+    /// Is this bare name a method call on the receiver?
+    fn is_this_call(&self, name: &str) -> bool {
+        !self.classes.is_empty()
+            && self.method_depth > 0
+            && name.chars().next().is_some_and(|first| first.is_lowercase())
+    }
+
+    /// Emit a load of whatever `name` refers to: a local, a captured variable,
+    /// or a module variable, in that order.
+    fn load_named(&mut self, name: &str, line: u16) -> Result<(), CompileError> {
+        if let Some(slot) = self.resolve_local(name) {
             self.emit_load_local(slot, line);
             return Ok(());
         }
-        let Some(index) = self.vm.module.names.find(&name) else {
-            return Err(self.error_at(self.previous, "Variable is not defined."));
-        };
-        self.chunk.emit_op(Op::LoadModuleVar, line);
-        self.chunk.emit_short(index as u16, line);
+        if let Some(slot) = self.resolve_upvalue(name, self.states.len() - 1) {
+            self.chunk_mut().emit_op(Op::LoadUpvalue, line);
+            self.chunk_mut().emit_byte(slot as u8, line);
+            return Ok(());
+        }
+        let index = self.module_variable(name)?;
+        self.chunk_mut().emit_op(Op::LoadModuleVar, line);
+        self.chunk_mut().emit_short(index as u16, line);
         Ok(())
+    }
+
+    /// Find a module variable, declaring it implicitly if the name is
+    /// capitalised.
+    ///
+    /// **A capitalised name that is not defined yet is assumed to be a class
+    /// defined later.** That is what lets two classes refer to each other, and
+    /// it is upstream's rule: a lowercase name is an error on the spot, an
+    /// uppercase one is a forward reference.
+    fn module_variable(&mut self, name: &str) -> Result<usize, CompileError> {
+        if let Some(index) = self.vm.module.names.find(name) {
+            return Ok(index);
+        }
+        let capitalised = name.chars().next().is_some_and(|first| first.is_uppercase());
+        if !capitalised {
+            return Err(self.error_at(self.previous, "Variable is not defined."));
+        }
+        Ok(self.vm.module.define(name, Value::NULL))
+    }
+
+    /// A bare name inside a class body is a call on `this`.
+    ///
+    /// `get(n - 1)` inside a method means `this.get(n - 1)`. Upstream applies
+    /// this only to lowercase names, so that `Foo` still reads as a class
+    /// rather than as a method call on the receiver.
+    fn named_call(&mut self, name: &str, can_assign: bool, line: u16) -> Result<(), CompileError> {
+        self.load_named("this", line)?;
+
+        if can_assign && self.check(TokenKind::Eq) {
+            self.advance()?;
+            self.skip_newlines()?;
+            self.expression()?;
+            return self.emit_call(&format!("{name}=(_)"), 1, line);
+        }
+
+        if self.match_token(TokenKind::LeftParen)? {
+            let mut arity = self.argument_list()?;
+            if self.match_token(TokenKind::LeftBrace)? {
+                self.block_argument()?;
+                arity += 1;
+            }
+            return self.emit_call(&signature(name, arity), arity, line);
+        }
+
+        if self.match_token(TokenKind::LeftBrace)? {
+            self.block_argument()?;
+            return self.emit_call(&signature(name, 1), 1, line);
+        }
+
+        self.emit_call(name, 0, line)
+    }
+
+    fn load_this(&mut self) -> Result<(), CompileError> {
+        let line = self.line();
+        if self.classes.is_empty() {
+            return Err(self.error_at(self.previous, "Cannot use 'this' outside of a method."));
+        }
+        self.load_named("this", line)
+    }
+
+    /// `_field`, inside a method of the class being compiled.
+    fn field(&mut self, can_assign: bool) -> Result<(), CompileError> {
+        let name = self.previous.text(self.source).to_string();
+        let line = self.line();
+
+        if self.classes.is_empty() {
+            return Err(self.error_at(
+                self.previous,
+                "Cannot reference a field outside of a class definition.",
+            ));
+        }
+        if self.class_state().in_static {
+            return Err(self.error_at(self.previous, "Cannot use an instance field in a static method."));
+        }
+
+        let index = match self.class_state().fields.iter().position(|field| *field == name) {
+            Some(index) => index,
+            None => {
+                let class = self.classes.last_mut().expect("a class being compiled");
+                if class.fields.len() >= u8::MAX as usize {
+                    return Err(self.error_at(self.previous, "A class can only have 255 fields."));
+                }
+                class.fields.push(name);
+                class.fields.len() - 1
+            }
+        };
+
+        // **Directly in a method, `this` is slot zero and the instruction can
+        // say so.** Inside a function nested in a method it is not — slot zero
+        // there belongs to the function — so `this` has to be loaded through
+        // the upvalue chain first and the general instruction used.
+        let direct = self.states.len() == self.method_depth;
+        let assigning = can_assign && self.check(TokenKind::Eq);
+
+        if !direct {
+            self.load_named("this", line)?;
+        }
+        if assigning {
+            self.advance()?;
+            self.skip_newlines()?;
+            self.expression()?;
+            self.chunk_mut()
+                .emit_op(if direct { Op::StoreFieldThis } else { Op::StoreField }, line);
+        } else {
+            self.chunk_mut()
+                .emit_op(if direct { Op::LoadFieldThis } else { Op::LoadField }, line);
+        }
+        self.chunk_mut().emit_byte(index as u8, line);
+        Ok(())
+    }
+
+    fn class_state(&self) -> &ClassState {
+        self.classes.last().expect("a class being compiled")
+    }
+
+    /// `super.name(args)` or `super(args)` in a constructor.
+    fn super_call(&mut self) -> Result<(), CompileError> {
+        let line = self.line();
+        if self.classes.is_empty() {
+            return Err(self.error_at(self.previous, "Cannot use 'super' outside of a method."));
+        }
+
+        // The receiver of a super call is always `this`.
+        self.load_named("this", line)?;
+
+        if self.match_token(TokenKind::Dot)? {
+            self.consume(TokenKind::Name, "Expect method name after 'super.'.")?;
+            let name = self.previous.text(self.source).to_string();
+            let arity = if self.match_token(TokenKind::LeftParen)? {
+                self.argument_list()?
+            } else {
+                0
+            };
+            return self.emit_super(&signature(&name, arity), arity, line);
+        }
+
+        // Bare `super(...)`: call the superclass's version of the method this
+        // one is in. The name is the enclosing method's own.
+        let name = self.state().name.clone();
+        let base = name.split('(').next().unwrap_or("").to_string();
+        let arity = if self.match_token(TokenKind::LeftParen)? {
+            self.argument_list()?
+        } else {
+            0
+        };
+        self.emit_super(&signature(&base, arity), arity, line)
     }
 
     /// `[a, b, c]`
@@ -626,8 +972,8 @@ impl<'a> Compiler<'a> {
         let Some(index) = self.vm.module.names.find("List") else {
             return Err(self.error_at(self.previous, "List class is not defined."));
         };
-        self.chunk.emit_op(Op::LoadModuleVar, line);
-        self.chunk.emit_short(index as u16, line);
+        self.chunk_mut().emit_op(Op::LoadModuleVar, line);
+        self.chunk_mut().emit_short(index as u16, line);
         self.emit_call("new", 0, line)?;
 
         self.skip_newlines()?;
@@ -687,17 +1033,370 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    // --- functions ----------------------------------------------------------
+
+    fn push_function(&mut self, name: String, receiver: &str, is_initializer: bool) {
+        self.states.push(FnState::new(name, receiver, is_initializer));
+    }
+
+    /// Finish the innermost function and emit a `Closure` for it in its parent.
+    fn end_function(&mut self) -> Result<(), CompileError> {
+        let line = self.line();
+        self.chunk_mut().emit_op(Op::End, line);
+
+        let state = self.states.pop().expect("a function being compiled");
+        let upvalues = state.upvalues;
+
+        let function = self.vm.heap.allocate(Object::Fn(Box::new(ObjFn {
+            chunk: Rc::new(state.chunk),
+            arity: state.arity,
+            num_upvalues: upvalues.len(),
+            name: state.name,
+            field_offset: 0,
+            super_class: None,
+        })));
+
+        let index = self.chunk_mut().add_constant(Value::object(function));
+        self.chunk_mut().emit_op(Op::Closure, line);
+        self.chunk_mut().emit_short(index, line);
+        // **Two bytes per upvalue, right after the instruction.** Only the
+        // enclosing function knows where each captured variable actually is,
+        // so it has to say so here rather than at compile time of the inner
+        // function.
+        for upvalue in &upvalues {
+            self.chunk_mut().emit_byte(u8::from(upvalue.is_local), line);
+            self.chunk_mut().emit_byte(upvalue.index as u8, line);
+        }
+        Ok(())
+    }
+
+    /// The body of a function, method or block, after its `{`.
+    ///
+    /// **A body with no newline after the `{` is a single expression**, and its
+    /// value is returned — `Fn.new { 1 + 2 }` is 3. With a newline it is a list
+    /// of statements and returns null. Upstream draws the line in exactly the
+    /// same place.
+    fn finish_body(&mut self) -> Result<(), CompileError> {
+        let line = self.line();
+
+        if self.match_token(TokenKind::RightBrace)? {
+            return self.finish_return(false, line);
+        }
+
+        if !self.check(TokenKind::Line) {
+            self.expression()?;
+            self.consume(TokenKind::RightBrace, "Expect '}' at end of block.")?;
+            return self.finish_return(true, line);
+        }
+
+        self.skip_newlines()?;
+        if self.match_token(TokenKind::RightBrace)? {
+            return self.finish_return(false, line);
+        }
+
+        loop {
+            self.declaration()?;
+            self.skip_newlines()?;
+            if self.check(TokenKind::RightBrace) || self.check(TokenKind::Eof) {
+                break;
+            }
+        }
+        self.consume(TokenKind::RightBrace, "Expect '}' at end of block.")?;
+        self.finish_return(false, line)
+    }
+
+    fn finish_return(&mut self, is_expression_body: bool, line: u16) -> Result<(), CompileError> {
+        if self.state().is_initializer {
+            // A constructor returns the instance whatever its body evaluated to.
+            if is_expression_body {
+                self.chunk_mut().emit_op(Op::Pop, line);
+            }
+            self.chunk_mut().emit_op(Op::LoadLocal, line);
+            self.chunk_mut().emit_byte(0, line);
+        } else if !is_expression_body {
+            self.chunk_mut().emit_op(Op::Null, line);
+        }
+        self.chunk_mut().emit_op(Op::Return, line);
+        Ok(())
+    }
+
+    fn return_statement(&mut self) -> Result<(), CompileError> {
+        let line = self.line();
+        if self.check(TokenKind::Line) || self.check(TokenKind::RightBrace) || self.check(TokenKind::Eof) {
+            self.chunk_mut().emit_op(Op::Null, line);
+        } else {
+            self.expression()?;
+        }
+        self.chunk_mut().emit_op(Op::Return, line);
+        Ok(())
+    }
+
+    /// `{ |a, b| body }` passed as an argument.
+    fn block_argument(&mut self) -> Result<(), CompileError> {
+        self.push_function("(fn)".to_string(), "", false);
+
+        if self.match_token(TokenKind::Pipe)? {
+            loop {
+                self.skip_newlines()?;
+                self.consume(TokenKind::Name, "Expect parameter name.")?;
+                let name = self.previous.text(self.source).to_string();
+                self.add_local(&name)?;
+                self.state_mut().arity += 1;
+                if !self.match_token(TokenKind::Comma)? {
+                    break;
+                }
+            }
+            self.consume(TokenKind::Pipe, "Expect '|' after parameters.")?;
+        }
+
+        self.finish_body()?;
+        self.end_function()
+    }
+
+    // --- classes ------------------------------------------------------------
+
+    fn class_definition(&mut self) -> Result<(), CompileError> {
+        self.consume(TokenKind::Name, "Expect class name.")?;
+        let name = self.previous.text(self.source).to_string();
+        let line = self.line();
+
+        // The class's own name, as a constant for the `Class` instruction.
+        let name_value = self.vm.new_string(&name);
+        self.emit_constant(name_value, line);
+
+        // The superclass, or `Object` when none is named.
+        if self.match_token(TokenKind::Is)? {
+            self.parse_precedence(Precedence::Call)?;
+        } else {
+            self.load_named("Object", line)?;
+        }
+
+        // The field count is not known until the methods have been compiled,
+        // so a placeholder goes in and is patched at the end.
+        self.chunk_mut().emit_op(Op::Class, line);
+        let field_count_at = self.chunk_mut().code.len();
+        self.chunk_mut().emit_byte(255, line);
+
+        let variable = self.define_variable(&name, line)?;
+
+        self.classes.push(ClassState {
+            fields: Vec::new(),
+            in_static: false,
+            variable,
+        });
+
+        self.consume(TokenKind::LeftBrace, "Expect '{' after class declaration.")?;
+        self.skip_newlines()?;
+
+        while !self.check(TokenKind::RightBrace) && !self.check(TokenKind::Eof) {
+            self.method()?;
+            self.skip_newlines()?;
+        }
+        self.consume(TokenKind::RightBrace, "Expect '}' after class body.")?;
+
+        let class = self.classes.pop().expect("the class being compiled");
+        self.state_mut().chunk.code[field_count_at] = class.fields.len() as u8;
+        Ok(())
+    }
+
+    /// Declare a variable for something just pushed onto the stack.
+    fn define_variable(&mut self, name: &str, line: u16) -> Result<Variable, CompileError> {
+        if self.state().scope_depth < 0 {
+            let index = self.vm.module.define(name, Value::NULL);
+            self.chunk_mut().emit_op(Op::StoreModuleVar, line);
+            self.chunk_mut().emit_short(index as u16, line);
+            self.chunk_mut().emit_op(Op::Pop, line);
+            return Ok(Variable { index, is_local: false });
+        }
+        let slot = self.add_local(name)?;
+        Ok(Variable { index: slot, is_local: true })
+    }
+
+    fn load_variable(&mut self, variable: Variable, line: u16) {
+        if variable.is_local {
+            self.chunk_mut().emit_op(Op::LoadLocal, line);
+            self.chunk_mut().emit_byte(variable.index as u8, line);
+        } else {
+            self.chunk_mut().emit_op(Op::LoadModuleVar, line);
+            self.chunk_mut().emit_short(variable.index as u16, line);
+        }
+    }
+
+    /// One method inside a class body.
+    fn method(&mut self) -> Result<(), CompileError> {
+        let is_static = self.match_token(TokenKind::Static)?;
+        let is_constructor = self.match_token(TokenKind::Construct)?;
+        self.classes.last_mut().expect("a class").in_static = is_static;
+
+        let (full, arity) = self.method_signature()?;
+        let line = self.line();
+        // A constructor's body is an instance method under a name no program
+        // can write, and `new` on the metaclass is generated to call it.
+        let body_signature = if is_constructor { format!("init {full}") } else { full.clone() };
+
+        self.push_function(
+            body_signature.clone(),
+            "this",
+            is_constructor,
+        );
+        let depth_was = self.method_depth;
+        self.method_depth = self.states.len();
+
+        for parameter in self.take_parameters() {
+            self.add_local(&parameter)?;
+            self.state_mut().arity += 1;
+        }
+
+        self.consume(TokenKind::LeftBrace, "Expect '{' to begin method body.")?;
+        self.finish_body()?;
+        self.end_function()?;
+        self.method_depth = depth_was;
+
+        let variable = self.class_state().variable;
+        self.load_variable(variable, line);
+        let symbol = self.vm.method_names.ensure(&body_signature);
+        self.chunk_mut()
+            .emit_op(if is_static { Op::MethodStatic } else { Op::MethodInstance }, line);
+        self.chunk_mut().emit_short(symbol as u16, line);
+
+        if is_constructor {
+            self.emit_constructor(&full, arity, line)?;
+        }
+        Ok(())
+    }
+
+    /// The `new(...)` static method a `construct` declaration implies.
+    ///
+    /// Three instructions: allocate an instance in place of the class, run the
+    /// constructor body on it, return it. Upstream generates the same thing.
+    fn emit_constructor(&mut self, full: &str, arity: usize, line: u16) -> Result<(), CompileError> {
+        self.push_function(full.to_string(), "this", false);
+        self.state_mut().arity = arity;
+        for index in 0..arity {
+            self.add_local(&format!("arg {index}"))?;
+        }
+
+        self.chunk_mut().emit_op(Op::Construct, line);
+        let initializer = self.vm.method_names.ensure(&format!("init {full}"));
+        self.chunk_mut().emit_op(Op::LoadLocal, line);
+        self.chunk_mut().emit_byte(0, line);
+        for slot in 1..=arity {
+            self.chunk_mut().emit_op(Op::LoadLocal, line);
+            self.chunk_mut().emit_byte(slot as u8, line);
+        }
+        self.chunk_mut().emit_op(Op::Call, line);
+        self.chunk_mut().emit_byte(arity as u8, line);
+        self.chunk_mut().emit_short(initializer as u16, line);
+        self.chunk_mut().emit_op(Op::Return, line);
+        self.end_function()?;
+
+        let variable = self.class_state().variable;
+        self.load_variable(variable, line);
+        let symbol = self.vm.method_names.ensure(full);
+        self.chunk_mut().emit_op(Op::MethodStatic, line);
+        self.chunk_mut().emit_short(symbol as u16, line);
+        Ok(())
+    }
+
+    /// Parse a method's name and parameter list.
+    ///
+    /// Returns the **finished signature** rather than a name to be assembled
+    /// later: a setter, a subscript and a binary operator each build one
+    /// differently, and handing back a bare name meant the caller had to guess
+    /// which -- which is how `[_]=(_)` came to be registered as `[_]=(_)(_,_)`.
+    fn method_signature(&mut self) -> Result<(String, usize), CompileError> {
+        self.advance()?;
+        let token = self.previous;
+
+        if token.kind == TokenKind::LeftBracket {
+            let parameters = self.parameter_list(TokenKind::RightBracket)?;
+            let count = parameters.len();
+            self.pending_parameters = parameters;
+            if self.match_token(TokenKind::Eq)? {
+                let mut setter = self.parameter_list_parenthesised()?;
+                self.pending_parameters.append(&mut setter);
+                let arity = self.pending_parameters.len();
+                return Ok((subscript_signature(count, true), arity));
+            }
+            return Ok((subscript_signature(count, false), count));
+        }
+
+        let name = match token.kind {
+            TokenKind::Name | TokenKind::Construct => token.text(self.source).to_string(),
+            kind => match operator_name(kind) {
+                Some(name) => name.to_string(),
+                None => return Err(self.error_at(token, "Expect method definition.")),
+            },
+        };
+
+        // `name=(value)` is a setter.
+        if self.match_token(TokenKind::Eq)? {
+            self.pending_parameters = self.parameter_list_parenthesised()?;
+            return Ok((format!("{name}=(_)"), 1));
+        }
+
+        if self.match_token(TokenKind::LeftParen)? {
+            self.pending_parameters = self.parameter_list(TokenKind::RightParen)?;
+            let arity = self.pending_parameters.len();
+            return Ok((signature(&name, arity), arity));
+        }
+
+        // No parentheses: a getter, or a unary operator such as `-` or `!`.
+        self.pending_parameters = Vec::new();
+        Ok((name, 0))
+    }
+
+    fn parameter_list_parenthesised(&mut self) -> Result<Vec<String>, CompileError> {
+        self.consume(TokenKind::LeftParen, "Expect '(' after method name.")?;
+        self.parameter_list(TokenKind::RightParen)
+    }
+
+    /// Parameter names up to `closing`, which is consumed.
+    fn parameter_list(&mut self, closing: TokenKind) -> Result<Vec<String>, CompileError> {
+        let mut names = Vec::new();
+        self.skip_newlines()?;
+        if !self.check(closing) {
+            loop {
+                self.skip_newlines()?;
+                self.consume(TokenKind::Name, "Expect parameter name.")?;
+                names.push(self.previous.text(self.source).to_string());
+                if names.len() > 16 {
+                    return Err(self.error_at(self.current, "Cannot have more than 16 parameters."));
+                }
+                self.skip_newlines()?;
+                if !self.match_token(TokenKind::Comma)? {
+                    break;
+                }
+            }
+        }
+        self.skip_newlines()?;
+        self.consume(closing, "Expect closing bracket after parameters.")?;
+        Ok(names)
+    }
+
+    fn take_parameters(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.pending_parameters)
+    }
+
+    fn emit_super(&mut self, signature: &str, arity: usize, line: u16) -> Result<(), CompileError> {
+        let symbol = self.vm.method_names.ensure(signature);
+        self.chunk_mut().emit_op(Op::Super, line);
+        self.chunk_mut().emit_byte(arity as u8, line);
+        self.chunk_mut().emit_short(symbol as u16, line);
+        Ok(())
+    }
+
     // --- emitting -----------------------------------------------------------
 
     fn emit_constant(&mut self, value: Value, line: u16) {
-        let index = self.chunk.add_constant(value);
-        self.chunk.emit_op(Op::Constant, line);
-        self.chunk.emit_short(index, line);
+        let index = self.chunk_mut().add_constant(value);
+        self.chunk_mut().emit_op(Op::Constant, line);
+        self.chunk_mut().emit_short(index, line);
     }
 
     fn emit_load_local(&mut self, slot: usize, line: u16) {
-        self.chunk.emit_op(Op::LoadLocal, line);
-        self.chunk.emit_byte(slot as u8, line);
+        self.chunk_mut().emit_op(Op::LoadLocal, line);
+        self.chunk_mut().emit_byte(slot as u8, line);
     }
 
     fn emit_call(&mut self, signature: &str, arity: usize, line: u16) -> Result<(), CompileError> {
@@ -705,14 +1404,14 @@ impl<'a> Compiler<'a> {
         if symbol > u16::MAX as usize {
             return Err(self.error_at(self.previous, "Too many method names."));
         }
-        self.chunk.emit_op(Op::Call, line);
-        self.chunk.emit_byte(arity as u8, line);
-        self.chunk.emit_short(symbol as u16, line);
+        self.chunk_mut().emit_op(Op::Call, line);
+        self.chunk_mut().emit_byte(arity as u8, line);
+        self.chunk_mut().emit_short(symbol as u16, line);
         Ok(())
     }
 
     fn patch(&mut self, at: usize) -> Result<(), CompileError> {
-        if self.chunk.patch_jump(at) {
+        if self.chunk_mut().patch_jump(at) {
             return Ok(());
         }
         Err(self.error_at(self.previous, "Too much code to jump over."))
@@ -745,6 +1444,7 @@ fn infix_precedence(kind: TokenKind) -> Precedence {
         TokenKind::PipePipe => Precedence::LogicalOr,
         TokenKind::AmpAmp => Precedence::LogicalAnd,
         TokenKind::EqEq | TokenKind::BangEq => Precedence::Equality,
+        TokenKind::Is => Precedence::Is,
         TokenKind::Lt | TokenKind::Gt | TokenKind::LtEq | TokenKind::GtEq => Precedence::Comparison,
         TokenKind::DotDot | TokenKind::DotDotDot => Precedence::Range,
         TokenKind::Plus | TokenKind::Minus => Precedence::Term,
@@ -762,7 +1462,8 @@ fn tighter(precedence: Precedence) -> Precedence {
         Precedence::Assignment => Precedence::LogicalOr,
         Precedence::LogicalOr => Precedence::LogicalAnd,
         Precedence::LogicalAnd => Precedence::Equality,
-        Precedence::Equality => Precedence::Comparison,
+        Precedence::Equality => Precedence::Is,
+        Precedence::Is => Precedence::Comparison,
         Precedence::Comparison => Precedence::Range,
         Precedence::Range => Precedence::Term,
         Precedence::Term => Precedence::Factor,
@@ -810,10 +1511,6 @@ fn unescape(raw: &str) -> String {
     out
 }
 
-/// Elements for a list literal, used by [`core`] when it builds one directly.
-pub fn empty_list(vm: &mut Vm) -> Value {
-    core::new_list(vm, Vec::new())
-}
 
 /// Narrow a lexer line number to what a chunk stores.
 ///
@@ -824,4 +1521,52 @@ pub fn empty_list(vm: &mut Vm) -> Value {
 /// accommodate a file nobody is going to put on a microcontroller.
 fn clamp_line(line: u32) -> u16 {
     line.min(u16::MAX as u32) as u16
+}
+
+/// `[_]` or `[_]=(_)`, with one `_` per subscript argument.
+fn subscript_signature(arity: usize, is_setter: bool) -> String {
+    let mut out = String::from("[");
+    for index in 0..arity {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('_');
+    }
+    out.push(']');
+    if is_setter {
+        out.push_str("=(_)");
+    }
+    out
+}
+
+/// The method name an operator token declares.
+///
+/// Wren's operators are ordinary methods, so `+(other) { }` in a class body
+/// defines the method that `a + b` calls. This is the mapping between the two.
+fn operator_name(kind: TokenKind) -> Option<&'static str> {
+    let name = match kind {
+        TokenKind::Plus => "+",
+        TokenKind::Minus => "-",
+        TokenKind::Star => "*",
+        TokenKind::Slash => "/",
+        TokenKind::Percent => "%",
+        TokenKind::Lt => "<",
+        TokenKind::Gt => ">",
+        TokenKind::LtEq => "<=",
+        TokenKind::GtEq => ">=",
+        TokenKind::EqEq => "==",
+        TokenKind::BangEq => "!=",
+        TokenKind::Bang => "!",
+        TokenKind::Tilde => "~",
+        TokenKind::DotDot => "..",
+        TokenKind::DotDotDot => "...",
+        TokenKind::Amp => "&",
+        TokenKind::Pipe => "|",
+        TokenKind::Caret => "^",
+        TokenKind::LtLt => "<<",
+        TokenKind::GtGt => ">>",
+        TokenKind::Is => "is",
+        _ => return None,
+    };
+    Some(name)
 }

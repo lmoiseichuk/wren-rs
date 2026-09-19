@@ -73,6 +73,59 @@ pub enum Op {
     /// End of the compiled chunk. A well-formed chunk always ends with this,
     /// so the interpreter needs no bounds check on the instruction pointer.
     End = 16,
+
+    /// Make a closure from the function in `constants[operand]`. Operand:
+    /// `u16`, then **two bytes per upvalue** the function captures: a flag
+    /// saying whether it comes from the enclosing function's locals or from
+    /// its upvalues, and the index.
+    ///
+    /// The variable-length operand is why closures are made by an instruction
+    /// rather than assembled at compile time: only the enclosing function knows
+    /// where each captured variable actually is.
+    Closure = 17,
+    /// Push the closure's upvalue `operand`. Operand: `u8`.
+    LoadUpvalue = 18,
+    /// Store the top of the stack into upvalue `operand`, leaving it. `u8`.
+    StoreUpvalue = 19,
+    /// Close every upvalue at or above the top of the stack, then pop.
+    CloseUpvalue = 20,
+
+    /// Make a class. Pops the superclass, then the name below it, and pushes
+    /// the class. Operand: `u8`, the number of fields it declares.
+    Class = 21,
+    /// Bind the closure below the class on the stack as an instance method.
+    /// Operand: `u16` symbol. Pops both.
+    MethodInstance = 22,
+    /// The same, on the metaclass. Operand: `u16` symbol.
+    MethodStatic = 23,
+
+    /// Push field `operand` of `this`. Operand: `u8`.
+    LoadFieldThis = 24,
+    /// Store the top of the stack into field `operand` of `this`. `u8`.
+    StoreFieldThis = 25,
+    /// Pop an instance and push its field `operand`. Operand: `u8`.
+    LoadField = 26,
+    /// Pop an instance and store into its field `operand`. Operand: `u8`.
+    StoreField = 27,
+
+    /// Replace the class in slot zero with a new instance of it.
+    ///
+    /// This is how `Foo.new(...)` works: the compiler generates a static
+    /// method on the metaclass whose body is this, then a call to the
+    /// constructor body, then a return.
+    Construct = 28,
+
+    /// Invoke a method on `this`, looking it up from the superclass of the
+    /// class this method was bound to. Operands: arity `u8`, symbol `u16`.
+    ///
+    /// **A super call is bound statically**, to the superclass of the class
+    /// the method was *written* in — not of the receiver's class. Otherwise a
+    /// method inherited two levels down would call itself forever.
+    ///
+    /// Upstream stores that class in a constant and rewrites the bytecode when
+    /// the method is bound. Here it is recorded on the function instead, which
+    /// needs no mutation of a chunk shared through an `Rc`.
+    Super = 29,
 }
 
 impl Op {
@@ -99,6 +152,19 @@ impl Op {
             14 => Op::Or,
             15 => Op::Return,
             16 => Op::End,
+            17 => Op::Closure,
+            18 => Op::LoadUpvalue,
+            19 => Op::StoreUpvalue,
+            20 => Op::CloseUpvalue,
+            21 => Op::Class,
+            22 => Op::MethodInstance,
+            23 => Op::MethodStatic,
+            24 => Op::LoadFieldThis,
+            25 => Op::StoreFieldThis,
+            26 => Op::LoadField,
+            27 => Op::StoreField,
+            28 => Op::Construct,
+            29 => Op::Super,
             _ => return None,
         };
         Some(op)
@@ -106,6 +172,7 @@ impl Op {
 }
 
 /// A compiled chunk of code: the instructions, and the constants they refer to.
+#[derive(Debug)]
 pub struct Chunk {
     pub code: Vec<u8>,
     pub constants: Vec<Value>,
