@@ -244,6 +244,12 @@ and the measured result on an ESP32-C6 at 160 MHz was `method_call` 2.766 →
 2.356 s, `fib` 18.176 → 16.601, `binary_trees` 8.616 → 8.268, `list_build`
 0.574 → 0.568.
 
+*Each table in this document measures one change against the commit before it,
+so the absolute numbers are of that moment rather than of today; the current
+figures are in [`../wren/benchmarks-wren-rs.md`](../wren/benchmarks-wren-rs.md).
+What a change was worth does not move when a later one lands, which is why they
+are recorded this way.*
+
 **The host said none of it.** Measured on a workstation, every one of those
 changes was inside the noise: an out-of-order core hides a dependent load that
 an in-order RISC-V pays for in full. Anyone repeating this work should not trust
@@ -418,23 +424,14 @@ that `Drop` can fire is the change that would be required, and it would ripple
 through the interpreter loop. **The handle table makes it possible; it does not
 make it cheap.** Writing that down now is better than discovering it later.
 
-There is also a cost refcounting does not escape: Wren has cycles by
-construction. A class refers to its methods, a method's closure refers to its
-module, a module refers to the class. A pure refcount leaks all of that, so a
-cycle collector comes back anyway, and the comparison to run is against
-mark-sweep-with-a-nursery rather than against nothing.
+There is also a cost refcounting looked certain not to escape: Wren has cycles
+by construction. A class refers to its methods, a method's closure refers to
+its module, a module refers to the class. A pure refcount leaks all of that.
 
-### What refcounting would actually be worth here
-
-The census gives the prize a number for the first time. `binary_trees` is
-104,575 B live and peaked at 185,156 B on the device, so **43% of peak is
-garbage the threshold is holding rather than anything the representation
-wastes**. That is larger than every object-layout saving in this document put
-together, and it is what prompt reclamation would recover.
-
-Whether prompt reclamation *works* on that garbage is a separate question, and
-the section below answers it by measuring rather than by reasoning from the
-cycles the language obviously has.
+**That turned out to be true and irrelevant**, which is the sort of thing only
+a measurement finds: those cycles are in the *live* set, and a collection never
+sees them. The sections below are what happened when the table above was
+stopped being argued about and built instead.
 
 ### What should replace it — what the profile says
 
@@ -514,47 +511,13 @@ A zero is worth nothing until the instrument has been shown to report
 non-zero, so the profiler first runs a program built to make 250 cyclic objects
 and prints what the simulation says about it. It says 250.
 
-### So: refcounting in front, tracing behind
+### What was recommended, before any of it was built
 
-The evidence points one way, and it is not the way the table above expected.
-
-**Refcounting is the memory answer**, because the biggest memory number in this
-project is not in any object's layout. `binary_trees` holds 76,727 B live and
-peaks at 158,124 B: **half of what it uses is garbage that has died and not
-been noticed yet**. Prompt reclamation removes that, and the profile says
-prompt reclamation would work on 100% of it.
-
-**Deferred counting is what makes it affordable.** Count only references held
-*by heap objects* — an instance's fields, a list's elements, a map's entries, a
-closed upvalue — and never those on the stack or in locals. `Value` stays
-`Copy`, the interpreter's hot path is untouched, and only `StoreField` and the
-container mutations adjust a count. An object reaching zero becomes a
-*candidate* rather than provably dead, because the stack may still hold it, and
-candidates are confirmed against the roots that are already enumerated for the
-collector.
-
-**The counters cost one byte a slot**, in a side array beside the mark bits,
-which is what keeps the object header at zero bytes. A count that saturates at
-255 sticks there and can only be freed by tracing.
-
-**Tracing stays, and gets rare.** Two things need it: saturated counts, and the
-live cycles the language creates on purpose. It stops being a growth-triggered
-event and becomes a backstop.
-
-The honest cost, which the profile also shows: `deeply_nested_gc.wren` builds a
-chain of 400,000 maps and drops it. A reference count frees that in one
-cascading decrement — an unbounded pause, which is the same problem a large
-sweep has, moved rather than solved.
-
-**What is not worth building**, on this evidence:
-
-- **More bitmaps.** The marks are already one bit per slot in a side vector.
-  There is nothing left to win.
-- **A moving or compacting arena**, as the first step. It would remove the
-  ~8 bytes of allocator header on every instance's field block and one
-  dependent load per field access, which the census priced at 9,312 B across
-  `binary_trees` — real, but a quarter of what prompt reclamation is worth, and
-  it needs objects to move.
+The profile's first reading said: refcounting in front, tracing behind,
+because 100% of the garbage 873 programs produce is acyclic and half of peak
+looked like floating garbage. Both halves of that were built. The sections
+below are what they measured, kept in the order they were learned because the
+order is the useful part.
 
 ### What refcounting measured, and what it means for a nursery
 
@@ -585,57 +548,120 @@ And the "half of peak is floating garbage" figure that motivated it compared a
 host census of the live set against the device's retained heap. Those are not
 the same measurement.
 
-### The shape the evidence actually points at
+### The nursery, built and measured
 
-Not refcounting, and not a generational collector with several generations and
-a compacting old space either. One nursery, and nothing else:
+Built, behind the `nursery` feature, and off. Objects already live in slots
+addressed by a stable index, so **a generation is a bitmap over slots rather
+than a region of memory**: a survivor is promoted by clearing a bit and never
+changes address. The migration a copying nursery pays for does not arise.
 
-- **84% of allocations die before the next collection.** A minor collection
-  traces roots and the remembered set, marks the sixth that survives, promotes
-  them and resets the nursery. Its cost is the survivors, not the live set.
-- **Long-lived objects stop being re-marked.** That is the 1.70-to-34 marked-
-  per-object-freed waste, and it is the half of the problem a threshold cannot
-  touch.
-- **No counting.** A nursery trace already learns what a reference count would
-  have told it, without a barrier on every store. The write-barrier *sites*
-  from the refcounting work are the ones a remembered set needs, so that part
-  is not wasted -- only the retain and release in them would be replaced by
-  recording an old-to-young reference.
-- **Bump allocation in the nursery**, which makes creating an object a pointer
-  move rather than a free-list pop, and makes reclaiming the whole nursery a
-  pointer reset.
+A minor collection traces the roots and the remembered set, does not scan old
+objects, frees the young slots nothing reached and promotes the rest. The
+invariant it rests on -- an old object may only point at a young one if the
+barrier recorded it -- is checked the same way the reference counts were, by
+`verify_remembered`, and holds across all 873 programs.
 
-The honest expectation is the same ceiling as before: at most the 17% the
-collector costs on an allocating program, and nothing on one that does not
-allocate. **The reason to build it is memory, not speed** -- a nursery bounds
-floating garbage by construction, and a bound is what a fixed heap needs.
+**On the host it does exactly what the theory says.** For `binary_trees`:
 
-Which is also why the cheap version of that bound went in first: see below.
+| nursery | collector's share | promoted | major collections |
+|---|---|---|---|
+| none | 28.2% | — | 139 |
+| 256 objects | 19.7% | 56% | 65 |
+| 512 | 16.6% | 46% | 49 |
+| 1024 | 10.8% | 24% | 26 |
+| 2048 | **7.8%** | **13.7%** | **14** |
+
+Major collections fall by an order of magnitude and the promotion rate
+converges on the 16% the profile predicted.
+
+**On the device it is slower and much larger.** With a 2048-object nursery and
+a 16 KB headroom: 9.105 s against 8.455, and a peak of 176,736 B against
+133,880. Two reasons, and the second is the one that matters:
+
+- A minor collection's fixed costs -- clearing ten mark bitmaps, gathering the
+  roots, clearing ten young and ten remembered bitmaps -- are proportional to
+  the whole table rather than to the nursery, so on a part where the collector
+  was only 17% to begin with they eat the saving.
+- **The nursery is peak memory.** Peak is the live set, plus the headroom the
+  old generation is allowed, plus the nursery. A 2048-object nursery is about
+  60 KB of young objects that by construction are not collected yet. Shrinking
+  it to bound that pushes the promotion rate back up -- 46% at 512 -- and
+  promoted garbage can only be reclaimed by a major.
+
+That trade has no good point on this workload, which is the finding. Without a
+headroom it does not merely lose: majors become rare enough that the old
+generation grows past the 320 KB the part has, and it runs out of memory.
+
+### Three alternatives, one conclusion
+
+Reference counting, a young generation, and a fixed headroom have all now been
+built and measured against the tracing collector. On an ESP32-C6FH4 at
+160 MHz, `binary_trees`, speed profile:
+
+| | time | peak |
+|---|---|---|
+| **tracing, as it stands** | **8.455 s** | 133,880 B |
+| tracing + 16 KB headroom | 9.240 s | **121,624 B** |
+| reference counting | 9.630 s | 126,056 B |
+| nursery + 16 KB headroom | 9.105 s | 176,736 B |
+
+**Nothing beats the collector that is already there on time, and the simplest
+thing beats everything on memory.** The profile said why before any of it was
+written: the collector is 16.9% of the one benchmark that allocates and
+0.0-0.6% of the rest, so a replacement can win at most 17% of one program --
+while every replacement adds work proportional to what the program *does*
+rather than to what the collector *costs*.
+
+The useful part of all three is what they leave behind: a write barrier at
+every store into a heap object, verified complete two different ways, and a
+profiler that can price the next idea before it is built.
 
 ### The dial that is already there
 
-Until then, the same 43% has a one-line lever: how far the live set may grow
-before collecting again. Upstream's default is 1.5x and this matches it, for
-comparability rather than because it is right on a part with 320 KB.
+How far the live set may grow before collecting again. Upstream's default is
+1.5x and this matches it, for comparability rather than because it is right on
+a part with 320 KB.
 
-Measured on an ESP32-C6, 1.25x instead took `binary_trees` peak from 185,156 B
-to 160,628 B — **13% less memory for 4.6% more time** — and did not move the
-other three benchmarks at all, because they do not collect often enough for the
-threshold to matter. `Heap::set_growth` exists so a firmware can make that
-trade; the default is left alone so the published numbers stay comparable with
-the C port.
+Measured on an ESP32-C6, 1.25x instead took `binary_trees` peak down 13% for
+4.6% more time, and did not move the other three benchmarks at all, because
+they do not collect often enough for the threshold to matter.
 
-**A ratio is the wrong shape for a fixed heap, though.** It lets a program
-hold half as much garbage again as it is using, so the allowance grows with
-the workload on a part whose total does not. `Heap::set_headroom` makes the
+**A ratio is the wrong shape for a fixed heap, though.** It lets a program hold
+half as much garbage again as it is using, so the allowance grows with the
+workload on a part whose total does not. `Heap::set_headroom` makes the
 threshold the live set plus a constant instead: with 16 KB of headroom,
-`binary_trees` peaked at 121,624 B rather than 133,888, nine percent less for
-eight percent more time — and, more usefully, at a number a firmware can
-budget against, because it no longer moves with the program.
+`binary_trees` peaked at 121,624 B rather than 133,880 — nine percent less for
+eight percent more time, and at a number a firmware can budget against.
 
-That is the property a nursery would provide by construction. The headroom is
-the two-line version of it, and it is what makes the nursery a speed
-optimisation of an existing guarantee rather than a new one.
+Of everything tried against the collector, this is the only one that stayed
+useful, and it is four lines.
+
+### What is left worth building
+
+Not another liveness policy: three have been measured and the collector wins.
+What the numbers still point at is **where objects live, not when they die**:
+
+- **Chunked slot tables.** A table's `Vec` holds its high-water mark for ever;
+  a program with a spike never gives the memory back. Slots in chunks -- a
+  few kilobytes each, sized to the type, returned to a pool when a chunk
+  empties -- would let it. This is an allocator change with no collector risk,
+  and it is the one thing on this page that reduces memory without costing
+  time.
+
+  **A chunk could be an object itself** -- a hidden type the language never
+  sees, holding a block of slots and addressed by a handle like anything else.
+  The attraction is that chunk lifetime then reuses the machinery that already
+  exists: the tables, the free list, the sweep. The cost is a bootstrap, since
+  the table that holds chunks cannot itself live in a chunk, and a second
+  indirection on every access -- handle to chunk, chunk to slot -- which is
+  the one thing this design has spent the most effort removing. Worth
+  measuring before it is assumed either way; a plain `Vec` of boxed blocks per
+  type needs no bootstrap and no extra hop.
+- **`Option<ObjUpvalue>` is 24 bytes where the payload is 16**, because a
+  `usize` and a `Value` leave no spare bit pattern for `Option` to use, and
+  upvalues are 19.2% of everything allocated. An occupancy bitmap beside each
+  table instead of an `Option` in every slot fixes that for one bit a slot,
+  and fixes it for anything added later with no niche.
 
 ## The memory targets these have to meet
 
@@ -657,7 +683,9 @@ All of it: the representation, the object types, mark-sweep over them, the
 lexer, the compiler, the interpreter and the core library. `crates/wren` passes
 all 829 of upstream's own tests, from source and through a bytecode round-trip.
 
-What this document is now for is the record of which representation decisions
-were tested and what they measured — the object cost table, the census, the
-indirection count, and the two levers that have numbers but no implementation
-yet (per-type tables, and refcounting in front of the tracing collector).
+What this document is now for is the record of which decisions were tested and
+what they measured: the object cost table, the census, the indirection count,
+the three replacements for the collector that were built and are switched off,
+and the two things still worth building. The negative results are the most
+useful part of it — each one was predicted by a number already on this page
+and read wrongly, and the reading is recorded beside the correction.

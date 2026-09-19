@@ -85,13 +85,20 @@ impl WrenError {
 /// a message.
 const MAX_FRAMES: usize = 256;
 
-/// How many zero-count objects to gather before confirming them.
+/// How many objects the nursery holds before it is collected.
 ///
-/// Each confirmation scans the roots, so this trades promptness for that
-/// scan. Too small and a loop that makes one dead string per iteration scans
-/// the stack every time; too large and the memory refcounting is supposed to
-/// reclaim sits around anyway.
-const CANDIDATES_BEFORE_FLUSH: usize = 64;
+/// **This is the bound on floating garbage**, which is the reason to have a
+/// nursery on a fixed heap: peak memory is the live set plus at most this many
+/// young objects. Too small and the roots are scanned constantly; too large
+/// and the bound stops being useful.
+const NURSERY_OBJECTS: usize = 2048;
+
+/// Whether this build has a young generation.
+///
+/// A constant so that the check above folds away entirely when it does not:
+/// `heap.young()` is a field read, and a field read and a comparison on every
+/// instruction is not free even when the answer is always no.
+const NURSERY: bool = cfg!(feature = "nursery");
 
 /// Why the interpreter keeps `chunk`, `ip` and `base` in locals
 /// ------------------------------------------------------------
@@ -462,11 +469,6 @@ impl Vm {
         // **Only now.** The classes above were created empty and populated by
         // `install`, so flattening any earlier would have copied nothing.
         vm.flatten_class_hierarchy();
-        // The core library is built by batch: metaclasses attached after the
-        // fact, four classes reparented onto `Sequence`, several hundred
-        // methods bound. Rather than a barrier at each, the counts are settled
-        // once here, from the object graph that resulted.
-        vm.heap.rebuild_counts();
         vm.core_variables = vm.modules[0].values.len();
 
         // On a host there is an obvious clock and no reason to make every
@@ -546,13 +548,11 @@ impl Vm {
             // `random` brings a class and a metaclass with it, neither of
             // which existed when the hierarchy was last flattened.
             self.flatten_class_hierarchy();
-            self.heap.rebuild_counts();
             return Ok((index, None));
         }
         if name == "meta" {
             let index = core::install_meta(self);
             self.flatten_class_hierarchy();
-            self.heap.rebuild_counts();
             return Ok((index, None));
         }
 
@@ -712,12 +712,12 @@ impl Vm {
     /// The `is_none` guard is what makes an override win. It matters for the
     /// core classes, which are populated before they are flattened and so
     /// already hold their own definitions of things like `toString`.
-    fn inherit_methods(&mut self, child: ObjectId, parent: ObjectId) {
+    fn inherit_methods(&mut self, child_id: ObjectId, parent: ObjectId) {
         let inherited = match self.heap.class(parent) {
             Some(parent) => parent.methods.clone(),
             _ => return,
         };
-        let Some(child) = self.heap.class_mut(child) else {
+        let Some(child) = self.heap.class_mut(child_id) else {
             return;
         };
         if child.methods.len() < inherited.len() {
@@ -729,15 +729,15 @@ impl Vm {
         for (symbol, entry) in inherited.iter().enumerate() {
             if child.methods[symbol] == crate::object::NO_METHOD {
                 child.methods[symbol] = *entry;
-                // Copying an entry down makes a second reference to the same
-                // closure, which the child now holds as well as the parent.
+                // Copying an entry down makes the child refer to the parent's
+                // closure as well, which the barrier has to hear about.
                 if let Some(closure) = crate::object::entry_closure(*entry) {
                     copied.push(closure);
                 }
             }
         }
         for closure in copied {
-            self.heap.retain_id(closure);
+            self.heap.wrote(child_id, Value::object(closure));
         }
     }
 
@@ -1065,13 +1065,11 @@ impl Vm {
             }
             let value = self.stack.get(slot).copied().unwrap_or(Value::NULL);
             // **Closing an upvalue turns a stack reference into a heap one**,
-            // which is exactly the transition the counts exist to notice. The
-            // old contents are `undefined` while it is open, so there is
-            // nothing to release.
-            self.heap.retain(value);
+            // which is exactly the transition the barrier exists to notice.
             if let Some(upvalue) = self.heap.upvalue_mut(id) {
                 upvalue.closed = value;
             }
+            self.heap.wrote(id, value);
         }
         self.open_upvalues = still_open;
     }
@@ -1090,19 +1088,17 @@ impl Vm {
     /// only live references are the ones below.
     /// only live references are the ones below.
     ///
-    /// Confirm the zero-count candidates against the roots, and free what
-    /// nothing is holding.
+    /// Collect the young generation.
     ///
-    /// **The handles go into a buffer the VM keeps.** This runs once every few
-    /// dozen allocations, and an allocation per flush is exactly the sort of
-    /// cost that makes prompt reclamation more expensive than the collector it
-    /// is meant to save.
-    fn flush_dead(&mut self) {
+    /// **The handles go into a buffer the VM keeps.** This runs whenever the
+    /// nursery fills, which is often, and an allocation per collection is the
+    /// sort of cost that eats what a nursery is supposed to save.
+    fn collect_young(&mut self) {
         let roots = self.roots();
         let mut buffer = ::core::mem::take(&mut self.root_handles);
         buffer.clear();
         buffer.extend(roots.iter().filter_map(|value| value.as_object()));
-        self.heap.flush_candidates(&buffer);
+        self.heap.collect_minor(&buffer);
         buffer.clear();
         self.root_handles = buffer;
     }
@@ -1769,17 +1765,10 @@ impl Vm {
                     let attributes = self.stack.pop().unwrap_or(Value::NULL);
                     let class = self.stack.pop().unwrap_or(Value::NULL);
                     if let Some(id) = class.as_object() {
-                        let old = match Heap::counting() {
-                            true => self.heap.class(id).map(|class| class.attributes),
-                            false => None,
-                        };
-                        self.heap.retain(attributes);
                         if let Some(class) = self.heap.class_mut(id) {
                             class.attributes = attributes;
                         }
-                        if let Some(old) = old {
-                            self.heap.release(old);
-                        }
+                        self.heap.wrote(id, attributes);
                     }
                 }
                 Op::ImportModule => {
@@ -1971,22 +1960,28 @@ impl Vm {
             // Checking here instead costs a branch per instruction and removes
             // the whole category: at an instruction boundary the live set is
             // exactly what `roots` enumerates, with nothing in flight.
-            if self.heap.should_collect() {
+            //
+            // **The nursery is asked first.** A minor collection costs the
+            // young generation; a major costs the live set. Checking the major
+            // threshold first meant it always won -- the heap passes 1.5x its
+            // live size long before a thousand objects accumulate -- and the
+            // nursery never collected at all.
+            if NURSERY && self.heap.young() >= NURSERY_OBJECTS {
+                // **The cheap half of collection**, at the same safe point and
+                // for the same reason. A minor collection costs the young
+                // generation and the remembered set rather than the live set,
+                // so it is worth doing often -- and 84% of what it looks at is
+                // already dead.
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.ip = ip;
+                }
+                self.collect_young();
+            } else if self.heap.should_collect() {
                 if let Some(frame) = self.frames.last_mut() {
                     frame.ip = ip;
                 }
                 let roots = self.roots();
                 self.heap.collect(roots);
-            } else if self.heap.candidates() >= CANDIDATES_BEFORE_FLUSH {
-                // **The cheap half of collection**, at the same safe point and
-                // for the same reason. Confirming a candidate costs a scan of
-                // the roots, not of the heap, so it is worth doing often --
-                // but not once per candidate, which would scan the roots for
-                // every dead string.
-                if let Some(frame) = self.frames.last_mut() {
-                    frame.ip = ip;
-                }
-                self.flush_dead();
             }
         }
     }
@@ -2090,17 +2085,10 @@ impl Vm {
                 }
             }
             None => {
-                let old = match Heap::counting() {
-                    true => self.heap.upvalue(id).map(|upvalue| upvalue.closed),
-                    false => None,
-                };
-                self.heap.retain(value);
                 if let Some(upvalue) = self.heap.upvalue_mut(id) {
                     upvalue.closed = value;
                 }
-                if let Some(old) = old {
-                    self.heap.release(old);
-                }
+                self.heap.wrote(id, value);
             }
         }
         Ok(())
@@ -2163,26 +2151,16 @@ impl Vm {
                 "Cannot access a field outside of a class.",
             ));
         };
-        // The barrier, in the order every one of them takes: read what is
-        // being overwritten, retain the new reference, store, release the old.
         let at = offset + index;
-        let old = match Heap::counting() {
-            true => self
-                .heap
-                .instance(id)
-                .and_then(|it| it.fields.get(at).copied()),
-            false => None,
-        };
-        self.heap.retain(value);
         match self.heap.instance_mut(id) {
             Some(instance) => {
                 if instance.fields.len() <= at {
                     instance.fields.resize(at + 1, Value::NULL);
                 }
                 instance.fields[at] = value;
-                if let Some(old) = old {
-                    self.heap.release(old);
-                }
+                // The barrier, in the shape every one of them takes: store,
+                // then say which object was stored into and what went in.
+                self.heap.wrote(id, value);
                 Ok(())
             }
             _ => Err(RuntimeError::new(
@@ -2222,23 +2200,13 @@ impl Vm {
                 "Cannot use a static field outside of a class definition.",
             ));
         };
-        let old = match Heap::counting() {
-            true => self
-                .heap
-                .class(owner)
-                .and_then(|c| c.static_fields.get(index).copied()),
-            false => None,
-        };
-        self.heap.retain(value);
         if let Some(class) = self.heap.class_mut(owner) {
             if class.static_fields.len() <= index {
                 class.static_fields.resize(index + 1, Value::NULL);
             }
             class.static_fields[index] = value;
         }
-        if let Some(old) = old {
-            self.heap.release(old);
-        }
+        self.heap.wrote(owner, value);
         Ok(())
     }
 
@@ -2379,23 +2347,12 @@ impl Vm {
         };
         self.set_field_offset(closure, inherited, superclass, class_id);
 
-        // A method table entry is a heap reference like any other, and
-        // binding over an existing one drops whatever was there.
-        let replaced = match Heap::counting() {
-            true => self
-                .heap
-                .class(target)
-                .map(|class| class.method_entry(symbol))
-                .and_then(crate::object::entry_closure),
-            false => None,
-        };
-        self.heap.retain_id(closure);
         if let Some(class) = self.heap.class_mut(target) {
             class.define(symbol, crate::object::closure_entry(closure));
         }
-        if let Some(replaced) = replaced {
-            self.heap.release_id(replaced);
-        }
+        // A method table entry is a reference like any other: a class that has
+        // already been collected once now points at a freshly compiled body.
+        self.heap.wrote(target, Value::object(closure));
         Ok(())
     }
 

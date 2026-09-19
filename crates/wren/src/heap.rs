@@ -41,7 +41,8 @@ use crate::value::Value;
 ///
 /// A `const` rather than a `#[cfg]` at each site: the barriers read better as
 /// ordinary code, and a constant `false` folds them away just as completely.
-const COUNTING: bool = cfg!(feature = "refcount");
+/// Whether the heap keeps a young generation.
+const NURSERY: bool = cfg!(feature = "nursery");
 
 /// How much the live set may grow before the next collection.
 ///
@@ -95,27 +96,29 @@ impl Collection {
 /// discriminant that has to be fetched.
 struct Table<T> {
     slots: Vec<Option<T>>,
-    /// How many *heap objects* refer to each slot.
-    ///
-    /// **One byte, beside the slots rather than inside them**, exactly as the
-    /// mark bits are -- which is what keeps an object's header at zero bytes.
-    /// A count that reaches 255 sticks there and is never decremented again,
-    /// so such an object can only ever be freed by tracing. That is the
-    /// classic sticky-count trade: a byte instead of a word, and a handful of
-    /// popular objects that the backstop has to clean up.
-    ///
-    /// **References from the stack, from locals and from module variables are
-    /// not counted.** Observing those would mean making `Value` non-`Copy`,
-    /// which is the change this design exists to avoid. They are roots
-    /// instead, and an object whose count falls to zero is therefore only a
-    /// *candidate* for freeing -- see `Heap::flush_candidates`.
-    counts: Vec<u8>,
     /// Indices of free slots, newest first. A separate stack rather than a
     /// linked list threaded through the slots themselves: the same asymptotics,
     /// none of the aliasing that a threaded list needs `unsafe` to express.
     free: Vec<u32>,
     /// One bit per slot. Cleared at the start of each mark phase.
     marks: Vec<u64>,
+    /// Slots holding an object that has not yet survived a collection.
+    ///
+    /// **A list and a bitmap, not a region.** The list is what a minor
+    /// collection walks, so its cost is the number of young objects rather
+    /// than the size of the table; the bitmap answers "is this one old?" in
+    /// one test, which is what the write barrier asks on every store.
+    ///
+    /// Nothing moves. Promotion clears a bit and drops an index -- the
+    /// migration a copying nursery pays for does not arise, because a handle
+    /// is an index into a table and an object never changes slots.
+    young: Vec<u32>,
+    young_bits: Vec<u64>,
+    /// Old slots that have had a young reference stored into them, and the
+    /// bits that keep the list free of duplicates.
+    remembered: Vec<u32>,
+    remembered_bits: Vec<u64>,
+
     /// Which collection each object was born before.
     ///
     /// **Only to answer one question, and only under `profile`**: of the
@@ -132,9 +135,12 @@ impl<T> Table<T> {
     fn new() -> Table<T> {
         Table {
             slots: Vec::new(),
-            counts: Vec::new(),
             free: Vec::new(),
             marks: Vec::new(),
+            young: Vec::new(),
+            young_bits: Vec::new(),
+            remembered: Vec::new(),
+            remembered_bits: Vec::new(),
             #[cfg(feature = "profile")]
             born: Vec::new(),
         }
@@ -151,8 +157,12 @@ impl<T> Table<T> {
     }
 
     /// Was this object allocated since the last collection?
+    ///
+    /// Distinct from [`Table::is_young`], which asks whether it is in the
+    /// young *generation* -- the same idea, but one is a measurement and the
+    /// other is the collector's bookkeeping.
     #[cfg(feature = "profile")]
-    fn is_young(&self, index: u32, generation: u32) -> bool {
+    fn is_newborn(&self, index: u32, generation: u32) -> bool {
         self.born.get(index as usize).copied() == Some(generation)
     }
 
@@ -160,18 +170,11 @@ impl<T> Table<T> {
         match self.free.pop() {
             Some(index) => {
                 self.slots[index as usize] = Some(value);
-                if COUNTING {
-                    self.counts[index as usize] = 0;
-                }
                 index
             }
             None => {
                 let index = self.slots.len();
                 self.slots.push(Some(value));
-                // A byte a slot, and only where it is used.
-                if COUNTING {
-                    self.counts.push(0);
-                }
                 if index / 64 >= self.marks.len() {
                     self.marks.push(0);
                 }
@@ -179,39 +182,59 @@ impl<T> Table<T> {
             }
         }
     }
-
-    /// Note one more heap reference to a slot. Saturates rather than wraps.
-    fn retain(&mut self, index: u32) {
-        if let Some(count) = self.counts.get_mut(index as usize) {
-            *count = count.saturating_add(1);
-        }
-    }
-
-    /// Note one fewer, and say whether that was the last one.
-    ///
-    /// A stuck count never comes back down, so this answers `false` for one --
-    /// the object stays until a trace proves it dead.
-    fn release(&mut self, index: u32) -> bool {
-        match self.counts.get_mut(index as usize) {
-            Some(count) if *count == u8::MAX => false,
-            Some(count) if *count > 0 => {
-                *count -= 1;
-                *count == 0
-            }
-            _ => false,
-        }
-    }
-
-    fn count(&self, index: u32) -> u8 {
-        self.counts.get(index as usize).copied().unwrap_or(0)
-    }
-
     fn get(&self, index: u32) -> Option<&T> {
         self.slots.get(index as usize)?.as_ref()
     }
 
     fn get_mut(&mut self, index: u32) -> Option<&mut T> {
         self.slots.get_mut(index as usize)?.as_mut()
+    }
+
+    /// Is this slot's object still in the young generation?
+    fn is_young(&self, index: u32) -> bool {
+        let index = index as usize;
+        match self.young_bits.get(index / 64) {
+            Some(word) => word & (1 << (index % 64)) != 0,
+            None => false,
+        }
+    }
+
+    /// Put a freshly allocated slot in the young generation.
+    fn make_young(&mut self, index: u32) {
+        let at = index as usize;
+        while self.young_bits.len() <= at / 64 {
+            self.young_bits.push(0);
+        }
+        if self.young_bits[at / 64] & (1 << (at % 64)) == 0 {
+            self.young_bits[at / 64] |= 1 << (at % 64);
+            self.young.push(index);
+        }
+    }
+    /// Note that an old slot now refers to something young.
+    fn remember(&mut self, index: u32) {
+        let at = index as usize;
+        while self.remembered_bits.len() <= at / 64 {
+            self.remembered_bits.push(0);
+        }
+        if self.remembered_bits[at / 64] & (1 << (at % 64)) == 0 {
+            self.remembered_bits[at / 64] |= 1 << (at % 64);
+            self.remembered.push(index);
+        }
+    }
+
+    fn forget_all(&mut self) {
+        self.remembered.clear();
+        for word in &mut self.remembered_bits {
+            *word = 0;
+        }
+    }
+
+    /// Everything alive is old now.
+    fn age_all(&mut self) {
+        self.young.clear();
+        for word in &mut self.young_bits {
+            *word = 0;
+        }
     }
 
     /// What one slot of this table costs, which is the whole point of having
@@ -338,12 +361,10 @@ pub struct Heap {
     /// whose intermediate results are not yet reachable from any root.
     paused: bool,
     collections: usize,
-    /// Handles whose count has reached zero.
-    ///
-    /// **Zero means "nothing on the heap refers to this", not "dead"** -- the
-    /// stack is not counted, so a candidate may still be in use. They are
-    /// confirmed against the roots before anything is freed.
-    candidates: Vec<ObjectId>,
+    /// How many objects are in the young generation, kept as a running total.
+    young_total: usize,
+    /// What those objects cost, so a major collection is not triggered by them.
+    young_bytes: usize,
     /// A reusable buffer for the short reference lists the barriers build.
     ///
     /// **Without this, counting cost an allocation per allocation.** Every
@@ -400,6 +421,12 @@ pub struct Profile {
     pub slots_swept: u64,
     /// Objects freed by their reference count rather than by a trace.
     pub freed_promptly: u64,
+    /// How many minor collections ran.
+    pub minor_collections: u64,
+    /// Young objects that survived one and were promoted where they stood.
+    pub promoted: u64,
+    /// Young objects a minor collection freed.
+    pub freed_young: u64,
     /// Objects allocated, counted here so both halves of the generational
     /// question come from the same place.
     pub young_allocated: u64,
@@ -432,7 +459,8 @@ impl Heap {
             headroom: None,
             paused: false,
             collections: 0,
-            candidates: Vec::new(),
+            young_total: 0,
+            young_bytes: 0,
             scratch: Vec::new(),
             #[cfg(feature = "profile")]
             profile: Profile::default(),
@@ -459,24 +487,6 @@ impl Heap {
             self.profile.allocated[object.object_type() as usize] += 1;
         }
         self.live += 1;
-
-        // **Creation is a barrier, and it is complete by construction.** A new
-        // object usually arrives holding references already -- an instance
-        // knows its class, a closure knows its function -- and rather than
-        // listing them at each of the dozens of construction sites, they are
-        // read off the same `trace` the collector uses. A type that traces
-        // correctly counts correctly.
-        //
-        // Fibers are the exception, here and everywhere: their references are
-        // roots rather than heap references, so they are not counted.
-        let mut born = match COUNTING {
-            true => core::mem::take(&mut self.scratch),
-            false => Vec::new(),
-        };
-        if COUNTING && object.object_type() != ObjectType::Fiber {
-            born.clear();
-            object.trace(&mut born);
-        }
 
         // **The cost is the slot this type actually uses**, not the largest
         // slot any type uses. Charging a flat size here and a per-type size at
@@ -522,30 +532,26 @@ impl Heap {
             self.profile.young_allocated += 1;
         }
 
-        self.bytes += cost;
-        // **Indexed, not iterated.** `born` is the heap's own scratch
-        // buffer and `retain_id` takes `&mut self`, so iterating it would
-        // borrow the thing being mutated. Taking it out and putting it back
-        // is what avoids an allocation per allocation.
-        if COUNTING {
-            #[allow(clippy::needless_range_loop)]
-            for index in 0..born.len() {
-                self.retain_id(born[index]);
+        if NURSERY {
+            self.young_total += 1;
+            self.young_bytes += cost;
+            let index = id.index();
+            match ObjectType::from_tag(id.tag()) {
+                Some(ObjectType::Class) => self.classes.make_young(index),
+                Some(ObjectType::Closure) => self.closures.make_young(index),
+                Some(ObjectType::Fn) => self.functions.make_young(index),
+                Some(ObjectType::Fiber) => self.fibers.make_young(index),
+                Some(ObjectType::Instance) => self.instances.make_young(index),
+                Some(ObjectType::List) => self.lists.make_young(index),
+                Some(ObjectType::Map) => self.maps.make_young(index),
+                Some(ObjectType::Range) => self.ranges.make_young(index),
+                Some(ObjectType::String) => self.strings.make_young(index),
+                Some(ObjectType::Upvalue) => self.upvalues.make_young(index),
+                None => {}
             }
-            born.clear();
-            self.scratch = born;
         }
 
-        // **A new object starts at zero and is a candidate immediately.**
-        // Most garbage never gets stored into anything: a temporary string, an
-        // intermediate list, the receiver of one method call. Its count is zero
-        // from birth and nothing ever releases it, so waiting for a count to
-        // *fall* to zero would leave the common case entirely to the tracing
-        // collector -- measured at 0.6% of reclaims before this line existed.
-        if COUNTING {
-            self.candidates.push(id);
-        }
-
+        self.bytes += cost;
         #[cfg(feature = "profile")]
         {
             self.profile.allocated_bytes += cost as u64;
@@ -708,216 +714,75 @@ impl Heap {
             false => None,
         }
     }
-
-    /// Note that **a heap object** now refers to `value`.
+    /// A heap object's field now holds `new` where it held `old`.
     ///
-    /// The barrier every store into an object's fields, a list's elements, a
-    /// map's entries or a class's tables has to go through. Stack and local
-    /// references are deliberately not counted: see `Table::counts`.
+    /// **The whole of the write barrier.** If an *old* object has just been
+    /// made to point at a *young* one, a minor collection would not otherwise
+    /// find the young object -- it does not scan old objects -- so the old one
+    /// joins the remembered set.
     ///
-    /// **Over-counting is safe and under-counting is a use-after-free**, which
-    /// is the asymmetry the whole design rests on. A missed `retain` frees
-    /// something still in use; a missed `release` leaks until the tracing
-    /// backstop runs. `verify_counts` exists to prove no `retain` is missing.
-    pub fn retain(&mut self, value: Value) {
-        if !COUNTING {
-            return;
-        }
-        if let Some(id) = value.as_object() {
-            self.retain_id(id);
+    /// Everything else is free: a store into a young object needs nothing,
+    /// because a young object is scanned anyway, and a store of anything that
+    /// is not a young handle needs nothing either. That is the difference
+    /// between this and a reference count, which has to act on every store
+    /// whatever is being stored.
+    pub fn wrote(&mut self, target: ObjectId, new: Value) {
+        if NURSERY {
+            self.note_old_to_young(target, new);
         }
     }
 
-    /// Note that a heap object no longer refers to `value`.
-    pub fn release(&mut self, value: Value) {
-        if !COUNTING {
+    /// Record an old object that has been pointed at something young.
+    fn note_old_to_young(&mut self, target: ObjectId, new: Value) {
+        let Some(young) = new.as_object() else {
+            return;
+        };
+        if !self.is_young(young) || self.is_young(target) {
             return;
         }
-        if let Some(id) = value.as_object() {
-            self.release_id(id);
-        }
-    }
-
-    /// Swap one heap reference for another, **retaining before releasing**.
-    ///
-    /// The order is not cosmetic: storing a value over itself would otherwise
-    /// drop the count to zero and make it a candidate for freeing between the
-    /// two halves of an assignment that changed nothing.
-    pub fn replace(&mut self, old: Value, new: Value) {
-        self.retain(new);
-        self.release(old);
-    }
-
-    pub fn retain_id(&mut self, id: ObjectId) {
-        if !COUNTING {
-            return;
-        }
-        let index = id.index();
-        match ObjectType::from_tag(id.tag()) {
-            Some(ObjectType::Class) => self.classes.retain(index),
-            Some(ObjectType::Closure) => self.closures.retain(index),
-            Some(ObjectType::Fn) => self.functions.retain(index),
-            Some(ObjectType::Fiber) => self.fibers.retain(index),
-            Some(ObjectType::Instance) => self.instances.retain(index),
-            Some(ObjectType::List) => self.lists.retain(index),
-            Some(ObjectType::Map) => self.maps.retain(index),
-            Some(ObjectType::Range) => self.ranges.retain(index),
-            Some(ObjectType::String) => self.strings.retain(index),
-            Some(ObjectType::Upvalue) => self.upvalues.retain(index),
+        let index = target.index();
+        match ObjectType::from_tag(target.tag()) {
+            Some(ObjectType::Class) => self.classes.remember(index),
+            Some(ObjectType::Closure) => self.closures.remember(index),
+            Some(ObjectType::Fn) => self.functions.remember(index),
+            Some(ObjectType::Fiber) => self.fibers.remember(index),
+            Some(ObjectType::Instance) => self.instances.remember(index),
+            Some(ObjectType::List) => self.lists.remember(index),
+            Some(ObjectType::Map) => self.maps.remember(index),
+            Some(ObjectType::Range) => self.ranges.remember(index),
+            Some(ObjectType::String) => self.strings.remember(index),
+            Some(ObjectType::Upvalue) => self.upvalues.remember(index),
             None => {}
         }
     }
 
-    /// Drop a reference; the handle is remembered if the count reached zero.
-    pub fn release_id(&mut self, id: ObjectId) {
-        if !COUNTING {
-            return;
-        }
-        let index = id.index();
-        let emptied = match ObjectType::from_tag(id.tag()) {
-            Some(ObjectType::Class) => self.classes.release(index),
-            Some(ObjectType::Closure) => self.closures.release(index),
-            Some(ObjectType::Fn) => self.functions.release(index),
-            Some(ObjectType::Fiber) => self.fibers.release(index),
-            Some(ObjectType::Instance) => self.instances.release(index),
-            Some(ObjectType::List) => self.lists.release(index),
-            Some(ObjectType::Map) => self.maps.release(index),
-            Some(ObjectType::Range) => self.ranges.release(index),
-            Some(ObjectType::String) => self.strings.release(index),
-            Some(ObjectType::Upvalue) => self.upvalues.release(index),
-            None => false,
-        };
-        if emptied {
-            self.candidates.push(id);
-        }
-    }
-
-    /// What the count says, for tests and for the verifier.
-    pub fn count_of(&self, id: ObjectId) -> u8 {
+    /// Has this object yet to survive a collection?
+    pub fn is_young(&self, id: ObjectId) -> bool {
         let index = id.index();
         match ObjectType::from_tag(id.tag()) {
-            Some(ObjectType::Class) => self.classes.count(index),
-            Some(ObjectType::Closure) => self.closures.count(index),
-            Some(ObjectType::Fn) => self.functions.count(index),
-            Some(ObjectType::Fiber) => self.fibers.count(index),
-            Some(ObjectType::Instance) => self.instances.count(index),
-            Some(ObjectType::List) => self.lists.count(index),
-            Some(ObjectType::Map) => self.maps.count(index),
-            Some(ObjectType::Range) => self.ranges.count(index),
-            Some(ObjectType::String) => self.strings.count(index),
-            Some(ObjectType::Upvalue) => self.upvalues.count(index),
-            None => 0,
+            Some(ObjectType::Class) => self.classes.is_young(index),
+            Some(ObjectType::Closure) => self.closures.is_young(index),
+            Some(ObjectType::Fn) => self.functions.is_young(index),
+            Some(ObjectType::Fiber) => self.fibers.is_young(index),
+            Some(ObjectType::Instance) => self.instances.is_young(index),
+            Some(ObjectType::List) => self.lists.is_young(index),
+            Some(ObjectType::Map) => self.maps.is_young(index),
+            Some(ObjectType::Range) => self.ranges.is_young(index),
+            Some(ObjectType::String) => self.strings.is_young(index),
+            Some(ObjectType::Upvalue) => self.upvalues.is_young(index),
+            None => false,
         }
     }
 
-    /// Free the candidates that the roots do not save.
+    /// How many objects are in the young generation.
     ///
-    /// **A count of zero means "no heap object refers to this", not "dead".**
-    /// The stack is not counted, so a candidate may still be a local, an
-    /// argument, or the value an instruction is part way through producing.
-    /// This is where that is settled: scan the roots, keep whatever they
-    /// mention, free the rest.
-    ///
-    /// **The scan is the roots, not the heap**, which is the whole reason
-    /// deferred counting is affordable. A candidate reachable from a root
-    /// *indirectly* -- root, list, candidate -- cannot have a count of zero,
-    /// because that list would be referring to it. So a direct look is enough.
-    ///
-    /// Fibers are the exception, and they are why this takes more than the
-    /// caller's roots: a fiber's stack is a stack, its contents are not
-    /// counted, and a fiber may be referred to only from a field. So every
-    /// fiber's contents are roots here, whether or not the fiber is running.
-    ///
-    /// Freeing cascades: releasing what a dead object referred to may empty
-    /// another count, which joins the worklist. That is the promptness this
-    /// exists for, and also its one pathology -- dropping a chain of 400,000
-    /// maps frees them in one unbounded cascade, which is the same pause a
-    /// large sweep has, moved rather than removed.
-    pub fn flush_candidates(&mut self, roots: &[ObjectId]) -> usize {
-        // `pause` means a caller is holding something in a Rust local that no
-        // root mentions. Tracing honours that and so must this.
-        if !COUNTING || self.paused || self.candidates.is_empty() {
-            return 0;
-        }
-
-        // **Protection is marked in the bitmap, not gathered into a set.** The
-        // mark bits are idle between collections, and a set would mean an
-        // allocation and a tree walk on every flush -- which, at one flush per
-        // sixty-four allocations, was most of what this cost.
-        each_table!(&mut *self, table, _kind, {
-            table.clear_marks();
-        });
-        for id in roots {
-            self.mark_at(*id);
-        }
-        // A fiber's stack is a stack and its contents are not counted, so
-        // every fiber protects what it holds whether it is running or not.
-        let mut scratch = core::mem::take(&mut self.scratch);
-        for index in 0..self.fibers.slots.len() {
-            if !self.fibers.occupied(index as u32) {
-                continue;
-            }
-            let id = ObjectId::tagged(ObjectType::Fiber.tag(), index as u32);
-            self.mark_at(id);
-            scratch.clear();
-            self.trace_at(id, &mut scratch);
-            #[allow(clippy::needless_range_loop)]
-            for at in 0..scratch.len() {
-                self.mark_at(scratch[at]);
-            }
-        }
-
-        let mut freed = 0usize;
-        // Candidates the roots saved keep their candidacy: a count of zero
-        // does not come back on its own, so dropping them here would mean
-        // waiting for a trace once they really do die.
-        let mut saved = Vec::new();
-        let mut worklist = core::mem::take(&mut self.candidates);
-        while let Some(id) = worklist.pop() {
-            // Retained since it was listed, or already gone.
-            if self.count_of(id) != 0 || !self.is_live(id) {
-                continue;
-            }
-            if self.is_marked_at(id) {
-                saved.push(id);
-                continue;
-            }
-
-            scratch.clear();
-            self.trace_at(id, &mut scratch);
-            #[allow(clippy::needless_range_loop)]
-            for at in 0..scratch.len() {
-                self.release_id(scratch[at]);
-            }
-            worklist.append(&mut self.candidates);
-
-            self.bytes = self.bytes.saturating_sub(self.size_at(id));
-            self.live = self.live.saturating_sub(1);
-            self.discard(id);
-            freed += 1;
-        }
-        self.candidates = saved;
-        scratch.clear();
-        self.scratch = scratch;
-
-        #[cfg(feature = "profile")]
-        {
-            self.profile.freed_promptly += freed as u64;
-            self.profile.flushes += 1;
-        }
-        freed
+    /// **One load, because the interpreter asks between every instruction.**
+    /// Summing ten vector lengths here instead cost 13-15% of every benchmark,
+    /// including the ones that never allocate enough to collect at all -- the
+    /// check was more expensive than the collection it was deciding about.
+    pub fn young(&self) -> usize {
+        self.young_total
     }
-
-    /// Whether this build counts references at all.
-    pub fn counting() -> bool {
-        COUNTING
-    }
-
-    /// How many candidates are waiting to be confirmed.
-    pub fn candidates(&self) -> usize {
-        self.candidates.len()
-    }
-
     /// What one object costs, slot and contents.
     fn size_at(&self, id: ObjectId) -> usize {
         let index = id.index();
@@ -943,90 +808,6 @@ impl Heap {
             None => 0,
         }
     }
-
-    /// Recompute every reference count from the object graph.
-    ///
-    /// **For batch construction, not for steady state.** Building the core
-    /// library sets a metaclass on a dozen classes, reparents four more onto
-    /// `Sequence` and binds several hundred methods -- all of it once, at
-    /// start-up, on objects that live for the whole run. Instrumenting each of
-    /// those sites would be thirty-odd barriers to maintain for work that
-    /// happens before any Wren code runs.
-    ///
-    /// So the counts are simply rebuilt afterwards, from the same `trace` the
-    /// collector uses. Correct by the same argument as the creation barrier:
-    /// a type that traces correctly counts correctly.
-    ///
-    /// It is O(the whole heap) and it runs three times in a VM's life -- after
-    /// the core library, and after each of the two modules built on demand.
-    pub fn rebuild_counts(&mut self) {
-        if !COUNTING {
-            return;
-        }
-        each_table!(&mut *self, table, _kind, {
-            for count in &mut table.counts {
-                *count = 0;
-            }
-        });
-
-        let ids = self.ids();
-        let mut referents: Vec<ObjectId> = Vec::new();
-        for id in &ids {
-            if ObjectType::from_tag(id.tag()) == Some(ObjectType::Fiber) {
-                continue;
-            }
-            referents.clear();
-            self.trace_at(*id, &mut referents);
-            for target in core::mem::take(&mut referents) {
-                self.retain_id(target);
-            }
-        }
-        self.candidates.clear();
-    }
-
-    /// Check every count against the references that actually exist.
-    ///
-    /// **This is how a write barrier is shown to be complete**, rather than
-    /// audited by reading the code and hoping. It walks every live object,
-    /// counts the references it holds, and reports any handle whose count
-    /// disagrees. Run across the 873 programs in the repository, a clean
-    /// report is real evidence; a single missing `retain` would be a
-    /// use-after-free the moment prompt freeing is switched on.
-    ///
-    /// Returns `(handle, counted, actual)` for each disagreement.
-    ///
-    /// A fiber's references are not counted -- fibers are roots, and their
-    /// stacks are stacks -- so they are excluded here for the same reason.
-    pub fn verify_counts(&self) -> Vec<(ObjectId, u8, u32)> {
-        let mut actual: alloc::collections::BTreeMap<u32, u32> =
-            alloc::collections::BTreeMap::new();
-        let mut referents: Vec<ObjectId> = Vec::new();
-        for id in self.ids() {
-            if ObjectType::from_tag(id.tag()) == Some(ObjectType::Fiber) {
-                continue;
-            }
-            referents.clear();
-            self.trace_at(id, &mut referents);
-            for target in &referents {
-                *actual.entry(target.raw()).or_insert(0) += 1;
-            }
-        }
-
-        let mut wrong = Vec::new();
-        for id in self.ids() {
-            let counted = self.count_of(id);
-            let real = actual.get(&id.raw()).copied().unwrap_or(0);
-            // A stuck count is not a disagreement, it is the design.
-            if counted == u8::MAX {
-                continue;
-            }
-            if u32::from(counted) != real {
-                wrong.push((id, counted, real));
-            }
-        }
-        wrong
-    }
-
     /// What kind of object a handle names, **from the handle alone**.
     ///
     /// No table is touched: the type is four bits of the handle. That is the
@@ -1075,9 +856,7 @@ impl Heap {
 
     /// Empty a slot and put it back on its table's free list.
     ///
-    /// Dropping the payload releases whatever its `Vec`s held. The references
-    /// it made are the caller's business -- `release_id` has to have been
-    /// called for each of them first, or their counts would be left too high.
+    /// Dropping the payload releases whatever its `Vec`s held.
     fn discard(&mut self, id: ObjectId) {
         let index = id.index();
         macro_rules! discard {
@@ -1088,9 +867,6 @@ impl Heap {
                     .is_some_and(Option::is_some)
                 {
                     $table.slots[index as usize] = None;
-                    if let Some(count) = $table.counts.get_mut(index as usize) {
-                        *count = 0;
-                    }
                     $table.free.push(index);
                 }
             }};
@@ -1251,7 +1027,12 @@ impl Heap {
     /// The VM asks this between instructions, where its roots are well defined,
     /// rather than having the answer forced on it mid-allocation.
     pub fn should_collect(&self) -> bool {
-        !self.paused && self.bytes >= self.threshold
+        // **A major collection is about the old generation.** Counting the
+        // nursery towards its threshold means the major always fires first --
+        // the heap passes 1.5x its live size in a few hundred allocations --
+        // and the nursery never fills, which is exactly what happened: 139
+        // major collections and not one minor.
+        !self.paused && self.bytes.saturating_sub(self.young_bytes) >= self.threshold
     }
 
     /// Suspend collection while a multi-step construction is in flight.
@@ -1266,6 +1047,200 @@ impl Heap {
 
     pub fn resume(&mut self) {
         self.paused = false;
+    }
+
+    /// Check the invariant a minor collection depends on.
+    ///
+    /// **An old object may only point at a young one if the barrier recorded
+    /// it.** A minor collection does not scan old objects, so an unrecorded
+    /// old-to-young reference means a live young object goes unmarked and is
+    /// freed while something still points at it -- the same class of failure a
+    /// missing `retain` was, and just as invisible until a collection happens
+    /// at exactly the wrong moment.
+    ///
+    /// Fibers are exempt: their stacks are moved on and off the VM rather than
+    /// stored through the barrier, so a minor collection scans every old fiber
+    /// unconditionally.
+    ///
+    /// Returns `(old object, the young thing it points at)` for each breach.
+    pub fn verify_remembered(&self) -> Vec<(ObjectId, ObjectId)> {
+        let mut breaches = Vec::new();
+        let mut referents: Vec<ObjectId> = Vec::new();
+        for id in self.ids() {
+            if self.is_young(id) || ObjectType::from_tag(id.tag()) == Some(ObjectType::Fiber) {
+                continue;
+            }
+            referents.clear();
+            self.trace_at(id, &mut referents);
+            for target in &referents {
+                if self.is_young(*target) && !self.is_remembered(id) {
+                    breaches.push((id, *target));
+                }
+            }
+        }
+        breaches
+    }
+
+    /// Whether a slot carries a mark, for the garbage analysis below.
+    #[cfg(feature = "profile")]
+    fn is_marked_at(&self, id: ObjectId) -> bool {
+        let index = id.index();
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => self.classes.is_marked(index),
+            Some(ObjectType::Closure) => self.closures.is_marked(index),
+            Some(ObjectType::Fn) => self.functions.is_marked(index),
+            Some(ObjectType::Fiber) => self.fibers.is_marked(index),
+            Some(ObjectType::Instance) => self.instances.is_marked(index),
+            Some(ObjectType::List) => self.lists.is_marked(index),
+            Some(ObjectType::Map) => self.maps.is_marked(index),
+            Some(ObjectType::Range) => self.ranges.is_marked(index),
+            Some(ObjectType::String) => self.strings.is_marked(index),
+            Some(ObjectType::Upvalue) => self.upvalues.is_marked(index),
+            None => false,
+        }
+    }
+
+    /// Is this old object in the remembered set?
+    fn is_remembered(&self, id: ObjectId) -> bool {
+        let index = id.index() as usize;
+        let bits = match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => &self.classes.remembered_bits,
+            Some(ObjectType::Closure) => &self.closures.remembered_bits,
+            Some(ObjectType::Fn) => &self.functions.remembered_bits,
+            Some(ObjectType::Fiber) => &self.fibers.remembered_bits,
+            Some(ObjectType::Instance) => &self.instances.remembered_bits,
+            Some(ObjectType::List) => &self.lists.remembered_bits,
+            Some(ObjectType::Map) => &self.maps.remembered_bits,
+            Some(ObjectType::Range) => &self.ranges.remembered_bits,
+            Some(ObjectType::String) => &self.strings.remembered_bits,
+            Some(ObjectType::Upvalue) => &self.upvalues.remembered_bits,
+            None => return false,
+        };
+        match bits.get(index / 64) {
+            Some(word) => word & (1 << (index % 64)) != 0,
+            None => false,
+        }
+    }
+
+    /// Whether this build keeps a young generation.
+    pub fn nursery() -> bool {
+        NURSERY
+    }
+
+    /// Collect the young generation only.
+    ///
+    /// **Nothing moves and nothing is copied.** A generation here is a bitmap
+    /// over slots, not a region of memory, so a survivor is promoted by
+    /// clearing its bit and an object never changes address. That is what
+    /// makes this affordable: the migration a copying nursery pays for does
+    /// not exist, because a handle is an index and the index does not change.
+    ///
+    /// The trace starts from the roots and from the objects the write barrier
+    /// remembered, and **it does not scan old objects**. That is sound because
+    /// of the invariant the barrier maintains: an old object can only come to
+    /// point at a young one through a store, and every such store is recorded.
+    /// References it made while it was itself young point at objects that were
+    /// promoted alongside it.
+    ///
+    /// Cost is the young generation and the remembered set, not the live set.
+    /// 84% of what this VM allocates is dead by the next collection, so most
+    /// of that work is a bitmap test that says "free it".
+    pub fn collect_minor(&mut self, roots: &[ObjectId]) -> Collection {
+        #[cfg(feature = "profile")]
+        let started = std::time::Instant::now();
+        let before = self.live;
+
+        each_table!(&mut *self, table, _kind, {
+            table.clear_marks();
+        });
+
+        let mut gray = core::mem::take(&mut self.scratch);
+        gray.clear();
+        gray.extend_from_slice(roots);
+
+        // The old objects that have to be looked at anyway: those written to
+        // since the last minor collection, and every old fiber -- a fiber's
+        // stack is moved on and off the VM rather than stored through the
+        // barrier, so it cannot be tracked the same way.
+        let mut scan: Vec<ObjectId> = Vec::new();
+        each_table!(&mut *self, table, kind, {
+            for index in &table.remembered {
+                scan.push(ObjectId::tagged(kind.tag(), *index));
+            }
+        });
+        for index in 0..self.fibers.slots.len() {
+            let index = index as u32;
+            if self.fibers.occupied(index) && !self.fibers.is_young(index) {
+                scan.push(ObjectId::tagged(ObjectType::Fiber.tag(), index));
+            }
+        }
+        for id in &scan {
+            self.trace_at(*id, &mut gray);
+        }
+
+        let mut referents: Vec<ObjectId> = Vec::new();
+        while let Some(id) = gray.pop() {
+            // An old object is not scanned: whatever young thing it points at
+            // is in the remembered set, and it cannot itself be collected here.
+            if !self.is_young(id) || !self.mark_at(id) {
+                continue;
+            }
+            #[cfg(feature = "profile")]
+            {
+                self.profile.marked += 1;
+            }
+            referents.clear();
+            self.trace_at(id, &mut referents);
+            gray.extend(referents.iter().copied());
+        }
+        gray.clear();
+        self.scratch = gray;
+
+        // Sweep the young generation, and nothing else. Survivors are promoted
+        // where they stand.
+        let mut dead: Vec<ObjectId> = Vec::new();
+        let mut promoted = 0usize;
+        each_table!(&mut *self, table, kind, {
+            for index in core::mem::take(&mut table.young) {
+                match table.is_marked(index) {
+                    true => promoted += 1,
+                    false => dead.push(ObjectId::tagged(kind.tag(), index)),
+                }
+            }
+        });
+
+        let mut live = self.live;
+        for id in &dead {
+            self.bytes = self.bytes.saturating_sub(self.size_at(*id));
+            live = live.saturating_sub(1);
+            self.discard(*id);
+        }
+        self.live = live;
+
+        // Everything that survived is old, and nothing old points at anything
+        // young any more.
+        each_table!(&mut *self, table, _kind, {
+            table.age_all();
+            table.forget_all();
+        });
+        self.young_total = 0;
+        self.young_bytes = 0;
+
+        #[cfg(feature = "profile")]
+        {
+            self.profile.minor_collections += 1;
+            self.profile.promoted += promoted as u64;
+            self.profile.freed_young += dead.len() as u64;
+            self.profile.collect_nanos += started.elapsed().as_nanos() as u64;
+        }
+        #[cfg(not(feature = "profile"))]
+        let _ = promoted;
+
+        Collection {
+            before,
+            after: live,
+            bytes_after: self.bytes,
+        }
     }
 
     /// Mark everything reachable from `roots`, free the rest, move the
@@ -1315,10 +1290,9 @@ impl Heap {
         // the whole point: a `List` slot is twelve bytes where a `Range` slot
         // is twenty-four, and neither pays for the other.
         //
-        // **Two passes, because freeing is a barrier too.** An object about to
-        // go releases everything it referred to, and that touches other
-        // tables -- so what dies is gathered first and freed after, rather
-        // than mutating ten tables while iterating one.
+        // **Two passes**, because freeing an object touches other tables: what
+        // dies is gathered first and freed after, rather than mutating ten
+        // tables while iterating one.
         let mut bytes = 0usize;
         let mut live = 0usize;
         let mut slots_seen = 0usize;
@@ -1337,7 +1311,7 @@ impl Heap {
                 if table.is_marked(index as u32) {
                     live += 1;
                     #[cfg(feature = "profile")]
-                    if table.is_young(index as u32, generation) {
+                    if table.is_newborn(index as u32, generation) {
                         young_survived += 1;
                     }
                     if let Some(value) = table.slots[index].as_mut() {
@@ -1350,25 +1324,20 @@ impl Heap {
             }
         });
 
-        let mut orphaned: Vec<ObjectId> = Vec::new();
-        for id in &dead {
-            if !COUNTING {
-                break;
-            }
-            if ObjectType::from_tag(id.tag()) == Some(ObjectType::Fiber) {
-                continue;
-            }
-            self.trace_at(*id, &mut orphaned);
-        }
-        for id in orphaned {
-            self.release_id(id);
-        }
         for id in &dead {
             self.discard(*id);
         }
-        // Everything that died took its candidacy with it, and what survived
-        // is about to be re-confirmed the next time a count reaches zero.
-        self.candidates.clear();
+        // A full collection settles the generations too: whatever is still
+        // here has survived one, so it is old, and no old object can be
+        // pointing at anything young.
+        if NURSERY {
+            each_table!(&mut *self, table, _kind, {
+                table.age_all();
+                table.forget_all();
+            });
+            self.young_total = 0;
+            self.young_bytes = 0;
+        }
 
         #[cfg(feature = "profile")]
         {
@@ -1459,24 +1428,6 @@ impl Heap {
         self.profile.garbage_acyclic += acyclic;
         self.profile.garbage_cyclic += garbage.len() as u64 - acyclic;
     }
-
-    fn is_marked_at(&self, id: ObjectId) -> bool {
-        let index = id.index();
-        match ObjectType::from_tag(id.tag()) {
-            Some(ObjectType::Class) => self.classes.is_marked(index),
-            Some(ObjectType::Closure) => self.closures.is_marked(index),
-            Some(ObjectType::Fn) => self.functions.is_marked(index),
-            Some(ObjectType::Fiber) => self.fibers.is_marked(index),
-            Some(ObjectType::Instance) => self.instances.is_marked(index),
-            Some(ObjectType::List) => self.lists.is_marked(index),
-            Some(ObjectType::Map) => self.maps.is_marked(index),
-            Some(ObjectType::Range) => self.ranges.is_marked(index),
-            Some(ObjectType::String) => self.strings.is_marked(index),
-            Some(ObjectType::Upvalue) => self.upvalues.is_marked(index),
-            None => false,
-        }
-    }
-
     /// How many objects are alive.
     pub fn live(&self) -> usize {
         self.live

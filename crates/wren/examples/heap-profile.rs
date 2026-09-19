@@ -103,23 +103,25 @@ fn main() {
         // against the references that actually exist. A missing write barrier
         // shows up here as a count that is too low, which is the one that
         // would be a use-after-free once prompt freeing is on.
-        for (id, counted, real) in match wren::Heap::counting() {
-            true => vm.heap.verify_counts(),
-            // Without the `refcount` feature there are no counts to check, and
-            // every object would look like a disagreement.
+        for (old, young) in match wren::Heap::nursery() {
+            true => vm.heap.verify_remembered(),
             false => Vec::new(),
         } {
-            let kind = vm.heap.kind_of(id).map_or("?", |kind| TYPES[kind as usize]);
+            let kind = vm
+                .heap
+                .kind_of(old)
+                .map_or("?", |kind| TYPES[kind as usize]);
             let entry = mismatches
                 .entry(kind)
                 .or_insert((0usize, 0usize, 0usize, String::new()));
             entry.0 += 1;
-            match counted as u32 <= real {
-                true => entry.1 += 1,
-                false => entry.2 += 1,
-            }
+            entry.1 += 1;
             if entry.3.is_empty() {
-                entry.3 = format!("{} (counted {counted}, actual {real})", path.display());
+                let points_at = vm
+                    .heap
+                    .kind_of(young)
+                    .map_or("?", |kind| TYPES[kind as usize]);
+                entry.3 = format!("{} (points at a young {points_at})", path.display());
             }
         }
 
@@ -144,18 +146,17 @@ fn main() {
 
     println!();
     println!("write barriers");
-    match (wren::Heap::counting(), mismatches.is_empty()) {
-        (false, _) => println!("  not counted in this build -- rebuild with --features refcount"),
-        (true, true) => println!("  every reference count agrees with the references that exist"),
+    match (wren::Heap::nursery(), mismatches.is_empty()) {
+        (false, _) => println!("  no young generation in this build -- try --features nursery"),
+        (true, true) => {
+            println!("  every old object pointing at a young one is in the remembered set")
+        }
         (true, false) => {
-            println!(
-                "  {:<10} {:>10} {:>9} {:>9}  first seen in",
-                "type", "disagree", "too low", "too high"
-            );
-            for (kind, (total, low, high, where_)) in &mismatches {
-                println!("  {kind:<10} {total:>10} {low:>9} {high:>9}  {where_}");
+            println!("  {:<10} {:>10}  first seen in", "type", "unrecorded");
+            for (kind, (total, _, _, where_)) in &mismatches {
+                println!("  {kind:<10} {total:>10}  {where_}");
             }
-            println!("  too low is the dangerous one: a missing retain frees something in use");
+            println!("  an unrecorded old-to-young reference is freed while still in use");
         }
     }
 
@@ -215,6 +216,9 @@ fn add(total: &mut wren::heap::Profile, one: &wren::heap::Profile) {
     total.slots_swept += one.slots_swept;
     total.freed_promptly += one.freed_promptly;
     total.young_allocated += one.young_allocated;
+    total.minor_collections += one.minor_collections;
+    total.promoted += one.promoted;
+    total.freed_young += one.freed_young;
     total.young_survived += one.young_survived;
     total.flushes += one.flushes;
     total.peak_live = total.peak_live.max(one.peak_live);
@@ -278,6 +282,13 @@ fn report(total: &wren::heap::Profile, ran: usize, natural: usize, wall: u64) {
         "  marked per object freed {:>11.2}   -- tracing work per byte reclaimed",
         ratio(total.marked, total.swept)
     );
+    println!();
+
+    println!("the young generation");
+    println!("  minor collections      {:>12}", total.minor_collections);
+    println!("  freed young            {:>12}", total.freed_young);
+    println!("  promoted               {:>12}", total.promoted);
+    println!("  major collections      {:>12}", total.collections);
     println!();
 
     println!("do objects die young");

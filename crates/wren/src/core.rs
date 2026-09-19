@@ -44,7 +44,6 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::handle::ObjectId;
-use crate::heap::Heap;
 use crate::math;
 use crate::object::{
     MapEntry, ObjClass, ObjFiber, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object,
@@ -1751,23 +1750,13 @@ fn set_instance_field(vm: &mut Vm, value: Value, index: usize, to: Value) {
     let Some(id) = value.as_object() else {
         return;
     };
-    let old = match Heap::counting() {
-        true => vm
-            .heap
-            .instance(id)
-            .and_then(|it| it.fields.get(index).copied()),
-        false => None,
-    };
-    vm.heap.retain(to);
     if let Some(instance) = vm.heap.instance_mut(id) {
         if instance.fields.len() <= index {
             instance.fields.resize(index + 1, Value::NULL);
         }
         instance.fields[index] = to;
     }
-    if let Some(old) = old {
-        vm.heap.release(old);
-    }
+    vm.heap.wrote(id, to);
 }
 
 fn function_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeError> {
@@ -1811,22 +1800,22 @@ fn install_list(vm: &mut Vm) {
     define(vm, class, "addCore(_)", |vm, at| {
         let list = receiver(vm, at);
         let element = argument(vm, at, 1);
-        vm.heap.retain(element);
         match vm.heap.list_mut(list.as_object().unwrap()) {
             Some(list) => list.elements.push(element),
             _ => return Err(RuntimeError::new("Receiver must be a list.")),
         }
+        vm.heap.wrote(list.as_object().unwrap(), element);
         Ok(list)
     });
 
     define(vm, class, "add(_)", |vm, at| {
         let list = receiver(vm, at);
         let element = argument(vm, at, 1);
-        vm.heap.retain(element);
         match vm.heap.list_mut(list.as_object().unwrap()) {
             Some(list) => list.elements.push(element),
             _ => return Err(RuntimeError::new("Receiver must be a list.")),
         }
+        vm.heap.wrote(list.as_object().unwrap(), element);
         // `add` returns the element, which is what makes `list.add(x)` usable
         // as an expression.
         Ok(element)
@@ -1863,20 +1852,11 @@ fn install_list(vm: &mut Vm) {
         let value = argument(vm, at, 2);
         let length = list_length(vm, list);
         let index = resolve_index(index, length)?;
-        let old = match Heap::counting() {
-            true => vm
-                .heap
-                .list(list.as_object().unwrap())
-                .and_then(|l| l.elements.get(index).copied()),
-            false => None,
-        };
-        vm.heap.retain(value);
-        match vm.heap.list_mut(list.as_object().unwrap()) {
+        let list_handle = list.as_object().unwrap();
+        match vm.heap.list_mut(list_handle) {
             Some(list) => {
                 list.elements[index] = value;
-                if let Some(old) = old {
-                    vm.heap.release(old);
-                }
+                vm.heap.wrote(list_handle, value);
                 Ok(value)
             }
             _ => Err(RuntimeError::new("Receiver must be a list.")),
@@ -1956,10 +1936,11 @@ fn install_list_extras(vm: &mut Vm) {
         if at_index < 0.0 || at_index > length as Num {
             return Err(RuntimeError::new("Index out of bounds."));
         }
-        vm.heap.retain(value);
-        match vm.heap.list_mut(list.as_object().unwrap()) {
+        let handle = list.as_object().unwrap();
+        match vm.heap.list_mut(handle) {
             Some(list) => {
                 list.elements.insert(at_index as usize, value);
+                vm.heap.wrote(handle, value);
                 Ok(value)
             }
             _ => Err(RuntimeError::new("Receiver must be a list.")),
@@ -1981,12 +1962,14 @@ fn install_list_extras(vm: &mut Vm) {
         let other = argument(vm, at, 1);
         // Any sequence, not just a list: `list.addAll(1..3)` is ordinary Wren.
         let added = collect(vm, other)?;
-        for element in &added {
-            vm.heap.retain(*element);
-        }
-        match vm.heap.list_mut(list.as_object().unwrap()) {
+        let handle = list.as_object().unwrap();
+        let copied = added.clone();
+        match vm.heap.list_mut(handle) {
             Some(list) => list.elements.extend(added),
             _ => return Err(RuntimeError::new("Receiver must be a list.")),
+        }
+        for element in copied {
+            vm.heap.wrote(handle, element);
         }
         Ok(other)
     });
@@ -2001,9 +1984,7 @@ fn install_list_extras(vm: &mut Vm) {
             (Some(index), Some(list)) => {
                 // The list drops its reference; the caller gets the value back
                 // on the stack, which is a root and so is not counted.
-                let removed = list.elements.remove(index);
-                vm.heap.release(removed);
-                Ok(removed)
+                Ok(list.elements.remove(index))
             }
             // Removing something that is not there answers null rather than
             // failing, which is what makes `remove` usable without a
@@ -2031,24 +2012,17 @@ fn install_list_extras(vm: &mut Vm) {
         let length = list_length(vm, list);
         let index = resolve_index(index, length)?;
         match vm.heap.list_mut(list.as_object().unwrap()) {
-            Some(list) => {
-                let removed = list.elements.remove(index);
-                vm.heap.release(removed);
-                Ok(removed)
-            }
+            Some(list) => Ok(list.elements.remove(index)),
             _ => Err(RuntimeError::new("Receiver must be a list.")),
         }
     });
 
     define(vm, class, "clear()", |vm, at| {
-        if let Some(id) = receiver(vm, at).as_object() {
-            let dropped = vm.heap.list(id).map(|list| list.elements.clone());
-            if let Some(list) = vm.heap.list_mut(id) {
-                list.elements.clear();
-            }
-            for element in dropped.into_iter().flatten() {
-                vm.heap.release(element);
-            }
+        if let Some(list) = receiver(vm, at)
+            .as_object()
+            .and_then(|id| vm.heap.list_mut(id))
+        {
+            list.elements.clear();
         }
         Ok(Value::NULL)
     });
@@ -2274,7 +2248,6 @@ fn install_map(vm: &mut Vm) {
         match (found, vm.heap.map_mut(id)) {
             (Some(slot), Some(map)) => {
                 let removed = map.entries[slot].value;
-                let dropped_key = map.entries[slot].key;
                 // **A tombstone, not an empty slot.** A key that collided with
                 // this one probed past it on the way in; blanking the slot
                 // would end that probe early and lose the key entirely.
@@ -2283,8 +2256,6 @@ fn install_map(vm: &mut Vm) {
                     value: Value::TRUE,
                 };
                 map.count -= 1;
-                vm.heap.release(dropped_key);
-                vm.heap.release(removed);
                 Ok(removed)
             }
             _ => Ok(Value::NULL),
@@ -2292,16 +2263,12 @@ fn install_map(vm: &mut Vm) {
     });
 
     define(vm, class, "clear()", |vm, at| {
-        if let Some(id) = receiver(vm, at).as_object() {
-            let dropped = vm.heap.map(id).map(|map| map.entries.clone());
-            if let Some(map) = vm.heap.map_mut(id) {
-                map.entries.clear();
-                map.count = 0;
-            }
-            for entry in dropped.into_iter().flatten() {
-                vm.heap.release(entry.key);
-                vm.heap.release(entry.value);
-            }
+        if let Some(map) = receiver(vm, at)
+            .as_object()
+            .and_then(|id| vm.heap.map_mut(id))
+        {
+            map.entries.clear();
+            map.count = 0;
         }
         Ok(Value::NULL)
     });
@@ -2635,31 +2602,20 @@ fn map_set(vm: &mut Vm, map: Value, key: Value, value: Value) -> Result<(), Runt
     };
     let (slot, existing) = probe(vm, &entries, key);
 
-    // **Both halves of the entry are replaced, including when the key was
-    // already there.** Wren compares map keys by value, so storing under an
-    // existing key overwrites it with a *different* string object that happens
-    // to be equal -- the old one loses a reference and the new one gains
-    // one. Treating that case as "the key is unchanged" was the last missing
-    // barrier the verifier found.
-    //
-    // A rehash does not pass through here: it moves the same entries into a
-    // bigger table, so nothing is gained or lost.
-    let previous = match existing {
-        true => entries.get(slot).copied(),
-        false => None,
-    };
-    vm.heap.retain(key);
-    vm.heap.retain(value);
     if let Some(map) = vm.heap.map_mut(id) {
         map.entries[slot] = MapEntry { key, value };
         if !existing {
             map.count += 1;
         }
     }
-    if let Some(previous) = previous {
-        vm.heap.release(previous.key);
-        vm.heap.release(previous.value);
-    }
+    // **Both halves of the entry**, including when the key was already there.
+    // Wren compares map keys by value, so storing under an existing key
+    // overwrites it with a *different* object that happens to be equal.
+    //
+    // A rehash does not pass through here: it moves the same entries into a
+    // bigger table, so no new reference is made.
+    vm.heap.wrote(id, key);
+    vm.heap.wrote(id, value);
     Ok(())
 }
 
@@ -3438,10 +3394,13 @@ pub fn map_lookup(vm: &Vm, map: Value, key: Value) -> Option<Value> {
 
 /// Append to a list, for accumulating repeated attribute keys.
 pub fn list_push(vm: &mut Vm, list: Value, value: Value) {
-    vm.heap.retain(value);
-    if let Some(list) = list.as_object().and_then(|id| vm.heap.list_mut(id)) {
+    let Some(id) = list.as_object() else {
+        return;
+    };
+    if let Some(list) = vm.heap.list_mut(id) {
         list.elements.push(value);
     }
+    vm.heap.wrote(id, value);
 }
 
 /// Build a list value from elements, for the compiler's list literals.

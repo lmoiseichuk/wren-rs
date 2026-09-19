@@ -14,10 +14,10 @@ because the first one is what the second is owed to.
 
 | benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython | wren-rs vs C `-O2` |
 |---|---|---|---|---|---|---|
-| `binary_trees` | **8.169 s** | 15.371 s | 2.160 s | 2.440 s | 4.729 s | 3.8x slower |
-| `fib` | **16.573 s** | 33.669 s | 3.250 s | 3.710 s | 7.109 s | 5.1x slower |
-| `list_build` | **0.562 s** | 1.028 s | 0.130 s | 0.150 s | 0.154 s | 4.3x slower |
-| `method_call` | **2.348 s** | 4.326 s | 0.350 s | 0.420 s | 1.748 s | 6.7x slower |
+| `binary_trees` | **8.455 s** | 15.371 s | 2.160 s | 2.440 s | 4.729 s | 3.8x slower |
+| `fib` | **17.253 s** | 33.669 s | 3.250 s | 3.710 s | 7.109 s | 5.1x slower |
+| `list_build` | **0.577 s** | 1.028 s | 0.130 s | 0.150 s | 0.154 s | 4.3x slower |
+| `method_call` | **2.411 s** | 4.326 s | 0.350 s | 0.420 s | 1.748 s | 6.7x slower |
 
 **wren-rs is four to seven times slower than upstream Wren on this part**, and
 one and a half to five times slower than MicroPython. `method_call` is the
@@ -32,10 +32,10 @@ the design note has been corrected.
 
 | benchmark | first run | now | |
 |---|---|---|---|
-| `binary_trees` | 8.616 s | 8.268 s | −4.0% |
-| `fib` | 18.176 s | 16.601 s | −8.7% |
-| `list_build` | 0.574 s | 0.568 s | −1.0% |
-| `method_call` | 2.766 s | 2.356 s | **−14.8%** |
+| `binary_trees` | 8.616 s | 8.455 s | −1.9% |
+| `fib` | 18.176 s | 17.253 s | −5.1% |
+| `list_build` | 0.574 s | 0.577 s | +0.5% |
+| `method_call` | 2.766 s | 2.411 s | **−12.8%** |
 
 The gain is all in the call path, which is why `method_call` moves most and
 `list_build` — a loop over a primitive — barely at all. Entering a call asked
@@ -111,7 +111,7 @@ no forced collection:
 
 | benchmark | wren-rs | C Wren `-O2` | |
 |---|---|---|---|
-| `binary_trees` | **133,888 B** | 78,784 B | *1.7x more* |
+| `binary_trees` | **133,880 B** | 78,784 B | *1.7x more* |
 | `fib` | **4,172 B** | 6,616 B | *1.6x less* |
 | `list_build` | **132,460 B** | 134,712 B | *1.0x less* |
 | `method_call` | **8,316 B** | 15,096 B | *1.8x less* |

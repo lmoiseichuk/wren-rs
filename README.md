@@ -158,10 +158,10 @@ caveats: **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
 
 | benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython |
 |---|---|---|---|---|---|
-| `binary_trees` depth 9 | 8.169 | 15.371 | **2.160** | 2.440 | 4.729 |
-| `fib(24)` x5 | 16.573 | 33.669 | **3.250** | 3.710 | 7.109 |
-| `list_build` 10,000 | 0.562 | 1.028 | **0.130** | 0.150 | 0.154 |
-| `method_call` | 2.348 | 4.326 | **0.350** | 0.420 | 1.748 |
+| `binary_trees` depth 9 | 8.455 | 15.371 | **2.160** | 2.440 | 4.729 |
+| `fib(24)` x5 | 17.253 | 33.669 | **3.250** | 3.710 | 7.109 |
+| `list_build` 10,000 | 0.577 | 1.028 | **0.130** | 0.150 | 0.154 |
+| `method_call` | 2.411 | 4.326 | **0.350** | 0.420 | 1.748 |
 
 The first run on hardware was slower than this — `binary_trees` 8.616,
 `fib` 18.176, `list_build` 0.574, `method_call` 2.766 at `speed`. What moved
@@ -176,7 +176,7 @@ both):
 |---|---|---|---|
 | **VM resident** | **22,920 B** | 83,036 B | — |
 | free to a program | ~305,000 B | ~227,000 B | 333,344 B |
-| `binary_trees` | 133,888 B | 78,812 B | 76,512 B |
+| `binary_trees` | 133,880 B | 78,812 B | 76,512 B |
 | `fib` | **4,172 B** | 6,612 B | 800 B |
 | `list_build` | 132,460 B | 134,712 B | 65,440 B |
 | `method_call` | **8,316 B** | 15,080 B | 1,616 B |
@@ -226,10 +226,10 @@ contradicts the design is worth more than a flattering one. Acting on it since:
 | | first run | now |
 |---|---|---|
 | VM resident | 45,676 B | **22,920 B** |
-| `method_call` | 2.766 s | **2.348 s** |
-| `fib` | 18.176 s | **16.573 s** |
-| `binary_trees` | 8.616 s | **8.169 s** |
-| `binary_trees` heap | 160,244 B | **133,888 B** |
+| `method_call` | 2.766 s | **2.411 s** |
+| `fib` | 18.176 s | **17.253 s** |
+| `binary_trees` | 8.616 s | **8.455 s** |
+| `binary_trees` heap | 160,244 B | **133,880 B** |
 | `method_call` heap | 9,800 B | **8,316 B** |
 
 Three changes, each measured on the board:
@@ -259,12 +259,36 @@ inside the noise on a workstation, because an out-of-order core hides a
 dependent load that an in-order RISC-V pays for in full. The board is the only
 place a change like this can be judged.
 
-What is left is the lever with a number but no implementation: `binary_trees`
-peaks at 134 KB against a live set well under half that, so **most of peak is
-still floating garbage** — which is what refcounting in front of the tracing
-collector would recover, and what `Heap::set_growth` trades for time today.
-The heap profiler says 100% of the garbage 873 programs produce is acyclic, so
-a reference count would reclaim all of it.
+#### Three replacements for the collector, all measured, none kept
+
+The heap profiler said the garbage 873 programs produce is 100% acyclic and
+that 84% of allocations die before the next collection. Both findings are
+real, and both suggested replacing mark-sweep. So all three candidates were
+built, verified against the whole suite, and measured on the board —
+`binary_trees`, speed profile:
+
+| | time | peak |
+|---|---|---|
+| **tracing, as it stands** | **8.455 s** | 133,880 B |
+| tracing + a 16 KB garbage ceiling | 9.240 s | **121,624 B** |
+| deferred reference counting | 9.630 s | 126,056 B |
+| a young generation + that ceiling | 9.105 s | 176,736 B |
+
+**Nothing beats the collector already there on time, and the simplest change
+beats everything on memory.** The profile had said why in advance: collection
+is 16.9% of the one benchmark that allocates and 0.0–0.6% of the other three,
+so a replacement can win at most 17% of one program — while each of these adds
+work proportional to what the program *does* rather than to what the collector
+*costs*.
+
+Refcounting is behind `--features refcount` and a nursery behind
+`--features nursery`; both are correct — 829 of 829, with their write barriers
+machine-verified — and both are off. `Heap::set_headroom` is the one that
+stayed useful: it makes peak memory *the live set plus a constant* instead of
+half as much again as the live set, which is the shape a fixed heap wants.
+
+[`doc/wren-rs/design.md`](doc/wren-rs/design.md) carries the measurements and
+what each cost.
 [`doc/wren-rs/design.md`](doc/wren-rs/design.md) carries the measurements and
 what each would cost.
 
