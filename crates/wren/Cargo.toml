@@ -68,6 +68,18 @@ f32 = []
 # collection, a refcount simulation over the garbage to work out how much of it
 # is cyclic. `cargo run --release --features profile --example heap-profile`.
 profile = ["std"]
+# **Reference counting in front of the tracing collector. Off, and measured.**
+#
+# Every heap-to-heap reference is counted and an object whose count reaches
+# zero is freed as soon as the roots agree, so most garbage never waits for a
+# trace -- 95.8% of reclaims on the benchmark set.
+#
+# It is off because the measurement says it does not pay on this VM: on an
+# ESP32-C6 it costs 18% of `binary_trees` to save 6% of its peak, and 3-5% of
+# the other three benchmarks to save nothing. `Heap::set_growth(5, 4)` buys
+# more memory than that for a quarter of the time. See
+# `doc/wren-rs/design.md`.
+refcount = []
 # **The compiler, which a device running bytecode does not need.** This is
 # what step 4 of the plan is for: compile on a workstation, ship `.wrenc`, and
 # leave the lexer and parser out of the image entirely. Default on, because a

@@ -44,6 +44,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::handle::ObjectId;
+use crate::heap::Heap;
 use crate::math;
 use crate::object::{
     MapEntry, ObjClass, ObjFiber, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object,
@@ -1750,10 +1751,13 @@ fn set_instance_field(vm: &mut Vm, value: Value, index: usize, to: Value) {
     let Some(id) = value.as_object() else {
         return;
     };
-    let old = vm
-        .heap
-        .instance(id)
-        .and_then(|it| it.fields.get(index).copied());
+    let old = match Heap::counting() {
+        true => vm
+            .heap
+            .instance(id)
+            .and_then(|it| it.fields.get(index).copied()),
+        false => None,
+    };
     vm.heap.retain(to);
     if let Some(instance) = vm.heap.instance_mut(id) {
         if instance.fields.len() <= index {
@@ -1859,10 +1863,13 @@ fn install_list(vm: &mut Vm) {
         let value = argument(vm, at, 2);
         let length = list_length(vm, list);
         let index = resolve_index(index, length)?;
-        let old = vm
-            .heap
-            .list(list.as_object().unwrap())
-            .and_then(|l| l.elements.get(index).copied());
+        let old = match Heap::counting() {
+            true => vm
+                .heap
+                .list(list.as_object().unwrap())
+                .and_then(|l| l.elements.get(index).copied()),
+            false => None,
+        };
         vm.heap.retain(value);
         match vm.heap.list_mut(list.as_object().unwrap()) {
             Some(list) => {

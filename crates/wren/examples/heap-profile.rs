@@ -103,7 +103,12 @@ fn main() {
         // against the references that actually exist. A missing write barrier
         // shows up here as a count that is too low, which is the one that
         // would be a use-after-free once prompt freeing is on.
-        for (id, counted, real) in vm.heap.verify_counts() {
+        for (id, counted, real) in match wren::Heap::counting() {
+            true => vm.heap.verify_counts(),
+            // Without the `refcount` feature there are no counts to check, and
+            // every object would look like a disagreement.
+            false => Vec::new(),
+        } {
             let kind = vm.heap.kind_of(id).map_or("?", |kind| TYPES[kind as usize]);
             let entry = mismatches
                 .entry(kind)
@@ -139,9 +144,10 @@ fn main() {
 
     println!();
     println!("write barriers");
-    match mismatches.is_empty() {
-        true => println!("  every reference count agrees with the references that exist"),
-        false => {
+    match (wren::Heap::counting(), mismatches.is_empty()) {
+        (false, _) => println!("  not counted in this build -- rebuild with --features refcount"),
+        (true, true) => println!("  every reference count agrees with the references that exist"),
+        (true, false) => {
             println!(
                 "  {:<10} {:>10} {:>9} {:>9}  first seen in",
                 "type", "disagree", "too low", "too high"
@@ -207,6 +213,8 @@ fn add(total: &mut wren::heap::Profile, one: &wren::heap::Profile) {
     total.garbage_cyclic += one.garbage_cyclic;
     total.collect_nanos += one.collect_nanos;
     total.slots_swept += one.slots_swept;
+    total.freed_promptly += one.freed_promptly;
+    total.flushes += one.flushes;
     total.peak_live = total.peak_live.max(one.peak_live);
     total.peak_bytes = total.peak_bytes.max(one.peak_bytes);
 }
@@ -281,6 +289,15 @@ fn report(total: &wren::heap::Profile, ran: usize, natural: usize, wall: u64) {
     println!(
         "  survival rate          {:>11.1}%  -- survivors are re-marked at every later collection",
         percent(total.survived, total.live_before)
+    );
+    println!();
+
+    println!("what the reference counts reclaimed");
+    println!("  freed without a trace   {:>12}", total.freed_promptly);
+    println!("  root scans to do it     {:>12}", total.flushes);
+    println!(
+        "  share of all reclaims  {:>11.1}%",
+        percent(total.freed_promptly, total.freed_promptly + total.swept)
     );
     println!();
 

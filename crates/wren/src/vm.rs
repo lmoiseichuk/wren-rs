@@ -85,6 +85,14 @@ impl WrenError {
 /// a message.
 const MAX_FRAMES: usize = 256;
 
+/// How many zero-count objects to gather before confirming them.
+///
+/// Each confirmation scans the roots, so this trades promptness for that
+/// scan. Too small and a loop that makes one dead string per iteration scans
+/// the stack every time; too large and the memory refcounting is supposed to
+/// reclaim sits around anyway.
+const CANDIDATES_BEFORE_FLUSH: usize = 64;
+
 /// Why the interpreter keeps `chunk`, `ip` and `base` in locals
 /// ------------------------------------------------------------
 ///
@@ -340,6 +348,8 @@ pub struct Vm {
     /// Upvalues still pointing at live stack slots. See
     /// [`ObjUpvalue`](crate::object::ObjUpvalue).
     open_upvalues: Vec<ObjectId>,
+    /// A reusable buffer for the handles a candidate flush checks against.
+    root_handles: Vec<ObjectId>,
 
     /// Where `System.print` writes.
     ///
@@ -438,6 +448,7 @@ impl Vm {
             rust_floor: 0,
             frames: Vec::new(),
             open_upvalues: Vec::new(),
+            root_handles: Vec::new(),
             output: Vec::new(),
         };
         // `List`, `Map`, `Range` and `String` are sequences.
@@ -1077,6 +1088,25 @@ impl Vm {
     /// object. There is no way to enumerate those, which is why `Heap::allocate`
     /// never collects and the check happens between instructions, where the
     /// only live references are the ones below.
+    /// only live references are the ones below.
+    ///
+    /// Confirm the zero-count candidates against the roots, and free what
+    /// nothing is holding.
+    ///
+    /// **The handles go into a buffer the VM keeps.** This runs once every few
+    /// dozen allocations, and an allocation per flush is exactly the sort of
+    /// cost that makes prompt reclamation more expensive than the collector it
+    /// is meant to save.
+    fn flush_dead(&mut self) {
+        let roots = self.roots();
+        let mut buffer = ::core::mem::take(&mut self.root_handles);
+        buffer.clear();
+        buffer.extend(roots.iter().filter_map(|value| value.as_object()));
+        self.heap.flush_candidates(&buffer);
+        buffer.clear();
+        self.root_handles = buffer;
+    }
+
     fn roots(&self) -> Vec<Value> {
         let mut roots = self.stack.clone();
         for module in &self.modules {
@@ -1739,7 +1769,10 @@ impl Vm {
                     let attributes = self.stack.pop().unwrap_or(Value::NULL);
                     let class = self.stack.pop().unwrap_or(Value::NULL);
                     if let Some(id) = class.as_object() {
-                        let old = self.heap.class(id).map(|class| class.attributes);
+                        let old = match Heap::counting() {
+                            true => self.heap.class(id).map(|class| class.attributes),
+                            false => None,
+                        };
                         self.heap.retain(attributes);
                         if let Some(class) = self.heap.class_mut(id) {
                             class.attributes = attributes;
@@ -1944,6 +1977,16 @@ impl Vm {
                 }
                 let roots = self.roots();
                 self.heap.collect(roots);
+            } else if self.heap.candidates() >= CANDIDATES_BEFORE_FLUSH {
+                // **The cheap half of collection**, at the same safe point and
+                // for the same reason. Confirming a candidate costs a scan of
+                // the roots, not of the heap, so it is worth doing often --
+                // but not once per candidate, which would scan the roots for
+                // every dead string.
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.ip = ip;
+                }
+                self.flush_dead();
             }
         }
     }
@@ -2047,7 +2090,10 @@ impl Vm {
                 }
             }
             None => {
-                let old = self.heap.upvalue(id).map(|upvalue| upvalue.closed);
+                let old = match Heap::counting() {
+                    true => self.heap.upvalue(id).map(|upvalue| upvalue.closed),
+                    false => None,
+                };
                 self.heap.retain(value);
                 if let Some(upvalue) = self.heap.upvalue_mut(id) {
                     upvalue.closed = value;
@@ -2120,10 +2166,13 @@ impl Vm {
         // The barrier, in the order every one of them takes: read what is
         // being overwritten, retain the new reference, store, release the old.
         let at = offset + index;
-        let old = self
-            .heap
-            .instance(id)
-            .and_then(|it| it.fields.get(at).copied());
+        let old = match Heap::counting() {
+            true => self
+                .heap
+                .instance(id)
+                .and_then(|it| it.fields.get(at).copied()),
+            false => None,
+        };
         self.heap.retain(value);
         match self.heap.instance_mut(id) {
             Some(instance) => {
@@ -2173,10 +2222,13 @@ impl Vm {
                 "Cannot use a static field outside of a class definition.",
             ));
         };
-        let old = self
-            .heap
-            .class(owner)
-            .and_then(|c| c.static_fields.get(index).copied());
+        let old = match Heap::counting() {
+            true => self
+                .heap
+                .class(owner)
+                .and_then(|c| c.static_fields.get(index).copied()),
+            false => None,
+        };
         self.heap.retain(value);
         if let Some(class) = self.heap.class_mut(owner) {
             if class.static_fields.len() <= index {
@@ -2329,11 +2381,14 @@ impl Vm {
 
         // A method table entry is a heap reference like any other, and
         // binding over an existing one drops whatever was there.
-        let replaced = self
-            .heap
-            .class(target)
-            .map(|class| class.method_entry(symbol))
-            .and_then(crate::object::entry_closure);
+        let replaced = match Heap::counting() {
+            true => self
+                .heap
+                .class(target)
+                .map(|class| class.method_entry(symbol))
+                .and_then(crate::object::entry_closure),
+            false => None,
+        };
         self.heap.retain_id(closure);
         if let Some(class) = self.heap.class_mut(target) {
             class.define(symbol, crate::object::closure_entry(closure));

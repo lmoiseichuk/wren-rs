@@ -37,6 +37,12 @@ use crate::object::{
 };
 use crate::value::Value;
 
+/// Whether reference counting is compiled in.
+///
+/// A `const` rather than a `#[cfg]` at each site: the barriers read better as
+/// ordinary code, and a constant `false` folds them away just as completely.
+const COUNTING: bool = cfg!(feature = "refcount");
+
 /// How much the live set may grow before the next collection.
 ///
 /// **Upstream's default is 10 MB and on these parts that means it never
@@ -126,13 +132,18 @@ impl<T> Table<T> {
         match self.free.pop() {
             Some(index) => {
                 self.slots[index as usize] = Some(value);
-                self.counts[index as usize] = 0;
+                if COUNTING {
+                    self.counts[index as usize] = 0;
+                }
                 index
             }
             None => {
                 let index = self.slots.len();
                 self.slots.push(Some(value));
-                self.counts.push(0);
+                // A byte a slot, and only where it is used.
+                if COUNTING {
+                    self.counts.push(0);
+                }
                 if index / 64 >= self.marks.len() {
                     self.marks.push(0);
                 }
@@ -296,6 +307,14 @@ pub struct Heap {
     /// stack is not counted, so a candidate may still be in use. They are
     /// confirmed against the roots before anything is freed.
     candidates: Vec<ObjectId>,
+    /// A reusable buffer for the short reference lists the barriers build.
+    ///
+    /// **Without this, counting cost an allocation per allocation.** Every
+    /// object created has its references read off `trace`, and a fresh `Vec`
+    /// for that is a call to the allocator for every instance, closure and
+    /// list the program makes -- measured at 28% of `binary_trees`, which is
+    /// more than the collector it was meant to replace.
+    scratch: Vec<ObjectId>,
     #[cfg(feature = "profile")]
     profile: Profile,
 }
@@ -342,6 +361,10 @@ pub struct Profile {
     /// Slots ever swept over. Tracing costs the live set; sweeping costs the
     /// whole table, which is a different curve and worth separating.
     pub slots_swept: u64,
+    /// Objects freed by their reference count rather than by a trace.
+    pub freed_promptly: u64,
+    /// How many times the candidate list was confirmed against the roots.
+    pub flushes: u64,
 }
 
 impl Heap {
@@ -364,6 +387,7 @@ impl Heap {
             paused: false,
             collections: 0,
             candidates: Vec::new(),
+            scratch: Vec::new(),
             #[cfg(feature = "profile")]
             profile: Profile::default(),
         }
@@ -399,8 +423,12 @@ impl Heap {
         //
         // Fibers are the exception, here and everywhere: their references are
         // roots rather than heap references, so they are not counted.
-        let mut born: Vec<ObjectId> = Vec::new();
-        if object.object_type() != ObjectType::Fiber {
+        let mut born = match COUNTING {
+            true => core::mem::take(&mut self.scratch),
+            false => Vec::new(),
+        };
+        if COUNTING && object.object_type() != ObjectType::Fiber {
+            born.clear();
             object.trace(&mut born);
         }
 
@@ -429,8 +457,27 @@ impl Heap {
         };
 
         self.bytes += cost;
-        for referent in born {
-            self.retain_id(referent);
+        // **Indexed, not iterated.** `born` is the heap's own scratch
+        // buffer and `retain_id` takes `&mut self`, so iterating it would
+        // borrow the thing being mutated. Taking it out and putting it back
+        // is what avoids an allocation per allocation.
+        if COUNTING {
+            #[allow(clippy::needless_range_loop)]
+            for index in 0..born.len() {
+                self.retain_id(born[index]);
+            }
+            born.clear();
+            self.scratch = born;
+        }
+
+        // **A new object starts at zero and is a candidate immediately.**
+        // Most garbage never gets stored into anything: a temporary string, an
+        // intermediate list, the receiver of one method call. Its count is zero
+        // from birth and nothing ever releases it, so waiting for a count to
+        // *fall* to zero would leave the common case entirely to the tracing
+        // collector -- measured at 0.6% of reclaims before this line existed.
+        if COUNTING {
+            self.candidates.push(id);
         }
 
         #[cfg(feature = "profile")]
@@ -607,6 +654,9 @@ impl Heap {
     /// something still in use; a missed `release` leaks until the tracing
     /// backstop runs. `verify_counts` exists to prove no `retain` is missing.
     pub fn retain(&mut self, value: Value) {
+        if !COUNTING {
+            return;
+        }
         if let Some(id) = value.as_object() {
             self.retain_id(id);
         }
@@ -614,6 +664,9 @@ impl Heap {
 
     /// Note that a heap object no longer refers to `value`.
     pub fn release(&mut self, value: Value) {
+        if !COUNTING {
+            return;
+        }
         if let Some(id) = value.as_object() {
             self.release_id(id);
         }
@@ -630,6 +683,9 @@ impl Heap {
     }
 
     pub fn retain_id(&mut self, id: ObjectId) {
+        if !COUNTING {
+            return;
+        }
         let index = id.index();
         match ObjectType::from_tag(id.tag()) {
             Some(ObjectType::Class) => self.classes.retain(index),
@@ -648,6 +704,9 @@ impl Heap {
 
     /// Drop a reference; the handle is remembered if the count reached zero.
     pub fn release_id(&mut self, id: ObjectId) {
+        if !COUNTING {
+            return;
+        }
         let index = id.index();
         let emptied = match ObjectType::from_tag(id.tag()) {
             Some(ObjectType::Class) => self.classes.release(index),
@@ -685,6 +744,140 @@ impl Heap {
         }
     }
 
+    /// Free the candidates that the roots do not save.
+    ///
+    /// **A count of zero means "no heap object refers to this", not "dead".**
+    /// The stack is not counted, so a candidate may still be a local, an
+    /// argument, or the value an instruction is part way through producing.
+    /// This is where that is settled: scan the roots, keep whatever they
+    /// mention, free the rest.
+    ///
+    /// **The scan is the roots, not the heap**, which is the whole reason
+    /// deferred counting is affordable. A candidate reachable from a root
+    /// *indirectly* -- root, list, candidate -- cannot have a count of zero,
+    /// because that list would be referring to it. So a direct look is enough.
+    ///
+    /// Fibers are the exception, and they are why this takes more than the
+    /// caller's roots: a fiber's stack is a stack, its contents are not
+    /// counted, and a fiber may be referred to only from a field. So every
+    /// fiber's contents are roots here, whether or not the fiber is running.
+    ///
+    /// Freeing cascades: releasing what a dead object referred to may empty
+    /// another count, which joins the worklist. That is the promptness this
+    /// exists for, and also its one pathology -- dropping a chain of 400,000
+    /// maps frees them in one unbounded cascade, which is the same pause a
+    /// large sweep has, moved rather than removed.
+    pub fn flush_candidates(&mut self, roots: &[ObjectId]) -> usize {
+        // `pause` means a caller is holding something in a Rust local that no
+        // root mentions. Tracing honours that and so must this.
+        if !COUNTING || self.paused || self.candidates.is_empty() {
+            return 0;
+        }
+
+        // **Protection is marked in the bitmap, not gathered into a set.** The
+        // mark bits are idle between collections, and a set would mean an
+        // allocation and a tree walk on every flush -- which, at one flush per
+        // sixty-four allocations, was most of what this cost.
+        each_table!(&mut *self, table, _kind, {
+            table.clear_marks();
+        });
+        for id in roots {
+            self.mark_at(*id);
+        }
+        // A fiber's stack is a stack and its contents are not counted, so
+        // every fiber protects what it holds whether it is running or not.
+        let mut scratch = core::mem::take(&mut self.scratch);
+        for index in 0..self.fibers.slots.len() {
+            if !self.fibers.occupied(index as u32) {
+                continue;
+            }
+            let id = ObjectId::tagged(ObjectType::Fiber.tag(), index as u32);
+            self.mark_at(id);
+            scratch.clear();
+            self.trace_at(id, &mut scratch);
+            #[allow(clippy::needless_range_loop)]
+            for at in 0..scratch.len() {
+                self.mark_at(scratch[at]);
+            }
+        }
+
+        let mut freed = 0usize;
+        // Candidates the roots saved keep their candidacy: a count of zero
+        // does not come back on its own, so dropping them here would mean
+        // waiting for a trace once they really do die.
+        let mut saved = Vec::new();
+        let mut worklist = core::mem::take(&mut self.candidates);
+        while let Some(id) = worklist.pop() {
+            // Retained since it was listed, or already gone.
+            if self.count_of(id) != 0 || !self.is_live(id) {
+                continue;
+            }
+            if self.is_marked_at(id) {
+                saved.push(id);
+                continue;
+            }
+
+            scratch.clear();
+            self.trace_at(id, &mut scratch);
+            #[allow(clippy::needless_range_loop)]
+            for at in 0..scratch.len() {
+                self.release_id(scratch[at]);
+            }
+            worklist.append(&mut self.candidates);
+
+            self.bytes = self.bytes.saturating_sub(self.size_at(id));
+            self.live = self.live.saturating_sub(1);
+            self.discard(id);
+            freed += 1;
+        }
+        self.candidates = saved;
+        scratch.clear();
+        self.scratch = scratch;
+
+        #[cfg(feature = "profile")]
+        {
+            self.profile.freed_promptly += freed as u64;
+            self.profile.flushes += 1;
+        }
+        freed
+    }
+
+    /// Whether this build counts references at all.
+    pub fn counting() -> bool {
+        COUNTING
+    }
+
+    /// How many candidates are waiting to be confirmed.
+    pub fn candidates(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// What one object costs, slot and contents.
+    fn size_at(&self, id: ObjectId) -> usize {
+        let index = id.index();
+        macro_rules! size {
+            ($table:expr) => {
+                match $table.get(index) {
+                    Some(value) => $table.slot_size() + value.contents_size(),
+                    None => 0,
+                }
+            };
+        }
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => size!(self.classes),
+            Some(ObjectType::Closure) => size!(self.closures),
+            Some(ObjectType::Fn) => size!(self.functions),
+            Some(ObjectType::Fiber) => size!(self.fibers),
+            Some(ObjectType::Instance) => size!(self.instances),
+            Some(ObjectType::List) => size!(self.lists),
+            Some(ObjectType::Map) => size!(self.maps),
+            Some(ObjectType::Range) => size!(self.ranges),
+            Some(ObjectType::String) => size!(self.strings),
+            Some(ObjectType::Upvalue) => size!(self.upvalues),
+            None => 0,
+        }
+    }
+
     /// Recompute every reference count from the object graph.
     ///
     /// **For batch construction, not for steady state.** Building the core
@@ -701,6 +894,9 @@ impl Heap {
     /// It is O(the whole heap) and it runs three times in a VM's life -- after
     /// the core library, and after each of the two modules built on demand.
     pub fn rebuild_counts(&mut self) {
+        if !COUNTING {
+            return;
+        }
         each_table!(&mut *self, table, _kind, {
             for count in &mut table.counts {
                 *count = 0;
@@ -826,7 +1022,9 @@ impl Heap {
                     .is_some_and(Option::is_some)
                 {
                     $table.slots[index as usize] = None;
-                    $table.counts[index as usize] = 0;
+                    if let Some(count) = $table.counts.get_mut(index as usize) {
+                        *count = 0;
+                    }
                     $table.free.push(index);
                 }
             }};
@@ -1066,6 +1264,9 @@ impl Heap {
 
         let mut orphaned: Vec<ObjectId> = Vec::new();
         for id in &dead {
+            if !COUNTING {
+                break;
+            }
             if ObjectType::from_tag(id.tag()) == Some(ObjectType::Fiber) {
                 continue;
             }
@@ -1164,7 +1365,6 @@ impl Heap {
         self.profile.garbage_cyclic += garbage.len() as u64 - acyclic;
     }
 
-    #[cfg(feature = "profile")]
     fn is_marked_at(&self, id: ObjectId) -> bool {
         let index = id.index();
         match ObjectType::from_tag(id.tag()) {
