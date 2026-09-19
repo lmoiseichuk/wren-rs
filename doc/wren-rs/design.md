@@ -376,27 +376,114 @@ garbage the threshold is holding rather than anything the representation
 wastes**. That is larger than every object-layout saving in this document put
 together, and it is what prompt reclamation would recover.
 
-Two things make it more tractable than the table above suggests:
+Whether prompt reclamation *works* on that garbage is a separate question, and
+the section below answers it by measuring rather than by reasoning from the
+cycles the language obviously has.
 
-**Deferred counting keeps `Value` `Copy`.** Count only references held *by heap
-objects* — an instance's fields, a list's elements, a map's entries, a closed
-upvalue — and never those on the stack or in locals. Then the interpreter's
-hottest path is untouched and only `StoreField` and the container mutations
-adjust a count. An object reaching zero becomes a *candidate* rather than
-provably dead, because the stack may still hold it, and candidates are confirmed
-by a scan of the roots that are already enumerated for the collector.
+### What should replace it — what the profile says
 
-**The counters cost nothing per object.** They go in a side array parallel to
-the slots, exactly as the mark bits already do — which is what preserves the
-zero-byte object header this design is built around. A `u8` is 1 B per slot,
-about 1.1 KB at the live counts measured here. A count that saturates at 255
-sticks there and is never decremented again, so such an object can only be
-freed by tracing.
+`cargo run --release --features profile --example heap-profile` runs all 873
+programs in the repository and counts four things that were being argued from
+first principles. Two of the arguments were wrong.
 
-That saturation is the second reason mark-sweep stays underneath, alongside
-cycles. The end state is not "refcounting instead" but **refcounting in front,
-tracing behind** — and the tracing half is then run rarely rather than on a
-growth threshold.
+**Nothing dominates the population.**
+
+| type | share of allocations | slot B | own-table B |
+|---|---|---|---|
+| `List` | 21.5% | 2,752,584 | 1,376,292 |
+| `Closure` | 19.7% | 2,518,104 | 419,684 |
+| `Upvalue` | 19.2% | 2,458,872 | 1,639,248 |
+| `Instance` | 19.0% | 2,434,776 | 1,623,184 |
+| `String` | 13.3% | 1,707,480 | 1,138,320 |
+| `Class` | 6.6% | 847,320 | 141,220 |
+| everything else | 0.8% | | |
+
+Per-type tables would save **50.3% of the slot bytes** on allocation volume,
+against 35% on the live snapshot measured earlier — because `Closure`, `Class`,
+`Fn` and `Fiber` are four bytes of payload sitting in a 24-byte slot, and
+together they are 27% of what gets allocated.
+
+**Mark-sweep is expensive in exactly one place.**
+
+| benchmark | collector's share of runtime | marked per object freed |
+|---|---|---|
+| `binary_trees` | **16.9%** | 1.70 |
+| `list_build` | 0.6% | 34.2 |
+| `method_call` | 0.1% | 29.0 |
+| `fib` | 0.0% | 19.8 |
+
+So "mark-sweep is slow" is true for a program that allocates and false for one
+that does not, which is what one would hope — but the second column is the
+interesting one and it goes the other way. **Where the collector is cheap it is
+also wildly inefficient**: `list_build` traces 34 objects to reclaim one,
+because its live set is large and stable and every survivor is marked again at
+every later collection. Survival across all 873 programs is 52.9%, and 95–97%
+for the three benchmarks that hold something.
+
+That waste is precisely what a generational collector removes. **It is also
+where the collector already costs nothing**, which is the argument against
+building one: on `binary_trees`, the one program where collection is 17% of the
+clock, tracing is already efficient at 1.70 and a nursery has little to remove.
+
+**No garbage was cyclic. None.** Across 453,581 garbage objects, a simulated
+reference count — built at every collection by counting references within the
+garbage and removing whatever falls to zero — would have freed **100%** of it
+the moment it died.
+
+This document asserted the opposite, and both statements are true: Wren does
+have cycles by construction, a class refers to its metaclass and a closure to
+its module, but those are in the *live* set and a collection never sees them.
+What actually becomes garbage in these programs is trees, strings, lists and
+closures, and none of it points back at itself.
+
+A zero is worth nothing until the instrument has been shown to report
+non-zero, so the profiler first runs a program built to make 250 cyclic objects
+and prints what the simulation says about it. It says 250.
+
+### So: refcounting in front, tracing behind
+
+The evidence points one way, and it is not the way the table above expected.
+
+**Refcounting is the memory answer**, because the biggest memory number in this
+project is not in any object's layout. `binary_trees` holds 76,727 B live and
+peaks at 158,124 B: **half of what it uses is garbage that has died and not
+been noticed yet**. Prompt reclamation removes that, and the profile says
+prompt reclamation would work on 100% of it.
+
+**Deferred counting is what makes it affordable.** Count only references held
+*by heap objects* — an instance's fields, a list's elements, a map's entries, a
+closed upvalue — and never those on the stack or in locals. `Value` stays
+`Copy`, the interpreter's hot path is untouched, and only `StoreField` and the
+container mutations adjust a count. An object reaching zero becomes a
+*candidate* rather than provably dead, because the stack may still hold it, and
+candidates are confirmed against the roots that are already enumerated for the
+collector.
+
+**The counters cost one byte a slot**, in a side array beside the mark bits,
+which is what keeps the object header at zero bytes. A count that saturates at
+255 sticks there and can only be freed by tracing.
+
+**Tracing stays, and gets rare.** Two things need it: saturated counts, and the
+live cycles the language creates on purpose. It stops being a growth-triggered
+event and becomes a backstop.
+
+The honest cost, which the profile also shows: `deeply_nested_gc.wren` builds a
+chain of 400,000 maps and drops it. A reference count frees that in one
+cascading decrement — an unbounded pause, which is the same problem a large
+sweep has, moved rather than solved.
+
+**What is not worth building**, on this evidence:
+
+- **Generational collection.** It removes re-marking, and re-marking is only
+  wasteful where the collector is already free. Revisit if a workload appears
+  with both a large stable live set *and* a high allocation rate.
+- **More bitmaps.** The marks are already one bit per slot in a side vector.
+  There is nothing left to win.
+- **A moving or compacting arena**, as the first step. It would remove the
+  ~8 bytes of allocator header on every instance's field block and one
+  dependent load per field access, which the census priced at 9,312 B across
+  `binary_trees` — real, but a quarter of what prompt reclamation is worth, and
+  it needs objects to move.
 
 ### The dial that is already there
 
