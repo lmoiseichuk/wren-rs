@@ -268,3 +268,50 @@ fn collecting_an_empty_heap_is_harmless() {
         }
     );
 }
+
+#[test]
+fn a_tighter_growth_factor_collects_sooner() {
+    // Two heaps, the same objects, different thresholds. The one allowed to
+    // grow less has to be readier to collect than the one allowed to grow
+    // more -- that is the whole of what the dial does, and it is worth a test
+    // because getting the fraction upside down would quietly double the
+    // memory a firmware uses.
+    let mut loose = Heap::new();
+    let mut tight = Heap::new();
+    tight.set_growth(5, 4);
+
+    for heap in [&mut loose, &mut tight] {
+        let mut kept = Vec::new();
+        // Enough live bytes that the factor decides the threshold rather
+        // than `INITIAL_THRESHOLD`, which is a floor under both.
+        for index in 0..512 {
+            kept.push(Value::object(heap.allocate(Object::String(
+                ObjString::from_text(&format!("string number {index} with some length to it")),
+            ))));
+        }
+        heap.collect(kept.iter().copied());
+    }
+
+    assert_eq!(
+        loose.bytes(),
+        tight.bytes(),
+        "same objects, same live bytes"
+    );
+    assert!(
+        tight.threshold() < loose.threshold(),
+        "1.25x should collect sooner than 1.5x: {} vs {}",
+        tight.threshold(),
+        loose.threshold()
+    );
+}
+
+#[test]
+fn a_nonsense_growth_factor_cannot_collect_forever() {
+    // A factor at or below 1 would put the threshold at or under the live set,
+    // so every allocation would want a collection that frees nothing.
+    let mut heap = Heap::new();
+    heap.set_growth(1, 2);
+    assert!(heap.growth().0 > heap.growth().1, "clamped above 1");
+    heap.set_growth(3, 0);
+    assert!(heap.growth().1 >= 1, "denominator never zero");
+}

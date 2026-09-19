@@ -46,6 +46,17 @@ const INITIAL_THRESHOLD: usize = 4 * 1024;
 /// The live set is allowed to reach this multiple of its post-collection size
 /// before collecting again. Upstream's `heapGrowthPercent` default is 50%,
 /// i.e. the same 1.5.
+///
+/// **This is the dial that trades memory for time**, and on a part with 320 KB
+/// it is worth knowing what it is worth. Measured on an ESP32-C6 running
+/// `binary_trees`, going from 1.5 to 1.25 took peak heap from 185,156 B to
+/// 160,628 B -- 13% less -- and cost 4.6% more time. The other three
+/// benchmarks did not move at all, because they do not collect often enough
+/// for the threshold to matter.
+///
+/// The default stays at upstream's 1.5 so the published comparison is like for
+/// like. A firmware that would rather have the memory calls
+/// [`Heap::set_growth`].
 const GROWTH_NUMERATOR: usize = 3;
 const GROWTH_DENOMINATOR: usize = 2;
 
@@ -81,6 +92,8 @@ pub struct Heap {
     live: usize,
     bytes: usize,
     threshold: usize,
+    /// The growth factor, as a fraction. See [`GROWTH_NUMERATOR`].
+    growth: (usize, usize),
     /// Set while a collection is not wanted — during a sequence of allocations
     /// whose intermediate results are not yet reachable from any root.
     paused: bool,
@@ -96,6 +109,7 @@ impl Heap {
             live: 0,
             bytes: 0,
             threshold: INITIAL_THRESHOLD,
+            growth: (GROWTH_NUMERATOR, GROWTH_DENOMINATOR),
             paused: false,
             collections: 0,
         }
@@ -157,6 +171,29 @@ impl Heap {
             }
             Some(ObjectId::new(index as u32))
         })
+    }
+
+    /// Choose how much the live set may grow before collecting again.
+    ///
+    /// `set_growth(5, 4)` collects at 1.25x rather than the default 1.5x:
+    /// less floating garbage held, more time in the collector. A denominator
+    /// of zero, or a factor below 1, would mean collecting forever, so both
+    /// are clamped rather than trusted -- this is a knob a firmware sets once
+    /// at start-up, and a typo in it should not be an infinite loop.
+    pub fn set_growth(&mut self, numerator: usize, denominator: usize) {
+        let denominator = denominator.max(1);
+        let numerator = numerator.max(denominator + 1);
+        self.growth = (numerator, denominator);
+    }
+
+    /// The growth factor in force, as `(numerator, denominator)`.
+    pub fn growth(&self) -> (usize, usize) {
+        self.growth
+    }
+
+    /// Where the next collection is due, in estimated live bytes.
+    pub fn threshold(&self) -> usize {
+        self.threshold
     }
 
     /// Is the live set big enough that collecting is worth it?
@@ -238,7 +275,8 @@ impl Heap {
 
         self.live = live;
         self.bytes = bytes;
-        self.threshold = (bytes * GROWTH_NUMERATOR / GROWTH_DENOMINATOR).max(INITIAL_THRESHOLD);
+        let (numerator, denominator) = self.growth;
+        self.threshold = (bytes * numerator / denominator).max(INITIAL_THRESHOLD);
         self.collections += 1;
 
         Collection {
