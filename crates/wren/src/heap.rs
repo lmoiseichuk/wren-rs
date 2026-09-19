@@ -98,6 +98,52 @@ pub struct Heap {
     /// whose intermediate results are not yet reachable from any root.
     paused: bool,
     collections: usize,
+    #[cfg(feature = "profile")]
+    profile: Profile,
+}
+
+/// What the collector did, for deciding what should replace it.
+///
+/// **Only built under the `profile` feature.** Every field here is a tally the
+/// shipping build has no use for, and the cyclic-garbage figure costs a whole
+/// second pass over the garbage at each collection.
+#[cfg(feature = "profile")]
+#[derive(Debug, Default, Clone)]
+pub struct Profile {
+    /// Objects ever allocated, by [`crate::object::ObjectType`] in
+    /// declaration order.
+    pub allocated: [u64; 10],
+    /// How many collections ran.
+    pub collections: u64,
+    /// What those objects were estimated to cost, at allocation time.
+    pub allocated_bytes: u64,
+    /// Objects visited by the mark phase, summed over every collection. This
+    /// is what tracing costs: it is proportional to the *live* set, and it is
+    /// paid again at every collection whether anything died or not.
+    pub marked: u64,
+    /// Objects freed, summed over every collection.
+    pub swept: u64,
+    /// Live objects immediately after each collection, summed. Against
+    /// `live_before` this gives the survival rate -- and a *high* one is the
+    /// bad case, because everything that survives is marked again at every
+    /// later collection for as long as it lives.
+    pub survived: u64,
+    /// Live objects immediately before each collection, summed.
+    pub live_before: u64,
+    /// Garbage a reference count would have freed the moment it died.
+    pub garbage_acyclic: u64,
+    /// Garbage a reference count would have leaked, because it is a cycle or
+    /// is reachable only from one. This is the figure that decides whether
+    /// refcounting can stand alone.
+    pub garbage_cyclic: u64,
+    /// Time inside `collect`, in nanoseconds.
+    pub collect_nanos: u64,
+    /// The high-water marks.
+    pub peak_live: usize,
+    pub peak_bytes: usize,
+    /// Slots ever swept over. Tracing costs the live set; sweeping costs the
+    /// whole table, which is a different curve and worth separating.
+    pub slots_swept: u64,
 }
 
 impl Heap {
@@ -112,6 +158,8 @@ impl Heap {
             growth: (GROWTH_NUMERATOR, GROWTH_DENOMINATOR),
             paused: false,
             collections: 0,
+            #[cfg(feature = "profile")]
+            profile: Profile::default(),
         }
     }
 
@@ -127,7 +175,20 @@ impl Heap {
     /// ways to write a collector bug, and this removes the opportunity rather
     /// than documenting it.
     pub fn allocate(&mut self, object: Object) -> ObjectId {
+        #[cfg(feature = "profile")]
+        {
+            self.profile.allocated[object.object_type() as usize] += 1;
+            self.profile.allocated_bytes += object.size_estimate() as u64;
+        }
         self.bytes += object.size_estimate();
+        #[cfg(feature = "profile")]
+        {
+            // Occupancy is exact and free: every slot that is not on the free
+            // list holds something.
+            let occupied = self.slots.len().saturating_sub(self.free.len()) + 1;
+            self.profile.peak_live = self.profile.peak_live.max(occupied);
+            self.profile.peak_bytes = self.profile.peak_bytes.max(self.bytes);
+        }
         self.live += 1;
 
         match self.free.pop() {
@@ -186,6 +247,12 @@ impl Heap {
         self.growth = (numerator, denominator);
     }
 
+    /// What the collector has been doing. See [`Profile`].
+    #[cfg(feature = "profile")]
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
     /// The growth factor in force, as `(numerator, denominator)`.
     pub fn growth(&self) -> (usize, usize) {
         self.growth
@@ -226,6 +293,8 @@ impl Heap {
     /// from a Rust local that is not in `roots` will be freed**, which is the
     /// same contract upstream has and the reason [`pause`](Heap::pause) exists.
     pub fn collect(&mut self, roots: impl IntoIterator<Item = Value>) -> Collection {
+        #[cfg(feature = "profile")]
+        let started = std::time::Instant::now();
         let before = self.live;
 
         for word in &mut self.marks {
@@ -251,9 +320,82 @@ impl Heap {
                 continue;
             }
             self.set_mark(index);
+            #[cfg(feature = "profile")]
+            {
+                self.profile.marked += 1;
+            }
             if let Some(object) = self.slots[index].as_ref() {
                 object.trace(&mut gray);
             }
+        }
+
+        // **What a reference count would have managed on its own.**
+        //
+        // Everything unmarked is about to be freed. A refcounted heap would
+        // have freed some of it the instant the last reference went away, and
+        // leaked the rest -- a cycle keeps its own counts above zero for ever.
+        // Which is which is decided here by simulating the counts: build the
+        // in-degree *within the garbage* (nothing live can point at garbage,
+        // by definition of reachable), then repeatedly remove whatever has no
+        // incoming reference left. What cannot be removed is a cycle, or is
+        // reachable only from one.
+        //
+        // This is the measurement that says whether refcounting can stand
+        // alone or has to keep a tracing collector behind it.
+        #[cfg(feature = "profile")]
+        {
+            let mut indegree: Vec<u32> = alloc::vec![0; self.slots.len()];
+            let mut garbage: Vec<usize> = Vec::new();
+            for index in 0..self.slots.len() {
+                if self.slots[index].is_some() && !self.is_marked(index) {
+                    garbage.push(index);
+                }
+            }
+
+            let mut referents: Vec<ObjectId> = Vec::new();
+            for index in &garbage {
+                referents.clear();
+                if let Some(object) = self.slots[*index].as_ref() {
+                    object.trace(&mut referents);
+                }
+                for id in &referents {
+                    let target = id.raw() as usize;
+                    if target < self.slots.len()
+                        && self.slots[target].is_some()
+                        && !self.is_marked(target)
+                    {
+                        indegree[target] += 1;
+                    }
+                }
+            }
+
+            let mut queue: Vec<usize> = garbage
+                .iter()
+                .copied()
+                .filter(|index| indegree[*index] == 0)
+                .collect();
+            let mut acyclic = 0u64;
+            while let Some(index) = queue.pop() {
+                acyclic += 1;
+                referents.clear();
+                if let Some(object) = self.slots[index].as_ref() {
+                    object.trace(&mut referents);
+                }
+                for id in &referents {
+                    let target = id.raw() as usize;
+                    if target < self.slots.len()
+                        && self.slots[target].is_some()
+                        && !self.is_marked(target)
+                    {
+                        indegree[target] = indegree[target].saturating_sub(1);
+                        if indegree[target] == 0 {
+                            queue.push(target);
+                        }
+                    }
+                }
+            }
+            self.profile.garbage_acyclic += acyclic;
+            self.profile.garbage_cyclic += garbage.len() as u64 - acyclic;
         }
 
         // Sweep.
@@ -287,6 +429,16 @@ impl Heap {
                 self.slots[index] = None;
                 self.free.push(index as u32);
             }
+        }
+
+        #[cfg(feature = "profile")]
+        {
+            self.profile.collections += 1;
+            self.profile.slots_swept += self.slots.len() as u64;
+            self.profile.swept += before.saturating_sub(live) as u64;
+            self.profile.live_before += before as u64;
+            self.profile.survived += live as u64;
+            self.profile.collect_nanos += started.elapsed().as_nanos() as u64;
         }
 
         self.live = live;

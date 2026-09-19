@@ -28,6 +28,13 @@ name = "wren"
 # fourteen significant digits, which is specialist numerical work that a naive
 # series will not reach. `libm` is the Rust port of musl's, so enabling it
 # keeps the crate pure Rust while making the two builds agree.
+# **The profiler only exists with its counters.** Declaring the requirement
+# keeps `cargo clippy --all-targets` and `cargo test` from trying to build it
+# in a plain checkout, where `heap::Profile` is not compiled at all.
+[[example]]
+name = "heap-profile"
+required-features = ["profile"]
+
 [dependencies]
 libm = { version = "0.2", optional = true }
 
@@ -56,6 +63,11 @@ libm = ["dep:libm"]
 # 2^24, so a program that counts past 16,777,216 will print something else.
 # `doc/wren-rs/design.md` sets out the trade in full.
 f32 = []
+# **Counters in the collector, for deciding what to replace it with.** Off by
+# default and never shipped: it adds a tally to every allocation and, at every
+# collection, a refcount simulation over the garbage to work out how much of it
+# is cyclic. `cargo run --release --features profile --example heap-profile`.
+profile = ["std"]
 # **The compiler, which a device running bytecode does not need.** This is
 # what step 4 of the plan is for: compile on a workstation, ship `.wrenc`, and
 # leave the lexer and parser out of the image entirely. Default on, because a
