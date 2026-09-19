@@ -45,8 +45,9 @@ pub struct CompileError {
 enum Precedence {
     None,
     Lowest,
-    Assignment, // =
-    LogicalOr,  // ||
+    Assignment,  // =
+    Conditional, // ?:
+    LogicalOr,   // ||
     LogicalAnd, // &&
     Equality,   // == !=
     Is,         // is
@@ -92,6 +93,14 @@ struct FnState {
     name: String,
     /// A constructor body returns `this` rather than null.
     is_initializer: bool,
+    /// Loops being compiled in *this* function, innermost last.
+    ///
+    /// **Per function, not per compiler.** A shared stack let a `break` inside
+    /// a function nested in a loop find the enclosing loop and emit a jump into
+    /// the wrong chunk entirely — offsets from one function applied to
+    /// another's code. Wren's rule is that a loop does not extend through a
+    /// function boundary, and keeping the stack here is what enforces it.
+    loops: Vec<LoopState>,
 }
 
 impl FnState {
@@ -100,9 +109,14 @@ impl FnState {
     fn new(name: String, receiver: &str, is_initializer: bool) -> FnState {
         FnState {
             chunk: Chunk::new(),
+            // **Depth -1, below every scope.** The receiver belongs to the
+            // frame rather than to any block: a module-level block opens at
+            // depth 0, and a receiver recorded at 0 was indistinguishable from
+            // that block's own locals, so closing the block discarded the
+            // receiver and shifted every slot after it.
             locals: alloc::vec![Local {
                 name: receiver.to_string(),
-                depth: 0,
+                depth: -1,
                 is_captured: false,
             }],
             upvalues: Vec::new(),
@@ -110,6 +124,7 @@ impl FnState {
             arity: 0,
             name,
             is_initializer,
+            loops: Vec::new(),
         }
     }
 }
@@ -121,6 +136,22 @@ struct ClassState {
     in_static: bool,
     /// Where the class itself lives, so each method can reload it.
     variable: Variable,
+}
+
+/// A loop being compiled, so `break` and `continue` know where to go.
+struct LoopState {
+    /// Where `continue` jumps back to.
+    start: usize,
+    /// Jumps emitted by `break`, waiting for the loop's end.
+    breaks: Vec<usize>,
+    /// How many locals existed when the loop began.
+    ///
+    /// **A count, not a scope depth.** Depth looked equivalent and is not: at
+    /// module level the enclosing scope is `-1` while the receiver in slot zero
+    /// sits at depth `0`, so "discard everything deeper than the loop" threw
+    /// away the receiver and shifted every later slot by one. The count says
+    /// exactly which slots the body added.
+    locals_at_start: usize,
 }
 
 /// Where a variable lives.
@@ -276,6 +307,10 @@ impl<'a> Compiler<'a> {
         let line = self.line();
         let depth = self.state().scope_depth;
         loop {
+            // Slot zero is never discarded by a scope ending; it is the frame's.
+            if self.state().locals.len() <= 1 {
+                break;
+            }
             let Some(local) = self.state().locals.last() else { break };
             if local.depth < depth {
                 break;
@@ -414,6 +449,12 @@ impl<'a> Compiler<'a> {
         if self.match_token(TokenKind::Return)? {
             return self.return_statement();
         }
+        if self.match_token(TokenKind::Break)? {
+            return self.break_statement();
+        }
+        if self.match_token(TokenKind::Continue)? {
+            return self.continue_statement();
+        }
         self.expression_statement()
     }
 
@@ -461,6 +502,8 @@ impl<'a> Compiler<'a> {
 
         let line = self.line();
         let exit = self.chunk_mut().emit_jump(Op::JumpIf, line);
+
+        self.begin_loop(loop_start);
         self.skip_newlines()?;
         self.statement()?;
 
@@ -468,7 +511,67 @@ impl<'a> Compiler<'a> {
         if !self.chunk_mut().emit_loop(loop_start, line) {
             return Err(self.error_at(self.previous, "Loop body too large."));
         }
-        self.patch(exit)
+        self.patch(exit)?;
+        self.end_loop()
+    }
+
+    fn begin_loop(&mut self, start: usize) {
+        let locals_at_start = self.state().locals.len();
+        self.state_mut()
+            .loops
+            .push(LoopState { start, breaks: Vec::new(), locals_at_start });
+    }
+
+    fn end_loop(&mut self) -> Result<(), CompileError> {
+        let finished = self.state_mut().loops.pop().expect("a loop being compiled");
+        for jump in finished.breaks {
+            self.patch(jump)?;
+        }
+        Ok(())
+    }
+
+    /// Discard the locals a `break` or `continue` is jumping out of.
+    ///
+    /// The compiler's idea of the stack has to match the VM's at the jump
+    /// target, and the body's locals are still in their slots at that point.
+    fn discard_locals_to(&mut self, keep: usize) -> Result<(), CompileError> {
+        let line = self.line();
+        let mut index = self.state().locals.len();
+        while index > keep {
+            let captured = self.state().locals[index - 1].is_captured;
+            self.chunk_mut()
+                .emit_op(if captured { Op::CloseUpvalue } else { Op::Pop }, line);
+            index -= 1;
+        }
+        Ok(())
+    }
+
+    fn break_statement(&mut self) -> Result<(), CompileError> {
+        let Some(keep) = self.state().loops.last().map(|state| state.locals_at_start) else {
+            return Err(self.error_at(self.previous, "Cannot use 'break' outside of a loop."));
+        };
+        self.discard_locals_to(keep)?;
+        let line = self.line();
+        let jump = self.chunk_mut().emit_jump(Op::Jump, line);
+        self.state_mut().loops.last_mut().expect("a loop").breaks.push(jump);
+        Ok(())
+    }
+
+    fn continue_statement(&mut self) -> Result<(), CompileError> {
+        let Some((start, keep)) = self
+            .state()
+            .loops
+            .last()
+            .map(|state| (state.start, state.locals_at_start))
+        else {
+            return Err(self.error_at(self.previous, "Cannot use 'continue' outside of a loop."));
+        };
+        self.discard_locals_to(keep)?;
+        let line = self.line();
+        if !self.chunk_mut().emit_loop(start, line) {
+            return Err(self.error_at(self.previous, "Loop body too large."));
+        }
+        Ok(())
     }
 
     /// `for (name in sequence) body`
@@ -520,9 +623,13 @@ impl<'a> Compiler<'a> {
         // assignment is also the loop condition, with nothing extra emitted.
         let exit = self.chunk_mut().emit_jump(Op::JumpIf, line);
 
+        // `continue` in a `for` goes back to the iterate call, not to the top of
+        // the body -- otherwise it would loop forever on the same element.
+        self.begin_loop(loop_start);
+
         // The loop variable is a fresh local in a scope of its own, so that a
-        // closure capturing it would get this iteration's value. (Closures do
-        // not exist yet; the scope is still the right shape.)
+        // closure capturing it gets this iteration's value rather than the
+        // last one.
         self.begin_scope();
         self.emit_load_local(sequence_slot, line);
         self.emit_load_local(iterator_slot, line);
@@ -538,6 +645,7 @@ impl<'a> Compiler<'a> {
             return Err(self.error_at(self.previous, "Loop body too large."));
         }
         self.patch(exit)?;
+        self.end_loop()?;
 
         self.end_scope();
         Ok(())
@@ -613,6 +721,7 @@ impl<'a> Compiler<'a> {
                 self.consume(TokenKind::RightParen, "Expect ')' after expression.")
             }
             TokenKind::LeftBracket => self.list_literal(),
+            TokenKind::LeftBrace => self.map_literal(),
             TokenKind::Minus => {
                 self.parse_precedence(Precedence::Unary)?;
                 self.emit_call("-", 0, line)
@@ -644,6 +753,7 @@ impl<'a> Compiler<'a> {
                 self.parse_precedence(Precedence::LogicalOr)?;
                 return self.patch(jump);
             }
+            TokenKind::Question => return self.conditional(),
             TokenKind::Dot => return self.method_call(),
             TokenKind::LeftBracket => return self.subscript(),
             _ => {}
@@ -676,6 +786,26 @@ impl<'a> Compiler<'a> {
         self.skip_newlines()?;
         self.parse_precedence(next)?;
         self.emit_call(&signature(name, 1), 1, line)
+    }
+
+    /// `condition ? then : else`
+    ///
+    /// Right-associative, so `a ? b : c ? d : e` groups as `a ? b : (c ? d : e)`
+    /// -- which is what makes a chain of them read as a series of cases.
+    fn conditional(&mut self) -> Result<(), CompileError> {
+        let line = self.line();
+        self.skip_newlines()?;
+
+        let else_jump = self.chunk_mut().emit_jump(Op::JumpIf, line);
+        self.parse_precedence(Precedence::Conditional)?;
+        self.skip_newlines()?;
+        self.consume(TokenKind::Colon, "Expect ':' after then branch of conditional operator.")?;
+        self.skip_newlines()?;
+
+        let end_jump = self.chunk_mut().emit_jump(Op::Jump, line);
+        self.patch(else_jump)?;
+        self.parse_precedence(Precedence::Assignment)?;
+        self.patch(end_jump)
     }
 
     /// `receiver.name`, `receiver.name(a, b)` or `receiver.name = value`.
@@ -962,6 +1092,43 @@ impl<'a> Compiler<'a> {
         self.emit_super(&signature(&base, arity), arity, line)
     }
 
+    /// `{}` or `{ key: value, ... }`
+    ///
+    /// **A `{` only means a map in expression position.** As a statement it is
+    /// a block, and the parser reaches this rule only through `prefix`, which
+    /// is exactly where a statement cannot start.
+    ///
+    /// Built the same way a list literal is: `Map.new`, then one `addCore` per
+    /// entry, which returns the map so it stays on the stack.
+    fn map_literal(&mut self) -> Result<(), CompileError> {
+        let line = self.line();
+        let index = self.module_variable("Map")?;
+        self.chunk_mut().emit_op(Op::LoadModuleVar, line);
+        self.chunk_mut().emit_short(index as u16, line);
+        self.emit_call("new", 0, line)?;
+
+        self.skip_newlines()?;
+        if !self.check(TokenKind::RightBrace) {
+            loop {
+                self.skip_newlines()?;
+                if self.check(TokenKind::RightBrace) {
+                    break;
+                }
+                self.parse_precedence(Precedence::Unary)?;
+                self.consume(TokenKind::Colon, "Expect ':' after map key.")?;
+                self.skip_newlines()?;
+                self.expression()?;
+                self.emit_call("addCore(_,_)", 2, line)?;
+                self.skip_newlines()?;
+                if !self.match_token(TokenKind::Comma)? {
+                    break;
+                }
+            }
+        }
+        self.skip_newlines()?;
+        self.consume(TokenKind::RightBrace, "Expect '}' after map entries.")
+    }
+
     /// `[a, b, c]`
     ///
     /// Built by calling `List.new` and then `addCore(_)` per element, which is
@@ -1059,6 +1226,7 @@ impl<'a> Compiler<'a> {
         let index = self.chunk_mut().add_constant(Value::object(function));
         self.chunk_mut().emit_op(Op::Closure, line);
         self.chunk_mut().emit_short(index, line);
+        self.chunk_mut().emit_byte(upvalues.len() as u8, line);
         // **Two bytes per upvalue, right after the instruction.** Only the
         // enclosing function knows where each captured variable actually is,
         // so it has to say so here rather than at compile time of the inner
@@ -1441,6 +1609,7 @@ fn signature(name: &str, arity: usize) -> String {
 
 fn infix_precedence(kind: TokenKind) -> Precedence {
     match kind {
+        TokenKind::Question => Precedence::Conditional,
         TokenKind::PipePipe => Precedence::LogicalOr,
         TokenKind::AmpAmp => Precedence::LogicalAnd,
         TokenKind::EqEq | TokenKind::BangEq => Precedence::Equality,
@@ -1459,7 +1628,8 @@ fn tighter(precedence: Precedence) -> Precedence {
     match precedence {
         Precedence::None => Precedence::Lowest,
         Precedence::Lowest => Precedence::Assignment,
-        Precedence::Assignment => Precedence::LogicalOr,
+        Precedence::Assignment => Precedence::Conditional,
+        Precedence::Conditional => Precedence::LogicalOr,
         Precedence::LogicalOr => Precedence::LogicalAnd,
         Precedence::LogicalAnd => Precedence::Equality,
         Precedence::Equality => Precedence::Is,

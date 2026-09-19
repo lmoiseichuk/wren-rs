@@ -24,7 +24,10 @@ use alloc::vec::Vec;
 
 use crate::handle::ObjectId;
 use crate::math;
-use crate::object::{Method, ObjClass, ObjList, ObjRange, ObjString, Object, Primitive};
+use crate::object::{
+    MapEntry, Method, ObjClass, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object,
+    Primitive,
+};
 use crate::value::Value;
 use crate::vm::{RuntimeError, Vm};
 
@@ -72,6 +75,8 @@ pub fn install(vm: &mut Vm) {
     install_null(vm);
     install_string(vm);
     install_list(vm);
+    install_list_extras(vm);
+    install_map(vm);
     install_range(vm);
     install_system(vm);
 }
@@ -391,8 +396,18 @@ fn install_list(vm: &mut Vm) {
 
     define(vm, class, "[_]", |vm, at| {
         let list = receiver(vm, at);
-        let index = number_argument(vm, at, 1)?;
         let length = list_length(vm, list);
+
+        // **A range subscript is a slice**, which is why this cannot simply
+        // demand a number: `list[1..2]` is a list, `list[1]` is an element.
+        if let Some(range) = range_of(vm, argument(vm, at, 1)) {
+            let taken = slice_indices(&range, length)?;
+            let elements = list_elements(vm, list);
+            let sliced = taken.into_iter().map(|index| elements[index]).collect();
+            return Ok(new_list(vm, sliced));
+        }
+
+        let index = number_argument(vm, at, 1)?;
         let index = resolve_index(index, length)?;
         match vm.heap.get(list.as_object().unwrap()) {
             Some(Object::List(list)) => Ok(list.elements[index]),
@@ -453,6 +468,205 @@ fn install_list(vm: &mut Vm) {
     });
 }
 
+/// The rest of `List`, and the `Sequence` methods it inherits upstream.
+///
+/// **Upstream writes these in Wren**, in `wren_core.wren`, as methods on a
+/// `Sequence` class that `List`, `Map`, `Range` and `String` all inherit. That
+/// costs a compile of several hundred lines at every start-up — 33 KB of
+/// compiler stack on the C6 — so here they are primitives on the types that
+/// need them.
+fn install_list_extras(vm: &mut Vm) {
+    let class = vm.list_class;
+
+    define(vm, class, "toList", |vm, at| Ok(receiver(vm, at)));
+
+    define(vm, class, "insert(_,_)", |vm, at| {
+        let list = receiver(vm, at);
+        let index = number_argument(vm, at, 1)?;
+        let value = argument(vm, at, 2);
+        let length = list_length(vm, list);
+        // `insert` accepts one past the end, where the other index-taking
+        // methods do not: appending is a legitimate insertion point.
+        let at_index = if index < 0.0 { index + length as f64 + 1.0 } else { index };
+        if at_index < 0.0 || at_index > length as f64 {
+            return Err(RuntimeError::new("Index out of bounds."));
+        }
+        match vm.heap.get_mut(list.as_object().unwrap()) {
+            Some(Object::List(list)) => {
+                list.elements.insert(at_index as usize, value);
+                Ok(value)
+            }
+            _ => Err(RuntimeError::new("Receiver must be a list.")),
+        }
+    });
+
+    define(vm, class, "+(_)", |vm, at| {
+        let mut joined = list_elements(vm, receiver(vm, at));
+        let other = argument(vm, at, 1);
+        if !matches!(other.as_object().and_then(|id| vm.heap.get(id)), Some(Object::List(_))) {
+            return Err(RuntimeError::new("Right operand must be a list."));
+        }
+        joined.extend(list_elements(vm, other));
+        Ok(new_list(vm, joined))
+    });
+
+    define(vm, class, "removeAt(_)", |vm, at| {
+        let list = receiver(vm, at);
+        let index = number_argument(vm, at, 1)?;
+        let length = list_length(vm, list);
+        let index = resolve_index(index, length)?;
+        match vm.heap.get_mut(list.as_object().unwrap()) {
+            Some(Object::List(list)) => Ok(list.elements.remove(index)),
+            _ => Err(RuntimeError::new("Receiver must be a list.")),
+        }
+    });
+
+    define(vm, class, "clear()", |vm, at| {
+        if let Some(Object::List(list)) =
+            receiver(vm, at).as_object().and_then(|id| vm.heap.get_mut(id))
+        {
+            list.elements.clear();
+        }
+        Ok(Value::NULL)
+    });
+
+    define(vm, class, "contains(_)", |vm, at| {
+        let wanted = argument(vm, at, 1);
+        let found = list_elements(vm, receiver(vm, at))
+            .iter()
+            .any(|element| values_equal(vm, *element, wanted));
+        Ok(Value::bool(found))
+    });
+
+    define(vm, class, "indexOf(_)", |vm, at| {
+        let wanted = argument(vm, at, 1);
+        let found = list_elements(vm, receiver(vm, at))
+            .iter()
+            .position(|element| values_equal(vm, *element, wanted));
+        Ok(Value::num(found.map_or(-1.0, |index| index as f64)))
+    });
+
+    define(vm, class, "isEmpty", |vm, at| {
+        Ok(Value::bool(list_length(vm, receiver(vm, at)) == 0))
+    });
+
+    define(vm, class, "each(_)", |vm, at| {
+        let function = argument(vm, at, 1);
+        for element in list_elements(vm, receiver(vm, at)) {
+            vm.call_function(function, &[element])?;
+        }
+        Ok(Value::NULL)
+    });
+
+    define(vm, class, "map(_)", |vm, at| {
+        let function = argument(vm, at, 1);
+        let mut mapped = Vec::new();
+        for element in list_elements(vm, receiver(vm, at)) {
+            mapped.push(vm.call_function(function, &[element])?);
+        }
+        Ok(new_list(vm, mapped))
+    });
+
+    define(vm, class, "where(_)", |vm, at| {
+        let function = argument(vm, at, 1);
+        let mut kept = Vec::new();
+        for element in list_elements(vm, receiver(vm, at)) {
+            if !vm.call_function(function, &[element])?.is_falsy() {
+                kept.push(element);
+            }
+        }
+        Ok(new_list(vm, kept))
+    });
+
+    define(vm, class, "any(_)", |vm, at| {
+        let function = argument(vm, at, 1);
+        for element in list_elements(vm, receiver(vm, at)) {
+            if !vm.call_function(function, &[element])?.is_falsy() {
+                return Ok(Value::TRUE);
+            }
+        }
+        Ok(Value::FALSE)
+    });
+
+    define(vm, class, "all(_)", |vm, at| {
+        let function = argument(vm, at, 1);
+        for element in list_elements(vm, receiver(vm, at)) {
+            if vm.call_function(function, &[element])?.is_falsy() {
+                return Ok(Value::FALSE);
+            }
+        }
+        Ok(Value::TRUE)
+    });
+
+    define(vm, class, "reduce(_)", |vm, at| {
+        let function = argument(vm, at, 1);
+        let elements = list_elements(vm, receiver(vm, at));
+        let mut iterator = elements.into_iter();
+        let Some(mut total) = iterator.next() else {
+            return Err(RuntimeError::new("Can't reduce an empty sequence."));
+        };
+        for element in iterator {
+            total = vm.call_function(function, &[total, element])?;
+        }
+        Ok(total)
+    });
+
+    define(vm, class, "reduce(_,_)", |vm, at| {
+        let mut total = argument(vm, at, 1);
+        let function = argument(vm, at, 2);
+        for element in list_elements(vm, receiver(vm, at)) {
+            total = vm.call_function(function, &[total, element])?;
+        }
+        Ok(total)
+    });
+
+    define(vm, class, "join()", |vm, at| {
+        let joined = join_elements(vm, receiver(vm, at), "")?;
+        Ok(vm.new_string(&joined))
+    });
+
+    define(vm, class, "join(_)", |vm, at| {
+        let separator = argument(vm, at, 1);
+        let separator = vm.to_string(separator);
+        let joined = join_elements(vm, receiver(vm, at), &separator)?;
+        Ok(vm.new_string(&joined))
+    });
+
+    // `List.new()` and `List.filled(n, value)`.
+    let metaclass = match vm.heap.get(class) {
+        Some(Object::Class(list)) => list.metaclass,
+        _ => None,
+    };
+    if let Some(metaclass) = metaclass {
+        define(vm, metaclass, "filled(_,_)", |vm, at| {
+            let count = number_argument(vm, at, 1)?;
+            if count < 0.0 || count != math::trunc(count) {
+                return Err(RuntimeError::new("Size must be a non-negative integer."));
+            }
+            let value = argument(vm, at, 2);
+            Ok(new_list(vm, alloc::vec![value; count as usize]))
+        });
+    }
+}
+
+fn list_elements(vm: &Vm, list: Value) -> Vec<Value> {
+    match list.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::List(list)) => list.elements.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn join_elements(vm: &mut Vm, list: Value, separator: &str) -> Result<alloc::string::String, RuntimeError> {
+    let mut out = alloc::string::String::new();
+    for (index, element) in list_elements(vm, list).into_iter().enumerate() {
+        if index > 0 {
+            out.push_str(separator);
+        }
+        out.push_str(&vm.stringify(element)?);
+    }
+    Ok(out)
+}
+
 fn list_length(vm: &Vm, list: Value) -> usize {
     match list.as_object().and_then(|id| vm.heap.get(id)) {
         Some(Object::List(list)) => list.elements.len(),
@@ -473,6 +687,198 @@ fn resolve_index(index: f64, length: usize) -> Result<usize, RuntimeError> {
         return Err(RuntimeError::new("Index out of bounds."));
     }
     Ok(resolved as usize)
+}
+
+/// `Map`, and the `MapEntry` its iteration yields.
+fn install_map(vm: &mut Vm) {
+    let class = vm.map_class;
+
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Map metaclass")));
+    let metaclass = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+    if let Some(Object::Class(map)) = vm.heap.get_mut(class) {
+        map.metaclass = Some(metaclass);
+    }
+    define(vm, metaclass, "new", |vm, _| {
+        let id = vm.heap.allocate(Object::Map(ObjMap::new()));
+        Ok(Value::object(id))
+    });
+
+    // What a map literal emits per entry; returns the map so the next entry
+    // does not have to reload it.
+    define(vm, class, "addCore(_,_)", |vm, at| {
+        let map = receiver(vm, at);
+        let key = argument(vm, at, 1);
+        let value = argument(vm, at, 2);
+        map_set(vm, map, key, value)?;
+        Ok(map)
+    });
+
+    define(vm, class, "[_]", |vm, at| {
+        let map = receiver(vm, at);
+        let key = argument(vm, at, 1);
+        // **A missing key is null, not an error.** That is Wren's rule and it
+        // is what makes `map[k] ?: default` idiomatic.
+        Ok(map_get(vm, map, key).unwrap_or(Value::NULL))
+    });
+
+    define(vm, class, "[_]=(_)", |vm, at| {
+        let map = receiver(vm, at);
+        let key = argument(vm, at, 1);
+        let value = argument(vm, at, 2);
+        map_set(vm, map, key, value)?;
+        Ok(value)
+    });
+
+    define(vm, class, "count", |vm, at| {
+        Ok(Value::num(map_entries(vm, receiver(vm, at)).len() as f64))
+    });
+
+    define(vm, class, "containsKey(_)", |vm, at| {
+        let map = receiver(vm, at);
+        let key = argument(vm, at, 1);
+        Ok(Value::bool(map_get(vm, map, key).is_some()))
+    });
+
+    define(vm, class, "remove(_)", |vm, at| {
+        let map = receiver(vm, at);
+        let key = argument(vm, at, 1);
+        let Some(id) = map.as_object() else {
+            return Err(RuntimeError::new("Receiver must be a map."));
+        };
+        let found = map_index(vm, map, key);
+        match (found, vm.heap.get_mut(id)) {
+            (Some(index), Some(Object::Map(map))) => Ok(map.entries.remove(index).value),
+            _ => Ok(Value::NULL),
+        }
+    });
+
+    define(vm, class, "clear()", |vm, at| {
+        if let Some(Object::Map(map)) = receiver(vm, at).as_object().and_then(|id| vm.heap.get_mut(id))
+        {
+            map.entries.clear();
+        }
+        Ok(Value::NULL)
+    });
+
+    define(vm, class, "keys", |vm, at| {
+        let keys: Vec<Value> = map_entries(vm, receiver(vm, at)).iter().map(|e| e.key).collect();
+        Ok(new_list(vm, keys))
+    });
+    define(vm, class, "values", |vm, at| {
+        let values: Vec<Value> = map_entries(vm, receiver(vm, at)).iter().map(|e| e.value).collect();
+        Ok(new_list(vm, values))
+    });
+
+    // Iterating a map yields `MapEntry` objects, so `for (e in map)` can reach
+    // both halves through `e.key` and `e.value`.
+    define(vm, class, "iterate(_)", |vm, at| {
+        let count = map_entries(vm, receiver(vm, at)).len();
+        if count == 0 {
+            return Ok(Value::FALSE);
+        }
+        let current = argument(vm, at, 1);
+        if current.is_null() {
+            return Ok(Value::num(0.0));
+        }
+        let index = current
+            .as_num()
+            .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?;
+        if index < 0.0 || index >= (count - 1) as f64 {
+            return Ok(Value::FALSE);
+        }
+        Ok(Value::num(index + 1.0))
+    });
+
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        let entries = map_entries(vm, receiver(vm, at));
+        let index = number_argument(vm, at, 1)? as usize;
+        let Some(entry) = entries.get(index).copied() else {
+            return Err(RuntimeError::new("Index out of bounds."));
+        };
+        let class = vm.map_entry_class;
+        let id = vm.heap.allocate(Object::Instance(ObjInstance {
+            class,
+            fields: alloc::vec![entry.key, entry.value],
+        }));
+        Ok(Value::object(id))
+    });
+
+    // `MapEntry` itself: two fields, reachable by name.
+    let entry_class = vm.map_entry_class;
+    define(vm, entry_class, "key", |vm, at| Ok(instance_field(vm, receiver(vm, at), 0)));
+    define(vm, entry_class, "value", |vm, at| Ok(instance_field(vm, receiver(vm, at), 1)));
+    define(vm, entry_class, "toString", |vm, at| {
+        let key = instance_field(vm, receiver(vm, at), 0);
+        let value = instance_field(vm, receiver(vm, at), 1);
+        let text = alloc::format!("{}:{}", vm.to_string(key), vm.to_string(value));
+        Ok(vm.new_string(&text))
+    });
+}
+
+fn instance_field(vm: &Vm, value: Value, index: usize) -> Value {
+    match value.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::Instance(instance)) => {
+            instance.fields.get(index).copied().unwrap_or(Value::NULL)
+        }
+        _ => Value::NULL,
+    }
+}
+
+fn map_entries(vm: &Vm, map: Value) -> Vec<MapEntry> {
+    match map.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::Map(map)) => map.entries.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Where `key` sits in the map, by Wren's equality rather than by identity.
+fn map_index(vm: &Vm, map: Value, key: Value) -> Option<usize> {
+    let entries = match map.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::Map(map)) => &map.entries,
+        _ => return None,
+    };
+    entries.iter().position(|entry| values_equal(vm, entry.key, key))
+}
+
+fn map_get(vm: &Vm, map: Value, key: Value) -> Option<Value> {
+    let index = map_index(vm, map, key)?;
+    match map.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::Map(map)) => map.entries.get(index).map(|entry| entry.value),
+        _ => None,
+    }
+}
+
+fn map_set(vm: &mut Vm, map: Value, key: Value, value: Value) -> Result<(), RuntimeError> {
+    let Some(id) = map.as_object() else {
+        return Err(RuntimeError::new("Receiver must be a map."));
+    };
+    let existing = map_index(vm, map, key);
+    match vm.heap.get_mut(id) {
+        Some(Object::Map(map)) => {
+            match existing {
+                Some(index) => map.entries[index].value = value,
+                None => map.entries.push(MapEntry { key, value }),
+            }
+            Ok(())
+        }
+        _ => Err(RuntimeError::new("Receiver must be a map.")),
+    }
+}
+
+/// Wren's `==` for the types that can be map keys.
+///
+/// **Strings compare by contents**, which is the whole reason this is not just
+/// a bit comparison: two separately allocated `"a"` are the same key.
+pub fn values_equal(vm: &Vm, left: Value, right: Value) -> bool {
+    if left.is_same(right) {
+        return true;
+    }
+    if let (Some(a), Some(b)) = (left.as_num(), right.as_num()) {
+        return a == b;
+    }
+    strings_equal(vm, left, right)
 }
 
 fn install_range(vm: &mut Vm) {
@@ -540,6 +946,59 @@ fn install_range(vm: &mut Vm) {
         let text = vm.to_string(receiver(vm, at));
         Ok(vm.new_string(&text))
     });
+}
+
+/// The element indices a range selects, in the order it selects them.
+///
+/// Handles the two things that make slicing fiddly: a descending range reads
+/// backwards, and an exclusive range stops one short of its end.
+fn slice_indices(range: &ObjRange, length: usize) -> Result<Vec<usize>, RuntimeError> {
+    let resolve = |value: f64| -> Result<isize, RuntimeError> {
+        if value != math::trunc(value) {
+            return Err(RuntimeError::new("Range start must be an integer."));
+        }
+        let resolved = if value < 0.0 { value + length as f64 } else { value };
+        Ok(resolved as isize)
+    };
+
+    let from = resolve(range.from)?;
+    let to = resolve(range.to)?;
+    let descending = to < from;
+
+    let last = if range.is_inclusive {
+        to
+    } else if descending {
+        to + 1
+    } else {
+        to - 1
+    };
+
+    // An exclusive empty range selects nothing rather than failing.
+    if !range.is_inclusive && from == to {
+        return Ok(Vec::new());
+    }
+    if from < 0 || from >= length as isize {
+        return Err(RuntimeError::new("Range start out of bounds."));
+    }
+    if last < 0 || last >= length as isize {
+        return Err(RuntimeError::new("Range end out of bounds."));
+    }
+
+    let mut indices = Vec::new();
+    if descending {
+        let mut index = from;
+        while index >= last {
+            indices.push(index as usize);
+            index -= 1;
+        }
+    } else {
+        let mut index = from;
+        while index <= last {
+            indices.push(index as usize);
+            index += 1;
+        }
+    }
+    Ok(indices)
 }
 
 fn range_of(vm: &Vm, value: Value) -> Option<ObjRange> {

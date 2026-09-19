@@ -74,10 +74,16 @@ pub enum Op {
     /// so the interpreter needs no bounds check on the instruction pointer.
     End = 16,
 
-    /// Make a closure from the function in `constants[operand]`. Operand:
-    /// `u16`, then **two bytes per upvalue** the function captures: a flag
-    /// saying whether it comes from the enclosing function's locals or from
-    /// its upvalues, and the index.
+    /// Make a closure from the function in `constants[operand]`. Operands:
+    /// `u16` constant, `u8` upvalue count, then **two bytes per upvalue**: a
+    /// flag saying whether it comes from the enclosing function's locals or
+    /// from its upvalues, and the index.
+    ///
+    /// **The count is in the instruction**, where upstream reads it from the
+    /// function object. It costs a byte and means the code can be walked
+    /// without the heap — which a disassembler needs, and which a bytecode
+    /// loader will need when step 4 ships compiled code to a part that has no
+    /// compiler.
     ///
     /// The variable-length operand is why closures are made by an instruction
     /// rather than assembled at compile time: only the enclosing function knows
@@ -274,4 +280,75 @@ impl Default for Chunk {
     fn default() -> Chunk {
         Chunk::new()
     }
+}
+
+/// Disassemble a chunk, one instruction per line.
+///
+/// Not used by the VM. It exists because a stack-discipline bug — the
+/// compiler's idea of which slot a local is in disagreeing with the VM's — is
+/// close to undebuggable from the outside, and obvious the moment the
+/// instructions are laid out with their offsets.
+#[cfg(feature = "std")]
+pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
+    use core::fmt::Write as _;
+
+    let mut out = alloc::string::String::new();
+    let mut offset = 0;
+    while offset < chunk.code.len() {
+        let at = offset;
+        let Some(op) = Op::from_byte(chunk.code[offset]) else {
+            let _ = writeln!(out, "{at:04} ??? {}", chunk.code[offset]);
+            offset += 1;
+            continue;
+        };
+        offset += 1;
+
+        let mut operand = alloc::string::String::new();
+        match op {
+            Op::Constant | Op::LoadModuleVar | Op::StoreModuleVar | Op::MethodInstance
+            | Op::MethodStatic => {
+                let _ = write!(operand, " {}", chunk.read_short(offset));
+                offset += 2;
+            }
+            Op::LoadLocal | Op::StoreLocal | Op::LoadUpvalue | Op::StoreUpvalue
+            | Op::LoadFieldThis | Op::StoreFieldThis | Op::LoadField | Op::StoreField
+            | Op::Class => {
+                let _ = write!(operand, " {}", chunk.code[offset]);
+                offset += 1;
+            }
+            Op::Jump | Op::JumpIf | Op::And | Op::Or => {
+                let target = offset + 2 + chunk.read_short(offset) as usize;
+                let _ = write!(operand, " -> {target:04}");
+                offset += 2;
+            }
+            Op::Loop => {
+                let target = offset + 2 - chunk.read_short(offset) as usize;
+                let _ = write!(operand, " -> {target:04}");
+                offset += 2;
+            }
+            Op::Call | Op::Super => {
+                let _ = write!(
+                    operand,
+                    " arity {} symbol {}",
+                    chunk.code[offset],
+                    chunk.read_short(offset + 1)
+                );
+                offset += 3;
+            }
+            Op::Closure => {
+                let index = chunk.read_short(offset);
+                offset += 2;
+                let count = chunk.code[offset] as usize;
+                offset += 1;
+                let _ = write!(operand, " {index} upvalues {count}");
+                // The descriptors are part of the instruction, so they have to
+                // be consumed or every later offset is wrong -- which is
+                // exactly the sort of thing this exists to catch.
+                offset += count * 2;
+            }
+            _ => {}
+        }
+        let _ = writeln!(out, "{at:04} {op:?}{operand}");
+    }
+    out
 }

@@ -57,7 +57,13 @@ fn main() {
             error_total += 1;
         }
 
-        match check(&source) {
+        // **A panic in the VM is a failure, not the end of the run.** A bad
+        // program must not be able to take the harness down with it, and the
+        // file that did it is the thing worth knowing.
+        let outcome = std::panic::catch_unwind(|| check(&source))
+            .unwrap_or_else(|_| Err(format!("PANIC in {}", path.display())));
+
+        match outcome {
             Ok(()) => {
                 passed += 1;
                 entry.0 += 1;
@@ -87,6 +93,27 @@ fn main() {
         let share = if *count == 0 { 0 } else { ok * 24 / count };
         let bar: String = "#".repeat(share) + &".".repeat(24 - share);
         println!("{group:<14} {ok:>4}/{count:<4} {bar}");
+    }
+
+    // `--why <substring>` lists the files behind one reason, which is how the
+    // histogram turns into something to act on.
+    if let Some(wanted) = std::env::args().nth(2) {
+        println!("\nfiles failing with {wanted:?}:");
+        for path in &files {
+            let Ok(source) = std::fs::read_to_string(path) else { continue };
+            let display = path.display().to_string();
+            if display.contains("/benchmark/") || display.contains("/api/") {
+                continue;
+            }
+            let outcome = std::panic::catch_unwind(|| check(&source))
+                .unwrap_or_else(|_| Err(format!("PANIC in {}", path.display())));
+            if let Err(reason) = outcome {
+                if reason.contains(&wanted) {
+                    println!("  {}", path.display());
+                }
+            }
+        }
+        return;
     }
 
     println!("\nwhy the rest fail, most common first:");
@@ -165,6 +192,9 @@ fn check(source: &str) -> Result<(), String> {
 
 /// Collapse a message to something worth counting.
 fn summarise(reason: &str) -> String {
+    if reason.starts_with("PANIC") {
+        return reason.to_string();
+    }
     if let Some(at) = reason.find(" does not implement ") {
         return format!("missing method{}", &reason[at + 19..]);
     }

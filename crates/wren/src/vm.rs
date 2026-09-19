@@ -138,6 +138,8 @@ pub struct Vm {
     pub object_class: ObjectId,
     /// The class of every function and closure, holding `call`.
     pub fn_class: ObjectId,
+    /// What iterating a map yields: a `key`/`value` pair.
+    pub map_entry_class: ObjectId,
 
     /// Calls in progress, innermost last.
     pub frames: Vec<Frame>,
@@ -184,6 +186,7 @@ impl Vm {
         let range_class = class_named(&mut heap, "Range", root);
         let class_class = class_named(&mut heap, "Class", root);
         let fn_class = class_named(&mut heap, "Fn", root);
+        let map_entry_class = class_named(&mut heap, "MapEntry", root);
 
         let mut vm = Vm {
             heap,
@@ -200,6 +203,7 @@ impl Vm {
             class_class,
             object_class,
             fn_class,
+            map_entry_class,
             frames: Vec::new(),
             open_upvalues: Vec::new(),
             output: Vec::new(),
@@ -434,7 +438,7 @@ impl Vm {
         for class in [
             self.num_class, self.bool_class, self.null_class, self.string_class,
             self.list_class, self.map_class, self.range_class, self.class_class,
-            self.object_class, self.fn_class,
+            self.object_class, self.fn_class, self.map_entry_class,
         ] {
             roots.push(Value::object(class));
         }
@@ -472,6 +476,29 @@ impl Vm {
             Method::Primitive(function) => function(self, at),
             Method::Closure(closure) => self.call_closure(closure, at),
         };
+        self.stack.truncate(at);
+        result
+    }
+
+    /// Call a Wren function with arguments, from Rust.
+    ///
+    /// This is what a core method written in Rust needs in order to take a
+    /// block: `list.map { ... }` has to actually run the block once per
+    /// element. The receiver slot holds the function itself, which is what a
+    /// closure's slot zero is.
+    pub fn call_function(&mut self, function: Value, args: &[Value]) -> Result<Value, RuntimeError> {
+        let Some(closure) = function.as_object() else {
+            return Err(RuntimeError::new("Argument must be a function."));
+        };
+        if !matches!(self.heap.get(closure), Some(Object::Closure(_))) {
+            return Err(RuntimeError::new("Argument must be a function."));
+        }
+        let at = self.stack.len();
+        self.stack.push(function);
+        for argument in args {
+            self.stack.push(*argument);
+        }
+        let result = self.call_closure(closure, at);
         self.stack.truncate(at);
         result
     }
@@ -586,10 +613,8 @@ impl Vm {
                     let function = chunk.constants[index]
                         .as_object()
                         .ok_or_else(|| RuntimeError::new("Closure constant is not a function."))?;
-                    let count = match self.heap.get(function) {
-                        Some(Object::Fn(function)) => function.num_upvalues,
-                        _ => return Err(RuntimeError::new("Closure constant is not a function.")),
-                    };
+                    let count = chunk.code[ip] as usize;
+                    ip += 1;
 
                     let mut upvalues = Vec::with_capacity(count);
                     for _ in 0..count {
