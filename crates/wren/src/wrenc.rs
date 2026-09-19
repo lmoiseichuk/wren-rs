@@ -60,7 +60,7 @@ const MAGIC: [u8; 6] = *b"WRENC\0";
 /// A file from a different version is refused rather than guessed at: the
 /// failure of loading the wrong bytecode is an interpreter running nonsense,
 /// which is far harder to diagnose than a message at load time.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// What went wrong reading a `.wrenc`.
 #[derive(Debug, Clone, PartialEq, Eq)]

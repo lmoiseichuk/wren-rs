@@ -28,24 +28,24 @@ use crate::value::Value;
 #[repr(u8)]
 pub enum Op {
     /// Push `constants[operand]`. Operand: `u16`.
-    Constant = 0,
+    Constant = 21,
     /// Push `null`.
-    Null = 1,
+    Null = 4,
     /// Push `false`.
-    False = 2,
+    False = 3,
     /// Push `true`.
-    True = 3,
+    True = 8,
     /// Push the local in slot `operand`. Operand: `u8`.
-    LoadLocal = 4,
+    LoadLocal = 12,
     /// Store the top of the stack into slot `operand`, leaving it. Operand: `u8`.
-    StoreLocal = 5,
+    StoreLocal = 17,
     /// Push module variable `operand`. Operand: `u16`.
-    LoadModuleVar = 6,
+    LoadModuleVar = 27,
     /// Store the top of the stack into module variable `operand`, leaving it.
     /// Operand: `u16`.
-    StoreModuleVar = 7,
+    StoreModuleVar = 33,
     /// Discard the top of the stack.
-    Pop = 8,
+    Pop = 5,
     /// Invoke a method. Operands: arity `u8`, then symbol `u16`.
     ///
     /// The receiver sits below the arguments, so a call of arity *n* consumes
@@ -57,23 +57,23 @@ pub enum Op {
     /// optimisation and it is deliberately not done yet: it multiplies the
     /// dispatch table by seventeen before there is anything to measure the
     /// benefit against.
-    Call = 9,
+    Call = 34,
     /// Jump forward by `operand` bytes. Operand: `u16`.
-    Jump = 10,
+    Jump = 23,
     /// Jump *backward* by `operand` bytes. Operand: `u16`.
-    Loop = 11,
+    Loop = 28,
     /// Pop, and jump forward by `operand` bytes if it was falsy. Operand: `u16`.
-    JumpIf = 12,
+    JumpIf = 24,
     /// If the top of the stack is falsy, jump forward by `operand` and leave
     /// it; otherwise pop and continue. Operand: `u16`.
-    And = 13,
+    And = 20,
     /// The mirror of [`Op::And`]. Operand: `u16`.
-    Or = 14,
+    Or = 31,
     /// Return the top of the stack from the current call.
-    Return = 15,
+    Return = 6,
     /// End of the compiled chunk. A well-formed chunk always ends with this,
     /// so the interpreter needs no bounds check on the instruction pointer.
-    End = 16,
+    End = 2,
 
     /// Make a closure from the function in `constants[operand]`. Operands:
     /// `u16` constant, `u8` upvalue count, then **two bytes per upvalue**: a
@@ -89,46 +89,46 @@ pub enum Op {
     /// The variable-length operand is why closures are made by an instruction
     /// rather than assembled at compile time: only the enclosing function knows
     /// where each captured variable actually is.
-    Closure = 17,
+    Closure = 39,
     /// Push the closure's upvalue `operand`. Operand: `u8`.
-    LoadUpvalue = 18,
+    LoadUpvalue = 14,
     /// Store the top of the stack into upvalue `operand`, leaving it. `u8`.
     StoreUpvalue = 19,
     /// Close every upvalue at or above the top of the stack, then pop.
-    CloseUpvalue = 20,
+    CloseUpvalue = 0,
 
     /// Make a class. Pops the superclass, then the name below it, and pushes
     /// the class. Operand: `u8`, the number of fields it declares.
-    Class = 21,
+    Class = 9,
     /// Bind the closure below the class on the stack as an instance method.
     /// Operand: `u16` symbol. Pops both.
-    MethodInstance = 22,
+    MethodInstance = 29,
     /// The same, on the metaclass. Operand: `u16` symbol.
-    MethodStatic = 23,
+    MethodStatic = 30,
 
     /// Push field `operand` of `this`. Operand: `u8`.
-    LoadFieldThis = 24,
+    LoadFieldThis = 11,
     /// Store the top of the stack into field `operand` of `this`. `u8`.
-    StoreFieldThis = 25,
+    StoreFieldThis = 16,
     /// Pop an instance and push its field `operand`. Operand: `u8`.
-    LoadField = 26,
+    LoadField = 10,
     /// Pop an instance and store into its field `operand`. Operand: `u8`.
-    StoreField = 27,
+    StoreField = 15,
 
     /// Replace the class in slot zero with a new instance of it.
     ///
     /// This is how `Foo.new(...)` works: the compiler generates a static
     /// method on the metaclass whose body is this, then a call to the
     /// constructor body, then a return.
-    Construct = 28,
+    Construct = 1,
 
     /// Attach attributes to a class. Pops the attributes, then the class.
-    SetAttributes = 34,
+    SetAttributes = 7,
     /// Push static field `operand` of the class this method belongs to.
     /// Operand: `u8`.
-    LoadStaticField = 32,
+    LoadStaticField = 13,
     /// Store the top of the stack into static field `operand`. Operand: `u8`.
-    StoreStaticField = 33,
+    StoreStaticField = 18,
 
     /// Load and run the module named by `constants[operand]`, leaving its
     /// result. Operand: `u16`.
@@ -136,7 +136,7 @@ pub enum Op {
     /// A module already loaded is not run again -- that is what makes two
     /// files importing the same third one share it rather than each get their
     /// own copy of its variables.
-    ImportModule = 30,
+    ImportModule = 22,
     /// Push a variable out of an already-imported module. Operands: `u16` for
     /// the module name, then `u16` for the variable name.
     ///
@@ -145,7 +145,7 @@ pub enum Op {
     /// any "last imported" state before the outer import got to read its
     /// variables. Naming it twice costs two bytes and removes the ordering
     /// hazard entirely.
-    ImportVariable = 31,
+    ImportVariable = 37,
 
     /// Invoke a method on `this`, looking it up from the superclass of the
     /// class this method was bound to. Operands: arity `u8`, symbol `u16`.
@@ -157,7 +157,7 @@ pub enum Op {
     /// Upstream stores that class in a constant and rewrites the bytecode when
     /// the method is bound. Here it is recorded on the function instead, which
     /// needs no mutation of a chunk shared through an `Rc`.
-    Super = 29,
+    Super = 36,
 
     // **Fused pairs.** An opcode costs about thirty-one machine instructions
     // on an ESP32-C6 and nearly all of that is dispatch rather than work, so
@@ -173,15 +173,15 @@ pub enum Op {
     // pass has to refuse. The dead byte costs one byte of image per fusion.
     /// `LoadLocal` then `Constant`. Operands: `u8` slot, a dead byte, `u16`
     /// constant. 18% of the adjacent pairs in `fib`.
-    LoadLocalConstant = 35,
+    LoadLocalConstant = 38,
     /// `LoadLocal` twice. Operands: `u8` slot, a dead byte, `u8` slot.
-    LoadLocalPair = 36,
+    LoadLocalPair = 35,
     /// `LoadLocal` then `Return`. Operands: `u8` slot, a dead byte.
-    LoadLocalReturn = 37,
+    LoadLocalReturn = 26,
     /// `StoreFieldThis` then `Pop`. Operands: `u8` field, a dead byte.
-    StoreFieldThisPop = 38,
+    StoreFieldThisPop = 32,
     /// `LoadFieldThis` then `Return`. Operands: `u8` field, a dead byte.
-    LoadFieldThisReturn = 39,
+    LoadFieldThisReturn = 25,
 }
 
 /// The opcodes as plain bytes, for matching the instruction stream directly.
@@ -303,53 +303,61 @@ mod opcode_bytes {
 impl Op {
     /// Decode a byte, or `None` if it is not an opcode.
     ///
+    /// **The numbering is not arbitrary**: opcodes are assigned in order of
+    /// instruction length, so that [`Chunk::instruction_len`] is a comparison
+    /// on the byte rather than a table. A new opcode belongs in the range for
+    /// its length.
+    ///
     /// A `match` rather than a transmute — which is what keeps this crate free
-    /// of `unsafe`, and costs a jump table the compiler would emit anyway.
+    /// of `unsafe`. The interpreter no longer calls it: `run_frames` matches
+    /// the byte directly, and this is for the compiler, the disassembler and
+    /// the file reader, none of which are hot.
     pub fn from_byte(byte: u8) -> Option<Op> {
         let op = match byte {
-            0 => Op::Constant,
-            1 => Op::Null,
-            2 => Op::False,
-            3 => Op::True,
-            4 => Op::LoadLocal,
-            5 => Op::StoreLocal,
-            6 => Op::LoadModuleVar,
-            7 => Op::StoreModuleVar,
-            8 => Op::Pop,
-            9 => Op::Call,
-            10 => Op::Jump,
-            11 => Op::Loop,
-            12 => Op::JumpIf,
-            13 => Op::And,
-            14 => Op::Or,
-            15 => Op::Return,
-            16 => Op::End,
-            17 => Op::Closure,
-            18 => Op::LoadUpvalue,
+            0 => Op::CloseUpvalue,
+            1 => Op::Construct,
+            2 => Op::End,
+            3 => Op::False,
+            4 => Op::Null,
+            5 => Op::Pop,
+            6 => Op::Return,
+            7 => Op::SetAttributes,
+            8 => Op::True,
+            9 => Op::Class,
+            10 => Op::LoadField,
+            11 => Op::LoadFieldThis,
+            12 => Op::LoadLocal,
+            13 => Op::LoadStaticField,
+            14 => Op::LoadUpvalue,
+            15 => Op::StoreField,
+            16 => Op::StoreFieldThis,
+            17 => Op::StoreLocal,
+            18 => Op::StoreStaticField,
             19 => Op::StoreUpvalue,
-            20 => Op::CloseUpvalue,
-            21 => Op::Class,
-            22 => Op::MethodInstance,
-            23 => Op::MethodStatic,
-            24 => Op::LoadFieldThis,
-            25 => Op::StoreFieldThis,
-            26 => Op::LoadField,
-            27 => Op::StoreField,
-            28 => Op::Construct,
-            29 => Op::Super,
-            30 => Op::ImportModule,
-            31 => Op::ImportVariable,
-            32 => Op::LoadStaticField,
-            33 => Op::StoreStaticField,
-            34 => Op::SetAttributes,
-            35 => Op::LoadLocalConstant,
-            36 => Op::LoadLocalPair,
-            37 => Op::LoadLocalReturn,
-            38 => Op::StoreFieldThisPop,
-            39 => Op::LoadFieldThisReturn,
+            20 => Op::And,
+            21 => Op::Constant,
+            22 => Op::ImportModule,
+            23 => Op::Jump,
+            24 => Op::JumpIf,
+            25 => Op::LoadFieldThisReturn,
+            26 => Op::LoadLocalReturn,
+            27 => Op::LoadModuleVar,
+            28 => Op::Loop,
+            29 => Op::MethodInstance,
+            30 => Op::MethodStatic,
+            31 => Op::Or,
+            32 => Op::StoreFieldThisPop,
+            33 => Op::StoreModuleVar,
+            34 => Op::Call,
+            35 => Op::LoadLocalPair,
+            36 => Op::Super,
+            37 => Op::ImportVariable,
+            38 => Op::LoadLocalConstant,
+            39 => Op::Closure,
             _ => return None,
         };
         Some(op)
+
     }
 }
 
@@ -514,47 +522,28 @@ impl Chunk {
     /// `None` when the byte is not an opcode or the instruction runs off the
     /// end, which for a chunk this crate compiled cannot happen.
     pub fn instruction_len(code: &[u8], at: usize) -> Option<usize> {
-        let op = Op::from_byte(*code.get(at)?)?;
-        let operands = match op {
-            Op::Call | Op::Super => 3,
-            Op::ImportVariable => 4,
-            Op::Closure => 3 + *code.get(at + 3)? as usize * 2,
-            Op::Constant
-            | Op::LoadModuleVar
-            | Op::StoreModuleVar
-            | Op::MethodInstance
-            | Op::MethodStatic
-            | Op::ImportModule
-            | Op::Jump
-            | Op::Loop
-            | Op::JumpIf
-            | Op::And
-            | Op::Or => 2,
-            Op::LoadLocal
-            | Op::StoreLocal
-            | Op::LoadUpvalue
-            | Op::StoreUpvalue
-            | Op::LoadFieldThis
-            | Op::StoreFieldThis
-            | Op::LoadField
-            | Op::StoreField
-            | Op::LoadStaticField
-            | Op::StoreStaticField
-            | Op::Class => 1,
-            Op::LoadLocalReturn | Op::StoreFieldThisPop | Op::LoadFieldThisReturn => 2,
-            Op::LoadLocalPair => 3,
-            Op::LoadLocalConstant => 4,
-            Op::Null
-            | Op::False
-            | Op::True
-            | Op::Pop
-            | Op::CloseUpvalue
-            | Op::Construct
-            | Op::Return
-            | Op::End
-            | Op::SetAttributes => 0,
-        };
-        Some(1 + operands)
+        // **The opcode numbers carry the length.** They are assigned in order
+        // of how long the instruction is, so this is a comparison on the raw
+        // byte rather than a table with one entry per opcode -- there is
+        // nothing to keep in step, and no `Op` to decode first.
+        //
+        // Adding an opcode means putting it in the right range, which means
+        // renumbering the ones after it and regenerating the `.wrenc` files.
+        // The tests in `tests/bytecode_lengths.rs` are what catch getting it
+        // wrong: they walk compiled programs by these lengths and require the
+        // walk to land exactly on the end.
+
+        Some(match *code.get(at)? {
+            0..=8 => 1,
+            9..=19 => 2,
+            20..=33 => 3,
+            34..=36 => 4,
+            37..=38 => 5,
+            // `Closure` alone is variable: a fixed head and two bytes per
+            // upvalue it captures.
+            39 => 4 + *code.get(at + 3)? as usize * 2,
+            _ => return None,
+        })
     }
 
     /// Every offset in `code` that some jump can land on.
@@ -571,7 +560,13 @@ impl Chunk {
                 break;
             };
             if let Some(op) = Op::from_byte(code[at]) {
-                let after = at + 3;
+                // **Where the jump is measured from is the end of the
+                // instruction**, which is asked for rather than written as
+                // `at + 3`. The two agree today because every jump is three
+                // bytes; a wider offset would make them disagree silently,
+                // and a jump target computed one byte out is the kind of
+                // fault that shows up as the wrong code running.
+                let after = at + len;
                 let offset = match op {
                     Op::Jump | Op::JumpIf | Op::And | Op::Or | Op::Loop => {
                         ((code[at + 1] as usize) << 8) | code[at + 2] as usize
