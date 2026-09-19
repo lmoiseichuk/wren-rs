@@ -18,6 +18,8 @@
 
 extern crate alloc;
 
+use alloc::string::ToString;
+
 use alloc::boxed::Box;
 
 use alloc::vec::Vec;
@@ -74,6 +76,8 @@ pub fn install(vm: &mut Vm) {
     install_bool(vm);
     install_null(vm);
     install_string(vm);
+    install_string_extras(vm);
+    install_num_extras(vm);
     install_list(vm);
     install_list_extras(vm);
     install_map(vm);
@@ -346,6 +350,346 @@ fn strings_equal(vm: &Vm, left: Value, right: Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// The rest of `Num`.
+fn install_num_extras(vm: &mut Vm) {
+    let class = vm.num_class;
+
+    define(vm, class, "min(_)", |vm, at| {
+        let a = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let b = number_argument(vm, at, 1)?;
+        Ok(Value::num(if a < b { a } else { b }))
+    });
+    define(vm, class, "max(_)", |vm, at| {
+        let a = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let b = number_argument(vm, at, 1)?;
+        Ok(Value::num(if a > b { a } else { b }))
+    });
+    define(vm, class, "clamp(_,_)", |vm, at| {
+        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let low = number_argument(vm, at, 1)?;
+        let high = number_argument(vm, at, 2)?;
+        let clamped = if value < low {
+            low
+        } else if value > high {
+            high
+        } else {
+            value
+        };
+        Ok(Value::num(clamped))
+    });
+
+    define(vm, class, "truncate", |vm, at| {
+        Ok(Value::num(math::trunc(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+    });
+    define(vm, class, "fraction", |vm, at| {
+        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        Ok(Value::num(value - math::trunc(value)))
+    });
+    define(vm, class, "sign", |vm, at| {
+        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let sign = if value > 0.0 {
+            1.0
+        } else if value < 0.0 {
+            -1.0
+        } else {
+            // Zero's sign is zero, not one. Wren follows the sign function
+            // rather than `copysign`.
+            0.0
+        };
+        Ok(Value::num(sign))
+    });
+    define(vm, class, "isInteger", |vm, at| {
+        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        Ok(Value::bool(value.is_finite() && value == math::trunc(value)))
+    });
+    define(vm, class, "isNan", |vm, at| {
+        Ok(Value::bool(receiver(vm, at).as_num().unwrap_or(0.0).is_nan()))
+    });
+    define(vm, class, "isInfinity", |vm, at| {
+        Ok(Value::bool(receiver(vm, at).as_num().unwrap_or(0.0).is_infinite()))
+    });
+
+    // **Wren's bitwise operators work on 32-bit unsigned values**, so a double
+    // is truncated and wrapped first and the result comes back as a double.
+    // Anything else would make `~0` depend on the width of a C int.
+    define(vm, class, "&(_)", |vm, at| bitwise(vm, at, |a, b| a & b));
+    define(vm, class, "|(_)", |vm, at| bitwise(vm, at, |a, b| a | b));
+    define(vm, class, "^(_)", |vm, at| bitwise(vm, at, |a, b| a ^ b));
+    define(vm, class, "<<(_)", |vm, at| bitwise(vm, at, |a, b| a.wrapping_shl(b & 31)));
+    define(vm, class, ">>(_)", |vm, at| bitwise(vm, at, |a, b| a.wrapping_shr(b & 31)));
+    define(vm, class, "~", |vm, at| {
+        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        Ok(Value::num(!(value as i64 as u32) as f64))
+    });
+
+    // **Only with `std`.** These need libm, which a `no_std` firmware does not
+    // have and this crate will not take a dependency for. Leaving them
+    // undefined there gives "Num does not implement 'sin'", which is honest;
+    // defining them to return NaN would be a silent wrong answer.
+    #[cfg(feature = "std")]
+    {
+        define(vm, class, "round", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).round()))
+        });
+        define(vm, class, "pow(_)", |vm, at| {
+            let base = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+            let exponent = number_argument(vm, at, 1)?;
+            Ok(Value::num(base.powf(exponent)))
+        });
+        define(vm, class, "log", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).ln()))
+        });
+        define(vm, class, "log2", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).log2()))
+        });
+        define(vm, class, "exp", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).exp()))
+        });
+        define(vm, class, "cbrt", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).cbrt()))
+        });
+        define(vm, class, "sin", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).sin()))
+        });
+        define(vm, class, "cos", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).cos()))
+        });
+        define(vm, class, "tan", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).tan()))
+        });
+        define(vm, class, "asin", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).asin()))
+        });
+        define(vm, class, "acos", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).acos()))
+        });
+        define(vm, class, "atan", |vm, at| {
+            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).atan()))
+        });
+        define(vm, class, "atan(_)", |vm, at| {
+            let y = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+            let x = number_argument(vm, at, 1)?;
+            Ok(Value::num(y.atan2(x)))
+        });
+    }
+
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Num metaclass")));
+    let metaclass = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+    if let Some(Object::Class(num)) = vm.heap.get_mut(class) {
+        num.metaclass = Some(metaclass);
+    }
+    define(vm, metaclass, "pi", |_, _| Ok(Value::num(core::f64::consts::PI)));
+    define(vm, metaclass, "e", |_, _| Ok(Value::num(core::f64::consts::E)));
+    define(vm, metaclass, "infinity", |_, _| Ok(Value::num(f64::INFINITY)));
+    define(vm, metaclass, "nan", |_, _| Ok(Value::num(f64::NAN)));
+    define(vm, metaclass, "largest", |_, _| Ok(Value::num(f64::MAX)));
+    define(vm, metaclass, "smallest", |_, _| Ok(Value::num(f64::MIN_POSITIVE)));
+    define(vm, metaclass, "maxSafeInteger", |_, _| Ok(Value::num(9007199254740991.0)));
+    define(vm, metaclass, "minSafeInteger", |_, _| Ok(Value::num(-9007199254740991.0)));
+}
+
+fn bitwise(vm: &Vm, at: usize, operation: fn(u32, u32) -> u32) -> Result<Value, RuntimeError> {
+    let left = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+    let right = argument(vm, at, 1)
+        .as_num()
+        .ok_or_else(|| RuntimeError::new("Right operand must be a number."))?;
+    Ok(Value::num(operation(left as i64 as u32, right as i64 as u32) as f64))
+}
+
+/// The rest of `String`.
+fn install_string_extras(vm: &mut Vm) {
+    let class = vm.string_class;
+
+    define(vm, class, "[_]", |vm, at| {
+        let text = string_bytes(vm, receiver(vm, at));
+        // A range subscript takes a substring, as it slices a list.
+        if let Some(range) = range_of(vm, argument(vm, at, 1)) {
+            let taken = slice_indices(&range, text.len())?;
+            let bytes: Vec<u8> = taken.into_iter().map(|index| text[index]).collect();
+            let sliced = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
+            return Ok(vm.new_string(&sliced));
+        }
+        let index = number_argument(vm, at, 1)?;
+        let index = resolve_index(index, text.len())?;
+        // **Indexing is by byte but yields a whole code point.** Upstream does
+        // the same: a string is bytes, but `s[0]` of a multi-byte character is
+        // that character rather than half of it.
+        let rest = alloc::string::String::from_utf8_lossy(&text[index..]).into_owned();
+        let character: alloc::string::String = rest.chars().take(1).collect();
+        Ok(vm.new_string(&character))
+    });
+
+    define(vm, class, "contains(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let needle = string_text(vm, argument(vm, at, 1));
+        Ok(Value::bool(text.contains(&needle)))
+    });
+    define(vm, class, "startsWith(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let needle = string_text(vm, argument(vm, at, 1));
+        Ok(Value::bool(text.starts_with(&needle)))
+    });
+    define(vm, class, "endsWith(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let needle = string_text(vm, argument(vm, at, 1));
+        Ok(Value::bool(text.ends_with(&needle)))
+    });
+    define(vm, class, "indexOf(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let needle = string_text(vm, argument(vm, at, 1));
+        Ok(Value::num(text.find(&needle).map_or(-1.0, |index| index as f64)))
+    });
+
+    define(vm, class, "isEmpty", |vm, at| {
+        Ok(Value::bool(string_bytes(vm, receiver(vm, at)).is_empty()))
+    });
+
+    define(vm, class, "trim()", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let trimmed = text.trim().to_string();
+        Ok(vm.new_string(&trimmed))
+    });
+    define(vm, class, "trimStart()", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let trimmed = text.trim_start().to_string();
+        Ok(vm.new_string(&trimmed))
+    });
+    define(vm, class, "trimEnd()", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let trimmed = text.trim_end().to_string();
+        Ok(vm.new_string(&trimmed))
+    });
+
+    define(vm, class, "split(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let separator = string_text(vm, argument(vm, at, 1));
+        if separator.is_empty() {
+            return Err(RuntimeError::new("Separator cannot be empty."));
+        }
+        let parts: Vec<alloc::string::String> =
+            text.split(&separator).map(|part| part.to_string()).collect();
+        let values: Vec<Value> = parts.iter().map(|part| vm.new_string(part)).collect();
+        Ok(new_list(vm, values))
+    });
+
+    define(vm, class, "*(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let count = number_argument(vm, at, 1)?;
+        if count < 0.0 || count != math::trunc(count) {
+            return Err(RuntimeError::new("Count must be a non-negative integer."));
+        }
+        let repeated = text.repeat(count as usize);
+        Ok(vm.new_string(&repeated))
+    });
+
+    // The byte and code-point views. Upstream returns lazy sequences; these are
+    // lists, which answers `count`, `[_]` and iteration the same way.
+    define(vm, class, "bytes", |vm, at| {
+        let values: Vec<Value> = string_bytes(vm, receiver(vm, at))
+            .iter()
+            .map(|byte| Value::num(*byte as f64))
+            .collect();
+        Ok(new_list(vm, values))
+    });
+    define(vm, class, "codePoints", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let values: Vec<Value> =
+            text.chars().map(|character| Value::num(character as u32 as f64)).collect();
+        Ok(new_list(vm, values))
+    });
+
+    // Iterating a string yields its characters, one code point at a time.
+    define(vm, class, "iterate(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let current = argument(vm, at, 1);
+        let start = if current.is_null() {
+            0
+        } else {
+            let index = current
+                .as_num()
+                .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?
+                as usize;
+            // Step past the character that starts at this byte.
+            match text[index..].chars().next() {
+                Some(character) => index + character.len_utf8(),
+                None => return Ok(Value::FALSE),
+            }
+        };
+        if start >= text.len() {
+            return Ok(Value::FALSE);
+        }
+        Ok(Value::num(start as f64))
+    });
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let index = number_argument(vm, at, 1)? as usize;
+        let character: alloc::string::String = text[index..].chars().take(1).collect();
+        Ok(vm.new_string(&character))
+    });
+
+    define(vm, class, "<(_)", |vm, at| compare_strings(vm, at, |o| o < 0));
+    define(vm, class, ">(_)", |vm, at| compare_strings(vm, at, |o| o > 0));
+    define(vm, class, "<=(_)", |vm, at| compare_strings(vm, at, |o| o <= 0));
+    define(vm, class, ">=(_)", |vm, at| compare_strings(vm, at, |o| o >= 0));
+
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("String metaclass")));
+    let metaclass = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+    if let Some(Object::Class(string)) = vm.heap.get_mut(class) {
+        string.metaclass = Some(metaclass);
+    }
+    define(vm, metaclass, "fromCodePoint(_)", |vm, at| {
+        let point = number_argument(vm, at, 1)?;
+        let Some(character) = char::from_u32(point as u32) else {
+            return Err(RuntimeError::new("Code point cannot be greater than 0x10ffff."));
+        };
+        let text = alloc::string::String::from(character);
+        Ok(vm.new_string(&text))
+    });
+    define(vm, metaclass, "fromByte(_)", |vm, at| {
+        let byte = number_argument(vm, at, 1)?;
+        if !(0.0..=255.0).contains(&byte) || byte != math::trunc(byte) {
+            return Err(RuntimeError::new("Byte must be an integer between 0 and 255."));
+        }
+        let id = vm
+            .heap
+            .allocate(Object::String(ObjString::new(alloc::vec![byte as u8])));
+        Ok(Value::object(id))
+    });
+}
+
+fn compare_strings(
+    vm: &Vm,
+    at: usize,
+    accept: fn(i32) -> bool,
+) -> Result<Value, RuntimeError> {
+    let left = string_bytes(vm, receiver(vm, at));
+    let right = match argument(vm, at, 1).as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::String(text)) => text.bytes.clone(),
+        _ => return Err(RuntimeError::new("Right operand must be a string.")),
+    };
+    let ordering = match left.cmp(&right) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    };
+    Ok(Value::bool(accept(ordering)))
+}
+
+fn string_bytes(vm: &Vm, value: Value) -> Vec<u8> {
+    match value.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::String(text)) => text.bytes.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn string_text(vm: &Vm, value: Value) -> alloc::string::String {
+    alloc::string::String::from_utf8_lossy(&string_bytes(vm, value)).into_owned()
 }
 
 fn install_list(vm: &mut Vm) {

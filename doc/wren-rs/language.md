@@ -24,10 +24,10 @@ paragraph of the spec rather than at a vague gap.
 | [Values](#values) | 10 | 2 | 0 |
 | [Lists](#lists) | 9 | 0 | 1 |
 | [Maps](#maps) | 8 | 0 | 0 |
-| [Method calls](#method-calls) | 7 | 0 | 1 |
+| [Method calls](#method-calls) | 8 | 0 | 0 |
 | [Control flow](#control-flow) | 11 | 0 | 0 |
 | [Variables](#variables) | 5 | 0 | 0 |
-| [Classes](#classes) | 14 | 0 | 1 |
+| [Classes](#classes) | 13 | 0 | 2 |
 | [Functions](#functions) | 7 | 0 | 0 |
 | [Concurrency](#concurrency) | 0 | 0 | 5 |
 | [Error handling](#error-handling) | 1 | 0 | 3 |
@@ -102,7 +102,7 @@ paragraph of the spec rather than at a vague gap.
 | Prefix operators | works |  |
 | Subscripts | works |  |
 | Subscript setters | works |  |
-| Signature includes arity | **missing** | Num does not implement 'clamp(_,_)'. |
+| Signature includes arity | works |  |
 
 ## Control flow
 
@@ -146,7 +146,7 @@ paragraph of the spec rather than at a vague gap.
 | Static members | works |  |
 | Static fields | **missing** | Expected expression. |
 | Inheritance | works |  |
-| super | works |  |
+| super | **missing** | Not a closure. |
 | is operator | works |  |
 | type getter | works |  |
 
