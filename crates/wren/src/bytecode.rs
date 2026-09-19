@@ -246,6 +246,16 @@ impl Chunk {
         }
     }
 
+    /// Rebuild a chunk from parts that were serialised.
+    ///
+    /// The constant lookup is rebuilt rather than stored: it is a compile-time
+    /// index for reusing constants, and a loaded chunk will never have another
+    /// added. Writing it to the file would cost bytes for a table nothing
+    /// reads.
+    pub fn from_parts(code: Vec<u8>, constants: Vec<Value>, lines: Vec<u16>) -> Chunk {
+        Chunk { code, constants, lookup: BTreeMap::new(), lines }
+    }
+
     pub fn emit_op(&mut self, op: Op, line: u16) {
         self.emit_byte(op as u8, line);
     }

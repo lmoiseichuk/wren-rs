@@ -1058,6 +1058,25 @@ impl Vm {
         self.run_module(chunk, 0)
     }
 
+    /// Run a closure that was loaded rather than compiled.
+    ///
+    /// The entry point for a part with no compiler: everything `interpret`
+    /// does after the parse, and nothing it does before.
+    pub fn run_closure(&mut self, closure: ObjectId) -> Result<(), RuntimeError> {
+        if self.current_fiber.is_none() {
+            let root = self.heap.allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
+            self.current_fiber = Some(root);
+            self.root_fiber = Some(root);
+        }
+
+        let base = self.stack.len();
+        self.stack.push(Value::NULL);
+        let depth = self.frames.len();
+        let chunk = self.push_frame(closure, base)?;
+        self.run_frames(chunk, depth)?;
+        Ok(())
+    }
+
     /// Run a chunk compiled against a particular module.
     pub fn run_module(&mut self, chunk: Rc<Chunk>, module: usize) -> Result<(), RuntimeError> {
         // Module code is a function like any other, so that one loop handles

@@ -1,0 +1,585 @@
+//! `.wrenc` — compiled Wren, for a part that cannot afford a compiler.
+//!
+//! **This is the whole point of step 4.** Upstream spends 33,552 B of stack
+//! compiling its own core library before user code runs, and this
+//! implementation spends a compiler's worth of flash on the lexer and parser.
+//! A CH32V006 has 8 KB of RAM and 62 KB of flash; it cannot have either. What
+//! it can have is a byte stream produced on a workstation.
+//!
+//! # What has to travel, and why it is not just the code
+//!
+//! A `Chunk` is not self-contained. Two of its operands are indices into
+//! tables the VM builds at start-up:
+//!
+//! * `Op::Call` carries a **method symbol** — an index into the VM's interned
+//!   signatures, assigned in the order the compiler first saw each one.
+//! * `Op::LoadModuleVar` carries an index into the **module's** variables,
+//!   which begins with however many the core library installed.
+//!
+//! Both depend on what the VM did before compiling, so neither survives being
+//! written to a file and read back into a different VM — a core library with
+//! one more method in it would shift every symbol. So the file carries the
+//! *names*, and loading rewrites the operands against the names the loading VM
+//! actually has. That costs a pass over the code at load time and makes the
+//! format independent of the VM's own start-up, which is worth far more than
+//! the pass costs.
+//!
+//! # Layout
+//!
+//! ```text
+//! "WRENC\0"        magic
+//! u16              format version
+//! [u8; 32]         SHA-256 of the source this was compiled from
+//! u32 + entries    method signatures, in the order they were interned
+//! u32 + entries    module variable names, likewise
+//! function         the module body, nested functions inline
+//! ```
+//!
+//! Every length is a little-endian `u32` unless stated, and every string is a
+//! `u32` length followed by its bytes -- Wren strings are bytes, so they are
+//! written as bytes rather than as text.
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::rc::Rc;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use crate::bytecode::{Chunk, Op};
+use crate::handle::ObjectId;
+use crate::object::{ObjClosure, ObjFn, ObjString, Object};
+use crate::value::Value;
+use crate::vm::Vm;
+
+/// `WRENC\0`.
+const MAGIC: [u8; 6] = *b"WRENC\0";
+
+/// Bumped whenever the layout changes in a way a reader cannot detect.
+///
+/// A file from a different version is refused rather than guessed at: the
+/// failure of loading the wrong bytecode is an interpreter running nonsense,
+/// which is far harder to diagnose than a message at load time.
+pub const VERSION: u16 = 1;
+
+/// What went wrong reading a `.wrenc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadError {
+    /// Not a `.wrenc` at all.
+    NotBytecode,
+    /// A `.wrenc` from a different version of this format.
+    WrongVersion { found: u16, expected: u16 },
+    /// The file ended in the middle of something.
+    Truncated,
+    /// A tag the reader does not know, which means a file it cannot trust.
+    Malformed(&'static str),
+}
+
+impl LoadError {
+    pub fn message(&self) -> String {
+        match self {
+            LoadError::NotBytecode => "Not a .wrenc file.".to_string(),
+            LoadError::WrongVersion { found, expected } => alloc::format!(
+                "Bytecode is version {found}, this build reads version {expected}."
+            ),
+            LoadError::Truncated => "Bytecode ends unexpectedly.".to_string(),
+            LoadError::Malformed(what) => alloc::format!("Bytecode is malformed: {what}."),
+        }
+    }
+}
+
+/// Which table a two-byte operand indexes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Table {
+    /// An interned method signature.
+    Symbol,
+    /// A module variable.
+    Variable,
+}
+
+/// Find every operand that indexes a table the VM owns.
+///
+/// **Decoding is the only way.** These operands are two bytes in the middle of
+/// variable-length instructions, so a scan would find false matches in jump
+/// offsets and constant indices. Walking the stream is also the check that it
+/// is well formed: a stream that does not decode is one that would have jumped
+/// into the middle of an instruction at run time.
+fn table_operands(code: &[u8]) -> Result<Vec<(Table, usize)>, LoadError> {
+    let mut found = Vec::new();
+    let mut at = 0;
+
+    while at < code.len() {
+        let Some(op) = Op::from_byte(code[at]) else {
+            return Err(LoadError::Malformed("unknown opcode"));
+        };
+        at += 1;
+
+        match op {
+            Op::Call | Op::Super => {
+                at += 1; // arity
+                found.push((Table::Symbol, at));
+                at += 2;
+            }
+            Op::MethodInstance | Op::MethodStatic => {
+                found.push((Table::Symbol, at));
+                at += 2;
+            }
+            Op::LoadModuleVar | Op::StoreModuleVar => {
+                found.push((Table::Variable, at));
+                at += 2;
+            }
+            // Two constant indices, neither of which indexes a VM table.
+            Op::ImportVariable => at += 4,
+            Op::Closure => {
+                let count = *code.get(at + 2).ok_or(LoadError::Truncated)? as usize;
+                at += 3 + count * 2;
+            }
+            Op::Constant | Op::ImportModule | Op::Jump | Op::Loop | Op::JumpIf | Op::And
+            | Op::Or => at += 2,
+            Op::LoadLocal | Op::StoreLocal | Op::LoadUpvalue | Op::StoreUpvalue
+            | Op::LoadFieldThis | Op::StoreFieldThis | Op::LoadField | Op::StoreField
+            | Op::LoadStaticField | Op::StoreStaticField | Op::Class => at += 1,
+            _ => {}
+        }
+    }
+
+    if at != code.len() {
+        return Err(LoadError::Malformed("an instruction runs past the end"));
+    }
+    Ok(found)
+}
+
+fn read_index(code: &[u8], at: usize) -> usize {
+    ((code[at] as usize) << 8) | code[at + 1] as usize
+}
+
+fn write_index(code: &mut [u8], at: usize, value: usize) {
+    code[at] = (value >> 8) as u8;
+    code[at + 1] = (value & 0xff) as u8;
+}
+
+/// The names a chunk actually uses, gathered in first-use order.
+///
+/// **Only what is used travels.** Writing the VM's whole symbol table put four
+/// hundred core-library signatures into every file and made the bytecode for a
+/// twelve-line program larger than the program -- 2,953 bytes of bytecode for
+/// 368 bytes of source, nearly all of it names nothing referenced.
+#[derive(Default)]
+struct Names {
+    symbols: Vec<usize>,
+    variables: Vec<usize>,
+}
+
+impl Names {
+    fn gather(&mut self, vm: &Vm, chunk: &Chunk) -> Result<(), LoadError> {
+        for (table, at) in table_operands(&chunk.code)? {
+            let index = read_index(&chunk.code, at);
+            let into = match table {
+                Table::Symbol => &mut self.symbols,
+                Table::Variable => &mut self.variables,
+            };
+            if !into.contains(&index) {
+                into.push(index);
+            }
+        }
+
+        // Nested functions use the same tables.
+        for constant in &chunk.constants {
+            if let Some(Object::Fn(function)) = constant.as_object().and_then(|id| vm.heap.get(id))
+            {
+                let nested = function.chunk.clone();
+                self.gather(vm, &nested)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn dense(&self, table: Table, index: usize) -> usize {
+        let list = match table {
+            Table::Symbol => &self.symbols,
+            Table::Variable => &self.variables,
+        };
+        list.iter().position(|entry| *entry == index).unwrap_or(0)
+    }
+}
+
+// --- writing ----------------------------------------------------------------
+
+/// Serialise a compiled chunk, stamped with the digest of its source.
+///
+/// Takes the VM because the symbol and variable names live there, not in the
+/// chunk: what the chunk holds are indices into the VM's tables.
+pub fn write(vm: &Vm, chunk: &Chunk, source: &[u8]) -> Result<Vec<u8>, LoadError> {
+    let mut names = Names::default();
+    names.gather(vm, chunk)?;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&crate::sha256::digest(source));
+
+    write_u32(&mut out, names.symbols.len() as u32);
+    for index in &names.symbols {
+        write_bytes(&mut out, vm.method_names.name(*index).unwrap_or("").as_bytes());
+    }
+    write_u32(&mut out, names.variables.len() as u32);
+    for index in &names.variables {
+        write_bytes(&mut out, vm.modules[0].names.name(*index).unwrap_or("").as_bytes());
+    }
+
+    write_function(vm, &mut out, chunk, 0, 0, "(module)", &names)?;
+    Ok(out)
+}
+
+fn write_function(
+    vm: &Vm,
+    out: &mut Vec<u8>,
+    chunk: &Chunk,
+    arity: usize,
+    upvalues: usize,
+    name: &str,
+    names: &Names,
+) -> Result<(), LoadError> {
+    out.push(arity as u8);
+    out.push(upvalues as u8);
+    write_bytes(out, name.as_bytes());
+
+    // The code is emitted with its table operands renumbered to the dense
+    // table this file carries.
+    let mut code = chunk.code.clone();
+    for (table, at) in table_operands(&code)? {
+        let dense = names.dense(table, read_index(&code, at));
+        write_index(&mut code, at, dense);
+    }
+    write_u32(out, code.len() as u32);
+    out.extend_from_slice(&code);
+
+    // **The line table travels run-length encoded.** It holds one line number
+    // per *byte* of code, and a statement is many bytes, so stored flat it was
+    // half the file -- 400 bytes of line numbers for 200 bytes of code. Almost
+    // every entry equals the one before it, which is exactly what run-length
+    // encoding is for. A runtime error with no line number would be the
+    // cheaper trade and a much worse one.
+    let mut runs: Vec<(u16, u16)> = Vec::new();
+    for line in &chunk.lines {
+        match runs.last_mut() {
+            Some((count, value)) if value == line && *count < u16::MAX => *count += 1,
+            _ => runs.push((1, *line)),
+        }
+    }
+    write_u32(out, runs.len() as u32);
+    for (count, line) in runs {
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&line.to_le_bytes());
+    }
+
+    write_u32(out, chunk.constants.len() as u32);
+    for constant in &chunk.constants {
+        write_constant(vm, out, *constant, names)?;
+    }
+    Ok(())
+}
+
+fn write_constant(
+    vm: &Vm,
+    out: &mut Vec<u8>,
+    value: Value,
+    names: &Names,
+) -> Result<(), LoadError> {
+    if value.is_null() {
+        out.push(0);
+        return Ok(());
+    }
+    if value.is_false() {
+        out.push(1);
+        return Ok(());
+    }
+    if value.is_true() {
+        out.push(2);
+        return Ok(());
+    }
+    if let Some(number) = value.as_num() {
+        out.push(3);
+        out.extend_from_slice(&number.to_bits().to_le_bytes());
+        return Ok(());
+    }
+    match value.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::String(text)) => {
+            out.push(4);
+            let bytes = text.bytes.clone();
+            write_bytes(out, &bytes);
+        }
+        Some(Object::Fn(function)) => {
+            out.push(5);
+            let chunk = function.chunk.clone();
+            let arity = function.arity;
+            let upvalues = function.num_upvalues;
+            let name = function.name.clone();
+            write_function(vm, out, &chunk, arity, upvalues, &name, names)?;
+        }
+        // **Class attributes are built at compile time**, so a whole object
+        // graph -- maps of lists, wrapped in a `ClassAttributes` -- can be a
+        // constant. It is the only such case, because it is the only thing the
+        // compiler constructs rather than emits code to construct. Writing it
+        // as null (the old fallback for "something else") lost every
+        // attribute in a round trip, which showed up as five tests passing
+        // from source and not from bytecode.
+        Some(Object::List(list)) => {
+            out.push(6);
+            let elements = list.elements.clone();
+            write_u32(out, elements.len() as u32);
+            for element in elements {
+                write_constant(vm, out, element, names)?;
+            }
+        }
+        Some(Object::Map(map)) => {
+            out.push(7);
+            let entries: Vec<crate::object::MapEntry> = map.live().copied().collect();
+            write_u32(out, entries.len() as u32);
+            for entry in entries {
+                write_constant(vm, out, entry.key, names)?;
+                write_constant(vm, out, entry.value, names)?;
+            }
+        }
+        Some(Object::Instance(instance)) => {
+            out.push(8);
+            let fields = instance.fields.clone();
+            write_u32(out, fields.len() as u32);
+            for field in fields {
+                write_constant(vm, out, field, names)?;
+            }
+        }
+        // Nothing else reaches a constant table.
+        _ => out.push(0),
+    }
+    Ok(())
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_u32(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
+}
+
+// --- reading ----------------------------------------------------------------
+
+/// A reader over a byte slice that refuses to run off the end.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], LoadError> {
+        if self.at + count > self.bytes.len() {
+            return Err(LoadError::Truncated);
+        }
+        let slice = &self.bytes[self.at..self.at + count];
+        self.at += count;
+        Ok(slice)
+    }
+
+    fn byte(&mut self) -> Result<u8, LoadError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, LoadError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, LoadError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, LoadError> {
+        let bytes = self.take(8)?;
+        let mut word = [0u8; 8];
+        word.copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(word))
+    }
+
+    fn blob(&mut self) -> Result<&'a [u8], LoadError> {
+        let length = self.u32()? as usize;
+        self.take(length)
+    }
+}
+
+/// What a loaded file was compiled from, so a caller can check it is current.
+pub struct Loaded {
+    /// The module body, ready to run.
+    pub closure: ObjectId,
+    /// SHA-256 of the source it was compiled from.
+    pub source_digest: [u8; 32],
+}
+
+/// Read a `.wrenc` into `vm`, returning a closure ready to run.
+pub fn load(vm: &mut Vm, bytes: &[u8]) -> Result<Loaded, LoadError> {
+    let mut reader = Reader { bytes, at: 0 };
+
+    if reader.take(MAGIC.len())? != MAGIC {
+        return Err(LoadError::NotBytecode);
+    }
+    let version = reader.u16()?;
+    if version != VERSION {
+        return Err(LoadError::WrongVersion { found: version, expected: VERSION });
+    }
+
+    let mut source_digest = [0u8; 32];
+    source_digest.copy_from_slice(reader.take(32)?);
+
+    // **The remapping tables.** Each name is interned into *this* VM, and the
+    // index it lands at is what the code will be rewritten to use.
+    let symbol_count = reader.u32()? as usize;
+    let mut symbols = Vec::with_capacity(symbol_count);
+    for _ in 0..symbol_count {
+        let name = core::str::from_utf8(reader.blob()?)
+            .map_err(|_| LoadError::Malformed("a method name is not utf-8"))?;
+        symbols.push(vm.method_names.ensure(name) as u16);
+    }
+
+    let variable_count = reader.u32()? as usize;
+    let mut variables = Vec::with_capacity(variable_count);
+    for _ in 0..variable_count {
+        let name = core::str::from_utf8(reader.blob()?)
+            .map_err(|_| LoadError::Malformed("a variable name is not utf-8"))?;
+        // A name the loading VM does not have is defined as null -- which is
+        // what the compiler does for a forward reference, and what makes a
+        // module compiled elsewhere land in the same shape here.
+        let index = match vm.modules[0].names.find(name) {
+            Some(index) => index,
+            None => vm.modules[0].define(name, Value::NULL),
+        };
+        variables.push(index as u16);
+    }
+
+    let function = read_function(vm, &mut reader, &symbols, &variables)?;
+    let closure = vm
+        .heap
+        .allocate(Object::Closure(Box::new(ObjClosure { function, upvalues: Vec::new() })));
+
+    Ok(Loaded { closure, source_digest })
+}
+
+fn read_function(
+    vm: &mut Vm,
+    reader: &mut Reader<'_>,
+    symbols: &[u16],
+    variables: &[u16],
+) -> Result<ObjectId, LoadError> {
+    let arity = reader.byte()? as usize;
+    let upvalues = reader.byte()? as usize;
+    let name = String::from_utf8_lossy(reader.blob()?).into_owned();
+
+    let mut code = reader.blob()?.to_vec();
+
+    let run_count = reader.u32()? as usize;
+    let mut lines = Vec::with_capacity(code.len());
+    for _ in 0..run_count {
+        let count = reader.u16()?;
+        let line = reader.u16()?;
+        for _ in 0..count {
+            lines.push(line);
+        }
+    }
+
+    let constant_count = reader.u32()? as usize;
+    let mut constants = Vec::with_capacity(constant_count);
+    for _ in 0..constant_count {
+        constants.push(read_constant(vm, reader, symbols, variables)?);
+    }
+
+    remap(&mut code, symbols, variables)?;
+
+    let function = vm.heap.allocate(Object::Fn(Box::new(ObjFn {
+        chunk: Rc::new(Chunk::from_parts(code, constants, lines)),
+        arity,
+        num_upvalues: upvalues,
+        name,
+        field_offset: 0,
+        super_class: None,
+        owner_class: None,
+        module: 0,
+    })));
+    Ok(function)
+}
+
+fn read_constant(
+    vm: &mut Vm,
+    reader: &mut Reader<'_>,
+    symbols: &[u16],
+    variables: &[u16],
+) -> Result<Value, LoadError> {
+    match reader.byte()? {
+        0 => Ok(Value::NULL),
+        1 => Ok(Value::FALSE),
+        2 => Ok(Value::TRUE),
+        3 => Ok(Value::num(f64::from_bits(reader.u64()?))),
+        4 => {
+            let bytes = reader.blob()?.to_vec();
+            Ok(Value::object(vm.heap.allocate(Object::String(ObjString::new(bytes)))))
+        }
+        5 => Ok(Value::object(read_function(vm, reader, symbols, variables)?)),
+        6 => {
+            let count = reader.u32()? as usize;
+            let mut elements = Vec::with_capacity(count);
+            for _ in 0..count {
+                elements.push(read_constant(vm, reader, symbols, variables)?);
+            }
+            Ok(Value::object(vm.heap.allocate(Object::List(crate::object::ObjList { elements }))))
+        }
+        7 => {
+            let count = reader.u32()? as usize;
+            // Rebuilt through the map's own insertion, so the table is hashed
+            // and sized the way a map built at run time would be -- a map is
+            // an open-addressed table, and its slots are not a thing to
+            // serialise.
+            let map = crate::core::new_map(vm);
+            for _ in 0..count {
+                let key = read_constant(vm, reader, symbols, variables)?;
+                let value = read_constant(vm, reader, symbols, variables)?;
+                crate::core::map_insert(vm, map, key, value);
+            }
+            Ok(map)
+        }
+        8 => {
+            let count = reader.u32()? as usize;
+            let mut fields = Vec::with_capacity(count);
+            for _ in 0..count {
+                fields.push(read_constant(vm, reader, symbols, variables)?);
+            }
+            // The only instance that can be a constant is a `ClassAttributes`.
+            let class = vm.class_attributes_class;
+            Ok(Value::object(
+                vm.heap.allocate(Object::Instance(crate::object::ObjInstance { class, fields })),
+            ))
+        }
+        _ => Err(LoadError::Malformed("unknown constant tag")),
+    }
+}
+
+/// Rewrite the symbol and variable operands to this VM's indices.
+///
+/// **Walking the code is the only way to find them.** The operands are two
+/// bytes in the middle of variable-length instructions, so the stream has to
+/// be decoded rather than scanned -- which is also the check that the code is
+/// well-formed, since a stream that does not decode is one that would have
+/// jumped into the middle of an instruction at run time.
+fn remap(code: &mut [u8], symbols: &[u16], variables: &[u16]) -> Result<(), LoadError> {
+    for (table, at) in table_operands(code)? {
+        let list = match table {
+            Table::Symbol => symbols,
+            Table::Variable => variables,
+        };
+        let dense = read_index(code, at);
+        let Some(actual) = list.get(dense) else {
+            return Err(LoadError::Malformed("an index is outside its table"));
+        };
+        write_index(code, at, *actual as usize);
+    }
+    Ok(())
+}

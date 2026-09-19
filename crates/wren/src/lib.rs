@@ -74,6 +74,8 @@ pub mod lexer;
 pub mod math;
 #[cfg(feature = "alloc")]
 pub mod sha256;
+#[cfg(feature = "alloc")]
+pub mod wrenc;
 
 // The heap and the objects in it need a growable allocation. A part with no
 // allocator at all still gets the lexer, and later the bytecode reader.

@@ -15,8 +15,17 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let root = std::env::args()
-        .nth(1)
+    // **Flags are separated from positions before anything reads them.** They
+    // were being taken by position, so `--bytecode` in the second slot was
+    // read as the name of a failure to filter by, and the run reported nothing
+    // at all rather than saying the argument made no sense.
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let positional: Vec<&String> =
+        arguments.iter().filter(|argument| !argument.starts_with("--")).collect();
+
+    let root = positional
+        .first()
+        .map(|root| root.to_string())
         .unwrap_or_else(|| "vendor/wren/test".to_string());
 
     let mut files = Vec::new();
@@ -88,7 +97,7 @@ fn main() {
 
     // `--why <substring>` lists the files behind one reason, which is how the
     // histogram turns into something to act on.
-    if std::env::args().nth(2).as_deref() == Some("--slow") {
+    if arguments.iter().any(|argument| argument == "--slow") {
         let mut ranked: Vec<&Outcome> = outcomes.iter().collect();
         ranked.sort_by_key(|outcome| core::cmp::Reverse(outcome.elapsed));
         println!("\nslowest files:");
@@ -100,8 +109,8 @@ fn main() {
 
     // `--diff <path substring>` shows expected against actual, line by line,
     // for the files that match. The histogram says how many; this says what.
-    if std::env::args().nth(2).as_deref() == Some("--diff") {
-        let wanted = std::env::args().nth(3).unwrap_or_default();
+    if arguments.iter().any(|argument| argument == "--diff") {
+        let wanted = positional.get(1).map(|w| w.to_string()).unwrap_or_default();
         for outcome in &outcomes {
             let path = outcome.path.display().to_string();
             if !path.contains(&wanted) || outcome.result.is_ok() {
@@ -142,7 +151,7 @@ fn main() {
         return;
     }
 
-    if let Some(wanted) = std::env::args().nth(2) {
+    if let Some(wanted) = positional.get(1).map(|w| w.to_string()) {
         println!("\nfiles failing with {wanted:?}:");
         for outcome in &outcomes {
             if let Err(reason) = &outcome.result {
@@ -301,7 +310,17 @@ fn check(source: &str, directory: &Path, module_name: &str) -> Result<(), String
 
     vm.set_main_module_name(module_name);
 
-    let result = vm.interpret(source);
+    // **`--bytecode` runs every test through a serialise-and-load round trip**,
+    // which is the only way to be sure the format carries everything. A format
+    // that drops something shows up here as a test that passed a moment ago
+    // and does not now, rather than as a device misbehaving later.
+    let via_bytecode = std::env::args().any(|argument| argument == "--bytecode");
+
+    let result = if via_bytecode {
+        run_via_bytecode(&mut vm, source)
+    } else {
+        vm.interpret(source)
+    };
 
     if expects_error {
         // Only that it failed, not how. Matching upstream's exact message and
@@ -336,6 +355,32 @@ fn check(source: &str, directory: &Path, module_name: &str) -> Result<(), String
             }
         }
     }
+}
+
+/// Compile, serialise, load into the same VM, and run what comes back.
+///
+/// The VM is reused deliberately: loading has to work against a VM whose
+/// symbol table already holds the names the compile interned, which is the
+/// case a fresh VM would not exercise.
+fn run_via_bytecode(vm: &mut wren::Vm, source: &str) -> Result<(), wren::WrenError> {
+    let chunk = wren::compiler::compile(vm, source)
+        .map_err(|error| wren::WrenError::Compile { message: error.message, line: error.line })?;
+
+    let bytes = match wren::wrenc::write(vm, &chunk, source.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(wren::WrenError::Compile { message: error.message(), line: 0 })
+        }
+    };
+
+    let loaded = match wren::wrenc::load(vm, &bytes) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return Err(wren::WrenError::Compile { message: error.message(), line: 0 })
+        }
+    };
+
+    vm.run_closure(loaded.closure).map_err(wren::WrenError::Runtime)
 }
 
 /// The text a `// expect:` comment asks for, if the line carries one.
