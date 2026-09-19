@@ -198,8 +198,7 @@ impl Names {
 
         // Nested functions use the same tables.
         for constant in &chunk.constants {
-            if let Some(Object::Fn(function)) = constant.as_object().and_then(|id| vm.heap.get(id))
-            {
+            if let Some(function) = constant.as_object().and_then(|id| vm.heap.function(id)) {
                 let nested = function.chunk.clone();
                 self.gather(vm, &nested)?;
             }

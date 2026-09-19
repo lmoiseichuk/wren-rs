@@ -31,7 +31,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::object::{Object, ObjectId};
+use crate::object::{
+    ObjClass, ObjClosure, ObjFiber, ObjFn, ObjInstance, ObjList, ObjMap, ObjRange, ObjString,
+    ObjUpvalue, Object, ObjectId, ObjectType,
+};
 use crate::value::Value;
 
 /// How much the live set may grow before the next collection.
@@ -216,6 +219,167 @@ impl Heap {
     /// Look an object up for modification.
     pub fn get_mut(&mut self, id: ObjectId) -> Option<&mut Object> {
         self.slots.get_mut(id.raw() as usize)?.as_mut()
+    }
+
+    /// Look up an object of a known type.
+    ///
+    /// **This is the API the VM should use, not [`get`](Heap::get).** Almost
+    /// every access already knows what it expects -- `match heap.get(id) {
+    /// Some(Object::Class(class)) => ..., _ => return }` was the shape of 140
+    /// sites -- and saying so lets the heap answer without building an enum
+    /// the caller immediately takes apart.
+    ///
+    /// It is also what makes the storage replaceable. With one table per type,
+    /// there is no single `Object` to hand back a reference to; there is a
+    /// `&ObjClass` in the class table. These accessors are the boundary that
+    /// lets that change without touching the VM.
+    ///
+    /// A handle of the wrong type reads as `None`, exactly as a stale handle
+    /// does. That is the same contract `get` has and the same one upstream's
+    /// `AS_CLASS` does not: there, asking a string for its methods is
+    /// undefined behaviour.
+    pub fn class(&self, id: ObjectId) -> Option<&ObjClass> {
+        match self.get(id)? {
+            Object::Class(class) => Some(class),
+            _ => None,
+        }
+    }
+
+    pub fn class_mut(&mut self, id: ObjectId) -> Option<&mut ObjClass> {
+        match self.get_mut(id)? {
+            Object::Class(class) => Some(class),
+            _ => None,
+        }
+    }
+
+    pub fn instance(&self, id: ObjectId) -> Option<&ObjInstance> {
+        match self.get(id)? {
+            Object::Instance(instance) => Some(instance),
+            _ => None,
+        }
+    }
+
+    pub fn instance_mut(&mut self, id: ObjectId) -> Option<&mut ObjInstance> {
+        match self.get_mut(id)? {
+            Object::Instance(instance) => Some(instance),
+            _ => None,
+        }
+    }
+
+    pub fn list(&self, id: ObjectId) -> Option<&ObjList> {
+        match self.get(id)? {
+            Object::List(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    pub fn list_mut(&mut self, id: ObjectId) -> Option<&mut ObjList> {
+        match self.get_mut(id)? {
+            Object::List(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    pub fn map(&self, id: ObjectId) -> Option<&ObjMap> {
+        match self.get(id)? {
+            Object::Map(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    pub fn map_mut(&mut self, id: ObjectId) -> Option<&mut ObjMap> {
+        match self.get_mut(id)? {
+            Object::Map(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    pub fn range(&self, id: ObjectId) -> Option<&ObjRange> {
+        match self.get(id)? {
+            Object::Range(range) => Some(range),
+            _ => None,
+        }
+    }
+
+    pub fn string(&self, id: ObjectId) -> Option<&ObjString> {
+        match self.get(id)? {
+            Object::String(string) => Some(string),
+            _ => None,
+        }
+    }
+
+    pub fn string_mut(&mut self, id: ObjectId) -> Option<&mut ObjString> {
+        match self.get_mut(id)? {
+            Object::String(string) => Some(string),
+            _ => None,
+        }
+    }
+
+    pub fn upvalue(&self, id: ObjectId) -> Option<&ObjUpvalue> {
+        match self.get(id)? {
+            Object::Upvalue(upvalue) => Some(upvalue),
+            _ => None,
+        }
+    }
+
+    pub fn upvalue_mut(&mut self, id: ObjectId) -> Option<&mut ObjUpvalue> {
+        match self.get_mut(id)? {
+            Object::Upvalue(upvalue) => Some(upvalue),
+            _ => None,
+        }
+    }
+
+    /// `Fn` is a keyword, so the accessor is spelled out.
+    pub fn function(&self, id: ObjectId) -> Option<&ObjFn> {
+        match self.get(id)? {
+            Object::Fn(function) => Some(function),
+            _ => None,
+        }
+    }
+
+    pub fn function_mut(&mut self, id: ObjectId) -> Option<&mut ObjFn> {
+        match self.get_mut(id)? {
+            Object::Fn(function) => Some(function),
+            _ => None,
+        }
+    }
+
+    pub fn closure(&self, id: ObjectId) -> Option<&ObjClosure> {
+        match self.get(id)? {
+            Object::Closure(closure) => Some(closure),
+            _ => None,
+        }
+    }
+
+    pub fn closure_mut(&mut self, id: ObjectId) -> Option<&mut ObjClosure> {
+        match self.get_mut(id)? {
+            Object::Closure(closure) => Some(closure),
+            _ => None,
+        }
+    }
+
+    pub fn fiber(&self, id: ObjectId) -> Option<&ObjFiber> {
+        match self.get(id)? {
+            Object::Fiber(fiber) => Some(fiber),
+            _ => None,
+        }
+    }
+
+    pub fn fiber_mut(&mut self, id: ObjectId) -> Option<&mut ObjFiber> {
+        match self.get_mut(id)? {
+            Object::Fiber(fiber) => Some(fiber),
+            _ => None,
+        }
+    }
+
+    /// What kind of object a handle refers to, without reading the object.
+    ///
+    /// Today this loads the object and reads its discriminant. Once the type
+    /// lives in the handle it will not touch the heap at all, which is what
+    /// makes `class_of` free for every built-in -- one of the four heap
+    /// lookups a method call still costs.
+    pub fn type_of(&self, id: ObjectId) -> Option<ObjectType> {
+        Some(self.get(id)?.object_type())
     }
 
     /// Every live handle, in allocation order.

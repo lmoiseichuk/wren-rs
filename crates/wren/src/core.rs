@@ -47,7 +47,7 @@ use crate::handle::ObjectId;
 use crate::math;
 use crate::object::{
     MapEntry, ObjClass, ObjFiber, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object,
-    Primitive,
+    ObjectType, Primitive,
 };
 use crate::value::{Num, Value};
 use crate::vm::{RuntimeError, Switch, Vm};
@@ -95,9 +95,11 @@ fn is_value_type(vm: &Vm, value: Value) -> bool {
     if value.is_num() || value.is_bool() || value.is_null() {
         return true;
     }
+    // Three types, so this asks the handle what it is rather than fetching
+    // the object to look at its discriminant.
     matches!(
-        value.as_object().and_then(|id| vm.heap.get(id)),
-        Some(Object::String(_) | Object::Range(_) | Object::Class(_))
+        value.as_object().and_then(|id| vm.heap.type_of(id)),
+        Some(ObjectType::String | ObjectType::Range | ObjectType::Class)
     )
 }
 
@@ -200,8 +202,8 @@ fn install_object(vm: &mut Vm) {
             if class == wanted {
                 return Ok(Value::TRUE);
             }
-            current = match vm.heap.get(class) {
-                Some(Object::Class(class)) => class.superclass,
+            current = match vm.heap.class(class) {
+                Some(class) => class.superclass,
                 _ => None,
             };
         }
@@ -217,7 +219,7 @@ fn install_object(vm: &mut Vm) {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(object)) = vm.heap.get_mut(class) {
+    if let Some(object) = vm.heap.class_mut(class) {
         object.metaclass = Some(object_metaclass);
     }
     define(vm, object_metaclass, "same(_,_)", |vm, at| {
@@ -248,8 +250,8 @@ fn install_class(vm: &mut Vm) {
         let Some(id) = receiver(vm, at).as_object() else {
             return Err(RuntimeError::new("Receiver must be a class."));
         };
-        let name = match vm.heap.get(id) {
-            Some(Object::Class(class)) => class.name,
+        let name = match vm.heap.class(id) {
+            Some(class) => class.name,
             _ => return Err(RuntimeError::new("Receiver must be a class.")),
         };
         Ok(Value::object(name))
@@ -259,9 +261,9 @@ fn install_class(vm: &mut Vm) {
         let Some(id) = receiver(vm, at).as_object() else {
             return Err(RuntimeError::new("Receiver must be a class."));
         };
-        match vm.heap.get(id) {
+        match vm.heap.class(id) {
             // `Object` has no supertype, which is what makes it the root.
-            Some(Object::Class(class)) => Ok(class.superclass.map_or(Value::NULL, Value::object)),
+            Some(class) => Ok(class.superclass.map_or(Value::NULL, Value::object)),
             _ => Err(RuntimeError::new("Receiver must be a class.")),
         }
     });
@@ -275,8 +277,8 @@ fn install_class(vm: &mut Vm) {
         let Some(id) = receiver(vm, at).as_object() else {
             return Err(RuntimeError::new("Receiver must be a class."));
         };
-        match vm.heap.get(id) {
-            Some(Object::Class(class)) => Ok(class.attributes),
+        match vm.heap.class(id) {
+            Some(class) => Ok(class.attributes),
             _ => Err(RuntimeError::new("Receiver must be a class.")),
         }
     });
@@ -303,7 +305,7 @@ fn install_fn(vm: &mut Vm) {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(function)) = vm.heap.get_mut(class) {
+    if let Some(function) = vm.heap.class_mut(class) {
         function.metaclass = Some(metaclass);
     }
 
@@ -312,9 +314,9 @@ fn install_fn(vm: &mut Vm) {
     // Wren: there is no bare block expression, only a block argument.
     define(vm, metaclass, "new(_)", |vm, at| {
         let block = argument(vm, at, 1);
-        match block.as_object().map(|id| vm.heap.get(id)) {
-            Some(Some(Object::Closure(_))) => Ok(block),
-            _ => Err(RuntimeError::new("Argument must be a function.")),
+        match block.as_object().and_then(|id| vm.heap.closure(id)) {
+            Some(_) => Ok(block),
+            None => Err(RuntimeError::new("Argument must be a function.")),
         }
     });
 
@@ -371,7 +373,7 @@ fn install_fiber(vm: &mut Vm) {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(fiber)) = vm.heap.get_mut(class) {
+    if let Some(fiber) = vm.heap.class_mut(class) {
         fiber.metaclass = Some(metaclass);
     }
 
@@ -380,7 +382,7 @@ fn install_fiber(vm: &mut Vm) {
         let Some(closure) = function.as_object() else {
             return Err(RuntimeError::new("Argument must be a function."));
         };
-        if !matches!(vm.heap.get(closure), Some(Object::Closure(_))) {
+        if !vm.heap.closure(closure).is_some() {
             return Err(RuntimeError::new("Argument must be a function."));
         }
         // A fiber's function receives at most the one value it was resumed
@@ -456,15 +458,21 @@ fn install_fiber(vm: &mut Vm) {
     });
 
     define(vm, class, "isDone", |vm, at| {
-        match receiver(vm, at).as_object().and_then(|id| vm.heap.get(id)) {
-            Some(Object::Fiber(fiber)) => Ok(Value::bool(fiber.done)),
+        match receiver(vm, at)
+            .as_object()
+            .and_then(|id| vm.heap.fiber(id))
+        {
+            Some(fiber) => Ok(Value::bool(fiber.done)),
             _ => Err(RuntimeError::new("Receiver must be a fiber.")),
         }
     });
 
     define(vm, class, "error", |vm, at| {
-        match receiver(vm, at).as_object().and_then(|id| vm.heap.get(id)) {
-            Some(Object::Fiber(fiber)) => Ok(fiber.error),
+        match receiver(vm, at)
+            .as_object()
+            .and_then(|id| vm.heap.fiber(id))
+        {
+            Some(fiber) => Ok(fiber.error),
             _ => Err(RuntimeError::new("Receiver must be a fiber.")),
         }
     });
@@ -481,18 +489,18 @@ fn switch_into(
     let Some(target) = receiver(vm, at).as_object() else {
         return Err(RuntimeError::new("Receiver must be a fiber."));
     };
-    match vm.heap.get(target) {
-        Some(Object::Fiber(fiber)) if fiber.done => {
+    match vm.heap.fiber(target) {
+        Some(fiber) if fiber.done => {
             return Err(RuntimeError::new("Cannot call a finished fiber."));
         }
         // **`call` and `try` only.** The root fiber is the one doing the
         // calling, so resuming it that way would re-enter a live stack. But
         // `transfer` to it is exactly how a fiber hands control back for good,
         // and refusing that broke four tests that were right.
-        Some(Object::Fiber(_)) if set_caller && vm.root_fiber == Some(target) => {
+        Some(_) if set_caller && vm.root_fiber == Some(target) => {
             return Err(RuntimeError::new("Cannot call root fiber."));
         }
-        Some(Object::Fiber(_)) => {}
+        Some(_) => {}
         _ => return Err(RuntimeError::new("Receiver must be a fiber.")),
     }
     vm.pending_switch = Some(Switch {
@@ -508,8 +516,8 @@ fn switch_into(
 
 /// Suspend the running fiber and hand `value` back to whoever resumed it.
 fn yield_to_caller(vm: &mut Vm, value: Value) -> Result<Value, RuntimeError> {
-    let caller = vm.current_fiber.and_then(|id| match vm.heap.get(id) {
-        Some(Object::Fiber(fiber)) => fiber.caller,
+    let caller = vm.current_fiber.and_then(|id| match vm.heap.fiber(id) {
+        Some(fiber) => fiber.caller,
         _ => None,
     });
     let Some(caller) = caller else {
@@ -703,8 +711,8 @@ fn strings_equal(vm: &Vm, left: Value, right: Value) -> bool {
     let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
         return false;
     };
-    match (vm.heap.get(left), vm.heap.get(right)) {
-        (Some(Object::String(a)), Some(Object::String(b))) => {
+    match (vm.heap.string(left), vm.heap.string(right)) {
+        (Some(a), Some(b)) => {
             // The cached hash is a cheap rejection before comparing bytes.
             a.hash() == b.hash() && a.bytes == b.bytes
         }
@@ -885,7 +893,7 @@ fn install_num_extras(vm: &mut Vm) {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(num)) = vm.heap.get_mut(class) {
+    if let Some(num) = vm.heap.class_mut(class) {
         num.metaclass = Some(metaclass);
     }
     define(vm, metaclass, "fromString(_)", |vm, at| {
@@ -1174,7 +1182,7 @@ fn install_string_extras(vm: &mut Vm) {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(string)) = vm.heap.get_mut(class) {
+    if let Some(string) = vm.heap.class_mut(class) {
         string.metaclass = Some(metaclass);
     }
     define(vm, metaclass, "fromCodePoint(_)", |vm, at| {
@@ -1213,9 +1221,9 @@ fn compare_strings(vm: &Vm, at: usize, accept: fn(i32) -> bool) -> Result<Value,
     let left = string_bytes(vm, receiver(vm, at));
     let right = match argument(vm, at, 1)
         .as_object()
-        .and_then(|id| vm.heap.get(id))
+        .and_then(|id| vm.heap.string(id))
     {
-        Some(Object::String(text)) => text.bytes.clone(),
+        Some(text) => text.bytes.clone(),
         _ => return Err(RuntimeError::new("Right operand must be a string.")),
     };
     let ordering = match left.cmp(&right) {
@@ -1421,8 +1429,8 @@ fn character_bytes(bytes: &[u8], at: usize) -> Vec<u8> {
 }
 
 fn string_bytes(vm: &Vm, value: Value) -> Vec<u8> {
-    match value.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::String(text)) => text.bytes.clone(),
+    match value.as_object().and_then(|id| vm.heap.string(id)) {
+        Some(text) => text.bytes.clone(),
         _ => Vec::new(),
     }
 }
@@ -1739,7 +1747,7 @@ fn new_view(vm: &mut Vm, class: crate::handle::ObjectId, fields: &[Value]) -> Va
 }
 
 fn set_instance_field(vm: &mut Vm, value: Value, index: usize, to: Value) {
-    if let Some(Object::Instance(instance)) = value.as_object().and_then(|id| vm.heap.get_mut(id)) {
+    if let Some(instance) = value.as_object().and_then(|id| vm.heap.instance_mut(id)) {
         if instance.fields.len() <= index {
             instance.fields.resize(index + 1, Value::NULL);
         }
@@ -1749,9 +1757,9 @@ fn set_instance_field(vm: &mut Vm, value: Value, index: usize, to: Value) {
 
 fn function_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeError> {
     let value = argument(vm, at, index);
-    match value.as_object().map(|id| vm.heap.get(id)) {
-        Some(Some(Object::Closure(_))) => Ok(value),
-        _ => Err(RuntimeError::new("Argument must be a function.")),
+    match value.as_object().and_then(|id| vm.heap.closure(id)) {
+        Some(_) => Ok(value),
+        None => Err(RuntimeError::new("Argument must be a function.")),
     }
 }
 
@@ -1777,7 +1785,7 @@ fn install_list(vm: &mut Vm) {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(list)) = vm.heap.get_mut(class) {
+    if let Some(list) = vm.heap.class_mut(class) {
         list.metaclass = Some(metaclass);
     }
     define(vm, metaclass, "new()", |vm, _| Ok(new_list(vm, Vec::new())));
@@ -1788,8 +1796,8 @@ fn install_list(vm: &mut Vm) {
     define(vm, class, "addCore(_)", |vm, at| {
         let list = receiver(vm, at);
         let element = argument(vm, at, 1);
-        match vm.heap.get_mut(list.as_object().unwrap()) {
-            Some(Object::List(list)) => list.elements.push(element),
+        match vm.heap.list_mut(list.as_object().unwrap()) {
+            Some(list) => list.elements.push(element),
             _ => return Err(RuntimeError::new("Receiver must be a list.")),
         }
         Ok(list)
@@ -1798,8 +1806,8 @@ fn install_list(vm: &mut Vm) {
     define(vm, class, "add(_)", |vm, at| {
         let list = receiver(vm, at);
         let element = argument(vm, at, 1);
-        match vm.heap.get_mut(list.as_object().unwrap()) {
-            Some(Object::List(list)) => list.elements.push(element),
+        match vm.heap.list_mut(list.as_object().unwrap()) {
+            Some(list) => list.elements.push(element),
             _ => return Err(RuntimeError::new("Receiver must be a list.")),
         }
         // `add` returns the element, which is what makes `list.add(x)` usable
@@ -1826,8 +1834,8 @@ fn install_list(vm: &mut Vm) {
 
         let index = number_argument(vm, at, 1)?;
         let index = resolve_index(index, length)?;
-        match vm.heap.get(list.as_object().unwrap()) {
-            Some(Object::List(list)) => Ok(list.elements[index]),
+        match vm.heap.list(list.as_object().unwrap()) {
+            Some(list) => Ok(list.elements[index]),
             _ => Err(RuntimeError::new("Receiver must be a list.")),
         }
     });
@@ -1838,8 +1846,8 @@ fn install_list(vm: &mut Vm) {
         let value = argument(vm, at, 2);
         let length = list_length(vm, list);
         let index = resolve_index(index, length)?;
-        match vm.heap.get_mut(list.as_object().unwrap()) {
-            Some(Object::List(list)) => {
+        match vm.heap.list_mut(list.as_object().unwrap()) {
+            Some(list) => {
                 list.elements[index] = value;
                 Ok(value)
             }
@@ -1871,8 +1879,8 @@ fn install_list(vm: &mut Vm) {
         let index = number_argument(vm, at, 1)?;
         let length = list_length(vm, list);
         let index = resolve_index(index, length)?;
-        match vm.heap.get(list.as_object().unwrap()) {
-            Some(Object::List(list)) => Ok(list.elements[index]),
+        match vm.heap.list(list.as_object().unwrap()) {
+            Some(list) => Ok(list.elements[index]),
             _ => Err(RuntimeError::new("Receiver must be a list.")),
         }
     });
@@ -1920,8 +1928,8 @@ fn install_list_extras(vm: &mut Vm) {
         if at_index < 0.0 || at_index > length as Num {
             return Err(RuntimeError::new("Index out of bounds."));
         }
-        match vm.heap.get_mut(list.as_object().unwrap()) {
-            Some(Object::List(list)) => {
+        match vm.heap.list_mut(list.as_object().unwrap()) {
+            Some(list) => {
                 list.elements.insert(at_index as usize, value);
                 Ok(value)
             }
@@ -1944,8 +1952,8 @@ fn install_list_extras(vm: &mut Vm) {
         let other = argument(vm, at, 1);
         // Any sequence, not just a list: `list.addAll(1..3)` is ordinary Wren.
         let added = collect(vm, other)?;
-        match vm.heap.get_mut(list.as_object().unwrap()) {
-            Some(Object::List(list)) => list.elements.extend(added),
+        match vm.heap.list_mut(list.as_object().unwrap()) {
+            Some(list) => list.elements.extend(added),
             _ => return Err(RuntimeError::new("Receiver must be a list.")),
         }
         Ok(other)
@@ -1957,8 +1965,8 @@ fn install_list_extras(vm: &mut Vm) {
         let found = list_elements(vm, list)
             .iter()
             .position(|element| values_equal(vm, *element, wanted));
-        match (found, vm.heap.get_mut(list.as_object().unwrap())) {
-            (Some(index), Some(Object::List(list))) => Ok(list.elements.remove(index)),
+        match (found, vm.heap.list_mut(list.as_object().unwrap())) {
+            (Some(index), Some(list)) => Ok(list.elements.remove(index)),
             // Removing something that is not there answers null rather than
             // failing, which is what makes `remove` usable without a
             // `contains` in front of it.
@@ -1984,16 +1992,16 @@ fn install_list_extras(vm: &mut Vm) {
         let index = number_argument(vm, at, 1)?;
         let length = list_length(vm, list);
         let index = resolve_index(index, length)?;
-        match vm.heap.get_mut(list.as_object().unwrap()) {
-            Some(Object::List(list)) => Ok(list.elements.remove(index)),
+        match vm.heap.list_mut(list.as_object().unwrap()) {
+            Some(list) => Ok(list.elements.remove(index)),
             _ => Err(RuntimeError::new("Receiver must be a list.")),
         }
     });
 
     define(vm, class, "clear()", |vm, at| {
-        if let Some(Object::List(list)) = receiver(vm, at)
+        if let Some(list) = receiver(vm, at)
             .as_object()
-            .and_then(|id| vm.heap.get_mut(id))
+            .and_then(|id| vm.heap.list_mut(id))
         {
             list.elements.clear();
         }
@@ -2092,8 +2100,8 @@ fn install_list_extras(vm: &mut Vm) {
     });
 
     // `List.new()` and `List.filled(n, value)`.
-    let metaclass = match vm.heap.get(class) {
-        Some(Object::Class(list)) => list.metaclass,
+    let metaclass = match vm.heap.class(class) {
+        Some(list) => list.metaclass,
         _ => None,
     };
     if let Some(metaclass) = metaclass {
@@ -2109,8 +2117,8 @@ fn install_list_extras(vm: &mut Vm) {
 }
 
 fn list_elements(vm: &Vm, list: Value) -> Vec<Value> {
-    match list.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::List(list)) => list.elements.clone(),
+    match list.as_object().and_then(|id| vm.heap.list(id)) {
+        Some(list) => list.elements.clone(),
         _ => Vec::new(),
     }
 }
@@ -2131,8 +2139,8 @@ fn join_elements(
 }
 
 fn list_length(vm: &Vm, list: Value) -> usize {
-    match list.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::List(list)) => list.elements.len(),
+    match list.as_object().and_then(|id| vm.heap.list(id)) {
+        Some(list) => list.elements.len(),
         _ => 0,
     }
 }
@@ -2167,7 +2175,7 @@ fn install_map(vm: &mut Vm) {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(map)) = vm.heap.get_mut(class) {
+    if let Some(map) = vm.heap.class_mut(class) {
         map.metaclass = Some(metaclass);
     }
     define(vm, metaclass, "new()", |vm, _| {
@@ -2218,8 +2226,8 @@ fn install_map(vm: &mut Vm) {
             return Err(RuntimeError::new("Receiver must be a map."));
         };
         let found = map_index(vm, map, key);
-        match (found, vm.heap.get_mut(id)) {
-            (Some(slot), Some(Object::Map(map))) => {
+        match (found, vm.heap.map_mut(id)) {
+            (Some(slot), Some(map)) => {
                 let removed = map.entries[slot].value;
                 // **A tombstone, not an empty slot.** A key that collided with
                 // this one probed past it on the way in; blanking the slot
@@ -2236,9 +2244,9 @@ fn install_map(vm: &mut Vm) {
     });
 
     define(vm, class, "clear()", |vm, at| {
-        if let Some(Object::Map(map)) = receiver(vm, at)
+        if let Some(map) = receiver(vm, at)
             .as_object()
-            .and_then(|id| vm.heap.get_mut(id))
+            .and_then(|id| vm.heap.map_mut(id))
         {
             map.entries.clear();
             map.count = 0;
@@ -2292,8 +2300,8 @@ fn install_map(vm: &mut Vm) {
             }
             index as usize + 1
         };
-        let next = match map.as_object().and_then(|id| vm.heap.get(id)) {
-            Some(Object::Map(map)) => map.next_live(from),
+        let next = match map.as_object().and_then(|id| vm.heap.map(id)) {
+            Some(map) => map.next_live(from),
             _ => return Err(RuntimeError::new("Receiver must be a map.")),
         };
         Ok(next.map_or(Value::FALSE, |slot| Value::num(slot as Num)))
@@ -2302,8 +2310,8 @@ fn install_map(vm: &mut Vm) {
     define(vm, class, "iteratorValue(_)", |vm, at| {
         let map = receiver(vm, at);
         let slot = integer_argument(vm, at, 1, "Iterator")?;
-        let capacity = match map.as_object().and_then(|id| vm.heap.get(id)) {
-            Some(Object::Map(map)) => map.entries.len(),
+        let capacity = match map.as_object().and_then(|id| vm.heap.map(id)) {
+            Some(map) => map.entries.len(),
             _ => return Err(RuntimeError::new("Receiver must be a map.")),
         };
         // **Out of the table's range and pointing at an empty slot are
@@ -2313,8 +2321,8 @@ fn install_map(vm: &mut Vm) {
             return Err(RuntimeError::new("Iterator out of bounds."));
         }
         let slot = slot as usize;
-        let entry = match map.as_object().and_then(|id| vm.heap.get(id)) {
-            Some(Object::Map(map)) if map.is_live(slot) => map.entries[slot],
+        let entry = match map.as_object().and_then(|id| vm.heap.map(id)) {
+            Some(map) if map.is_live(slot) => map.entries[slot],
             _ => return Err(RuntimeError::new("Invalid map iterator.")),
         };
         let class = vm.map_entry_class;
@@ -2368,7 +2376,7 @@ fn install_map(vm: &mut Vm) {
         entry_metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(entry)) = vm.heap.get_mut(entry_class) {
+    if let Some(entry) = vm.heap.class_mut(entry_class) {
         entry.metaclass = Some(entry_metaclass);
     }
     define(vm, entry_metaclass, "new(_,_)", |vm, at| {
@@ -2397,26 +2405,24 @@ fn install_map(vm: &mut Vm) {
 }
 
 fn instance_field(vm: &Vm, value: Value, index: usize) -> Value {
-    match value.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::Instance(instance)) => {
-            instance.fields.get(index).copied().unwrap_or(Value::NULL)
-        }
+    match value.as_object().and_then(|id| vm.heap.instance(id)) {
+        Some(instance) => instance.fields.get(index).copied().unwrap_or(Value::NULL),
         _ => Value::NULL,
     }
 }
 
 /// The live entries of a map, in slot order.
 fn map_entries(vm: &Vm, map: Value) -> Vec<MapEntry> {
-    match map.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::Map(map)) => map.live().copied().collect(),
+    match map.as_object().and_then(|id| vm.heap.map(id)) {
+        Some(map) => map.live().copied().collect(),
         _ => Vec::new(),
     }
 }
 
 /// How many live entries a map has.
 fn map_count(vm: &Vm, map: Value) -> usize {
-    match map.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::Map(map)) => map.count,
+    match map.as_object().and_then(|id| vm.heap.map(id)) {
+        Some(map) => map.count,
         _ => 0,
     }
 }
@@ -2511,8 +2517,8 @@ fn grow_map(vm: &mut Vm, id: crate::handle::ObjectId, wanted: usize) {
         capacity *= 2;
     }
 
-    let old = match vm.heap.get(id) {
-        Some(Object::Map(map)) => map.entries.clone(),
+    let old = match vm.heap.map(id) {
+        Some(map) => map.entries.clone(),
         _ => return,
     };
     let empty = MapEntry {
@@ -2528,7 +2534,7 @@ fn grow_map(vm: &mut Vm, id: crate::handle::ObjectId, wanted: usize) {
         count += 1;
     }
 
-    if let Some(Object::Map(map)) = vm.heap.get_mut(id) {
+    if let Some(map) = vm.heap.map_mut(id) {
         map.entries = entries;
         map.count = count;
     }
@@ -2536,8 +2542,8 @@ fn grow_map(vm: &mut Vm, id: crate::handle::ObjectId, wanted: usize) {
 
 /// The slot holding `key`, if the map has it.
 fn map_index(vm: &Vm, map: Value, key: Value) -> Option<usize> {
-    let entries = match map.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::Map(map)) if !map.entries.is_empty() => &map.entries,
+    let entries = match map.as_object().and_then(|id| vm.heap.map(id)) {
+        Some(map) if !map.entries.is_empty() => &map.entries,
         _ => return None,
     };
     match probe(vm, entries, key) {
@@ -2548,8 +2554,8 @@ fn map_index(vm: &Vm, map: Value, key: Value) -> Option<usize> {
 
 fn map_get(vm: &Vm, map: Value, key: Value) -> Option<Value> {
     let slot = map_index(vm, map, key)?;
-    match map.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::Map(map)) => map.entries.get(slot).map(|entry| entry.value),
+    match map.as_object().and_then(|id| vm.heap.map(id)) {
+        Some(map) => map.entries.get(slot).map(|entry| entry.value),
         _ => None,
     }
 }
@@ -2562,21 +2568,21 @@ fn map_set(vm: &mut Vm, map: Value, key: Value, value: Value) -> Result<(), Runt
     // **Grown at three quarters full.** A linear-probing table degrades sharply
     // as it fills: the probe length climbs with the square of the load, so the
     // last few insertions into a full table cost more than all the rest.
-    let (count, capacity) = match vm.heap.get(id) {
-        Some(Object::Map(map)) => (map.count, map.entries.len()),
+    let (count, capacity) = match vm.heap.map(id) {
+        Some(map) => (map.count, map.entries.len()),
         _ => return Err(RuntimeError::new("Receiver must be a map.")),
     };
     if capacity == 0 || (count + 1) * 4 > capacity * 3 {
         grow_map(vm, id, (count + 1) * 2);
     }
 
-    let entries = match vm.heap.get(id) {
-        Some(Object::Map(map)) => map.entries.clone(),
+    let entries = match vm.heap.map(id) {
+        Some(map) => map.entries.clone(),
         _ => return Err(RuntimeError::new("Receiver must be a map.")),
     };
     let (slot, existing) = probe(vm, &entries, key);
 
-    if let Some(Object::Map(map)) = vm.heap.get_mut(id) {
+    if let Some(map) = vm.heap.map_mut(id) {
         map.entries[slot] = MapEntry { key, value };
         if !existing {
             map.count += 1;
@@ -2784,10 +2790,7 @@ fn slice_indices(range: &ObjRange, length: usize) -> Result<Vec<usize>, RuntimeE
 }
 
 fn range_of(vm: &Vm, value: Value) -> Option<ObjRange> {
-    match vm.heap.get(value.as_object()?)? {
-        Object::Range(range) => Some(*range),
-        _ => None,
-    }
+    vm.heap.range(value.as_object()?).copied()
 }
 
 /// `System`, and the metaclass that holds its static methods.
@@ -2928,19 +2931,19 @@ fn install_metaclasses(vm: &mut Vm) {
         vm.skip_sequence_class,
     ];
     for class in classes {
-        let existing = match vm.heap.get(class) {
-            Some(Object::Class(class)) => class.metaclass,
+        let existing = match vm.heap.class(class) {
+            Some(class) => class.metaclass,
             _ => continue,
         };
         if existing.is_some() {
             continue;
         }
-        let name = match vm.heap.get(class) {
-            Some(Object::Class(class)) => class.name,
+        let name = match vm.heap.class(class) {
+            Some(class) => class.name,
             _ => continue,
         };
-        let text = match vm.heap.get(name) {
-            Some(Object::String(text)) => text.as_str().unwrap_or("?").to_string(),
+        let text = match vm.heap.string(name) {
+            Some(text) => text.as_str().unwrap_or("?").to_string(),
             _ => "?".to_string(),
         };
         let metaclass_name =
@@ -2952,7 +2955,7 @@ fn install_metaclasses(vm: &mut Vm) {
             metaclass_name,
             Some(vm.class_class),
         ))));
-        if let Some(Object::Class(class)) = vm.heap.get_mut(class) {
+        if let Some(class) = vm.heap.class_mut(class) {
             class.metaclass = Some(metaclass);
         }
     }
@@ -2981,7 +2984,7 @@ pub fn install_meta(vm: &mut Vm) -> usize {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(meta)) = vm.heap.get_mut(class) {
+    if let Some(meta) = vm.heap.class_mut(class) {
         meta.metaclass = Some(metaclass);
     }
 
@@ -3092,7 +3095,7 @@ pub fn install_random(vm: &mut Vm) -> usize {
         metaclass_name,
         Some(vm.class_class),
     ))));
-    if let Some(Object::Class(random)) = vm.heap.get_mut(class) {
+    if let Some(random) = vm.heap.class_mut(class) {
         random.metaclass = Some(metaclass);
         // **Eight fields, not four.** The generator's state is four `u32`
         // words, and a `Num` only holds one exactly when it is a double: an
@@ -3220,7 +3223,7 @@ pub fn install_random(vm: &mut Vm) -> usize {
             elements.swap(index, choice.min(index));
             index -= 1;
         }
-        if let Some(Object::List(target)) = list.as_object().and_then(|id| vm.heap.get_mut(id)) {
+        if let Some(target) = list.as_object().and_then(|id| vm.heap.list_mut(id)) {
             target.elements = elements;
         }
         Ok(list)
@@ -3296,8 +3299,8 @@ fn next_u32(vm: &mut Vm, receiver: Value) -> u32 {
         return 0;
     };
     let mut state = [0u32; 4];
-    match vm.heap.get(id) {
-        Some(Object::Instance(instance)) => {
+    match vm.heap.instance(id) {
+        Some(instance) => {
             for (word, slot) in state.iter_mut().zip((0..8).step_by(2)) {
                 let low = field_half(instance, slot);
                 let high = field_half(instance, slot + 1);
@@ -3307,7 +3310,7 @@ fn next_u32(vm: &mut Vm, receiver: Value) -> u32 {
         _ => return 0,
     }
     let value = step(&mut state);
-    if let Some(Object::Instance(instance)) = vm.heap.get_mut(id) {
+    if let Some(instance) = vm.heap.instance_mut(id) {
         for (word, slot) in state.iter().zip((0..8).step_by(2)) {
             let [low, high] = halves(*word);
             instance.fields[slot] = low;
@@ -3365,7 +3368,7 @@ pub fn map_lookup(vm: &Vm, map: Value, key: Value) -> Option<Value> {
 
 /// Append to a list, for accumulating repeated attribute keys.
 pub fn list_push(vm: &mut Vm, list: Value, value: Value) {
-    if let Some(Object::List(list)) = list.as_object().and_then(|id| vm.heap.get_mut(id)) {
+    if let Some(list) = list.as_object().and_then(|id| vm.heap.list_mut(id)) {
         list.elements.push(value);
     }
 }

@@ -441,7 +441,7 @@ impl Vm {
         };
         // `List`, `Map`, `Range` and `String` are sequences.
         for class in [list_class, map_class, range_class, string_class] {
-            if let Some(Object::Class(class)) = vm.heap.get_mut(class) {
+            if let Some(class) = vm.heap.class_mut(class) {
                 class.superclass = Some(sequence_class);
             }
         }
@@ -652,9 +652,7 @@ impl Vm {
     /// The chain is still walked for `is` and for `super`, which are about the
     /// hierarchy rather than about finding a method in it.
     fn find_method(&self, class: ObjectId, symbol: usize) -> Option<Method> {
-        let Some(Object::Class(class)) = self.heap.get(class) else {
-            return None;
-        };
+        let class = self.heap.class(class)?;
         let entry = class.method_entry(symbol);
         if let Some(closure) = crate::object::entry_closure(entry) {
             return Some(Method::Closure(closure));
@@ -673,7 +671,7 @@ impl Vm {
     ) {
         let index = self.primitives.len();
         self.primitives.push(function);
-        if let Some(Object::Class(class)) = self.heap.get_mut(class) {
+        if let Some(class) = self.heap.class_mut(class) {
             class.define(symbol, crate::object::primitive_entry(index));
         }
     }
@@ -692,11 +690,11 @@ impl Vm {
     /// core classes, which are populated before they are flattened and so
     /// already hold their own definitions of things like `toString`.
     fn inherit_methods(&mut self, child: ObjectId, parent: ObjectId) {
-        let inherited = match self.heap.get(parent) {
-            Some(Object::Class(parent)) => parent.methods.clone(),
+        let inherited = match self.heap.class(parent) {
+            Some(parent) => parent.methods.clone(),
             _ => return,
         };
-        let Some(Object::Class(child)) = self.heap.get_mut(child) else {
+        let Some(child) = self.heap.class_mut(child) else {
             return;
         };
         if child.methods.len() < inherited.len() {
@@ -724,15 +722,15 @@ impl Vm {
     fn flatten_class_hierarchy(&mut self) {
         let mut classes: Vec<(usize, ObjectId)> = Vec::new();
         for id in self.heap.ids() {
-            if !matches!(self.heap.get(id), Some(Object::Class(_))) {
+            if !self.heap.class(id).is_some() {
                 continue;
             }
             // Depth is counted with a step limit rather than trusted: a cycle
             // here would hang the VM at start-up, which is the worst place to
             // find out that a superclass was wired up wrongly.
             let mut depth = 0;
-            let mut current = match self.heap.get(id) {
-                Some(Object::Class(class)) => class.superclass,
+            let mut current = match self.heap.class(id) {
+                Some(class) => class.superclass,
                 _ => None,
             };
             while let Some(parent) = current {
@@ -740,8 +738,8 @@ impl Vm {
                 if depth > 64 {
                     break;
                 }
-                current = match self.heap.get(parent) {
-                    Some(Object::Class(parent)) => parent.superclass,
+                current = match self.heap.class(parent) {
+                    Some(parent) => parent.superclass,
                     _ => None,
                 };
             }
@@ -750,8 +748,8 @@ impl Vm {
         classes.sort_by_key(|(depth, _)| *depth);
 
         for (_, id) in &classes {
-            let parent = match self.heap.get(*id) {
-                Some(Object::Class(class)) => class.superclass,
+            let parent = match self.heap.class(*id) {
+                Some(class) => class.superclass,
                 _ => None,
             };
             if let Some(parent) = parent {
@@ -766,7 +764,7 @@ impl Vm {
         // its whole life -- and `Vm::new`'s resident figure is a published
         // number, so it should be the honest one.
         for (_, id) in &classes {
-            if let Some(Object::Class(class)) = self.heap.get_mut(*id) {
+            if let Some(class) = self.heap.class_mut(*id) {
                 class.methods.shrink_to_fit();
             }
         }
@@ -806,16 +804,16 @@ impl Vm {
     /// non-string, which printed it as `[invalid toString]` and rejected it
     /// wherever a string argument was required.
     pub fn is_string(&self, value: Value) -> bool {
-        matches!(
-            value.as_object().and_then(|id| self.heap.get(id)),
-            Some(Object::String(_))
-        )
+        value
+            .as_object()
+            .and_then(|id| self.heap.string(id))
+            .is_some()
     }
 
     /// Read a string object, for a primitive that needs its contents.
     pub fn string_at(&self, value: Value) -> Option<&str> {
-        match self.heap.get(value.as_object()?)? {
-            Object::String(text) => text.as_str(),
+        match self.heap.string(value.as_object()?) {
+            Some(text) => text.as_str(),
             _ => None,
         }
     }
@@ -882,8 +880,8 @@ impl Vm {
                 out.push('}');
                 out
             }
-            Some(Object::Class(class)) => match self.heap.get(class.name) {
-                Some(Object::String(name)) => name.as_str().unwrap_or("<class>").to_string(),
+            Some(Object::Class(class)) => match self.heap.string(class.name) {
+                Some(name) => name.as_str().unwrap_or("<class>").to_string(),
                 _ => "<class>".to_string(),
             },
             Some(Object::Instance(instance)) => {
@@ -935,10 +933,10 @@ impl Vm {
     /// per *call* -- not per instruction -- is the cheapest of the three by a
     /// wide margin.
     fn call_target(&self, closure: ObjectId) -> Result<CallTarget, RuntimeError> {
-        let Some(Object::Closure(closure)) = self.heap.get(closure) else {
+        let Some(closure) = self.heap.closure(closure) else {
             return Err(RuntimeError::new("Not a closure."));
         };
-        let Some(Object::Fn(function)) = self.heap.get(closure.function) else {
+        let Some(function) = self.heap.function(closure.function) else {
             return Err(RuntimeError::new("Closure has no function."));
         };
         Ok(CallTarget {
@@ -968,11 +966,9 @@ impl Vm {
     }
 
     fn function_of(&self, closure: ObjectId) -> Option<&ObjFn> {
-        let Some(Object::Closure(closure)) = self.heap.get(closure) else {
-            return None;
-        };
-        match self.heap.get(closure.function) {
-            Some(Object::Fn(function)) => Some(function),
+        let closure = self.heap.closure(closure)?;
+        match self.heap.function(closure.function) {
+            Some(function) => Some(function),
             _ => None,
         }
     }
@@ -984,7 +980,7 @@ impl Vm {
     /// upvalue would silently turn one shared variable into two.
     fn capture_upvalue(&mut self, slot: usize) -> ObjectId {
         for existing in &self.open_upvalues {
-            if let Some(Object::Upvalue(upvalue)) = self.heap.get(*existing) {
+            if let Some(upvalue) = self.heap.upvalue(*existing) {
                 if upvalue.is_open() && upvalue.slot == slot {
                     return *existing;
                 }
@@ -1006,8 +1002,8 @@ impl Vm {
     fn close_upvalues(&mut self, from: usize) {
         let mut still_open = Vec::new();
         for id in ::core::mem::take(&mut self.open_upvalues) {
-            let slot = match self.heap.get(id) {
-                Some(Object::Upvalue(upvalue)) if upvalue.is_open() => upvalue.slot,
+            let slot = match self.heap.upvalue(id) {
+                Some(upvalue) if upvalue.is_open() => upvalue.slot,
                 _ => continue,
             };
             if slot < from {
@@ -1015,7 +1011,7 @@ impl Vm {
                 continue;
             }
             let value = self.stack.get(slot).copied().unwrap_or(Value::NULL);
-            if let Some(Object::Upvalue(upvalue)) = self.heap.get_mut(id) {
+            if let Some(upvalue) = self.heap.upvalue_mut(id) {
                 upvalue.closed = value;
             }
         }
@@ -1138,7 +1134,7 @@ impl Vm {
         let Some(id) = self.current_fiber else { return };
         let stack = ::core::mem::take(&mut self.stack);
         let frames = ::core::mem::take(&mut self.frames);
-        if let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) {
+        if let Some(fiber) = self.heap.fiber_mut(id) {
             fiber.stack = stack;
             fiber.frames = frames;
         }
@@ -1146,8 +1142,8 @@ impl Vm {
 
     /// Take a fiber's stack and frames as the VM's own, and run it.
     fn resume(&mut self, target: ObjectId, value: Value) -> Result<(), RuntimeError> {
-        let (mut stack, mut frames, entry, done) = match self.heap.get_mut(target) {
-            Some(Object::Fiber(fiber)) => (
+        let (mut stack, mut frames, entry, done) = match self.heap.fiber_mut(target) {
+            Some(fiber) => (
                 ::core::mem::take(&mut fiber.stack),
                 ::core::mem::take(&mut fiber.frames),
                 fiber.entry,
@@ -1198,14 +1194,14 @@ impl Vm {
         self.park_current(ip);
 
         if switch.set_caller {
-            if let Some(Object::Fiber(fiber)) = self.heap.get_mut(switch.target) {
+            if let Some(fiber) = self.heap.fiber_mut(switch.target) {
                 fiber.caller = from;
                 fiber.catching = switch.catching;
             }
         }
         if switch.finishing {
             if let Some(from) = from {
-                if let Some(Object::Fiber(fiber)) = self.heap.get_mut(from) {
+                if let Some(fiber) = self.heap.fiber_mut(from) {
                     fiber.done = true;
                 }
             }
@@ -1217,9 +1213,7 @@ impl Vm {
     fn catcher(&self) -> Option<ObjectId> {
         let mut current = self.current_fiber;
         while let Some(id) = current {
-            let Some(Object::Fiber(fiber)) = self.heap.get(id) else {
-                return None;
-            };
+            let fiber = self.heap.fiber(id)?;
             if fiber.catching {
                 return fiber.caller;
             }
@@ -1697,9 +1691,7 @@ impl Vm {
                 Op::SetAttributes => {
                     let attributes = self.stack.pop().unwrap_or(Value::NULL);
                     let class = self.stack.pop().unwrap_or(Value::NULL);
-                    if let Some(Object::Class(class)) =
-                        class.as_object().and_then(|id| self.heap.get_mut(id))
-                    {
+                    if let Some(class) = class.as_object().and_then(|id| self.heap.class_mut(id)) {
                         class.attributes = attributes;
                     }
                 }
@@ -1802,8 +1794,8 @@ impl Vm {
                         // The symptom was a second `fiber.call()` reporting the
                         // fiber already finished after it had only yielded.
                         let finished = self.frames.is_empty();
-                        let caller = self.current_fiber.and_then(|id| match self.heap.get(id) {
-                            Some(Object::Fiber(fiber)) => fiber.caller,
+                        let caller = self.current_fiber.and_then(|id| match self.heap.fiber(id) {
+                            Some(fiber) => fiber.caller,
                             _ => None,
                         });
                         if let (Some(caller), true) = (caller, finished) {
@@ -1827,7 +1819,7 @@ impl Vm {
                         }
                         if finished {
                             if let Some(id) = self.current_fiber {
-                                if let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) {
+                                if let Some(fiber) = self.heap.fiber_mut(id) {
                                     fiber.done = true;
                                 }
                             }
@@ -1926,7 +1918,7 @@ impl Vm {
         // `fiber.error` while also claiming not to be done.
         let mut current = self.current_fiber;
         while let Some(id) = current {
-            let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) else {
+            let Some(fiber) = self.heap.fiber_mut(id) else {
                 break;
             };
             fiber.error = message;
@@ -1962,14 +1954,14 @@ impl Vm {
         let Some(frame) = self.frames.last() else {
             return Err(RuntimeError::new("No frame."));
         };
-        let Some(Object::Closure(closure)) = self.heap.get(frame.closure) else {
+        let Some(closure) = self.heap.closure(frame.closure) else {
             return Err(RuntimeError::new("No closure."));
         };
         let Some(id) = closure.upvalues.get(slot).copied() else {
             return Err(RuntimeError::new("No such upvalue."));
         };
-        match self.heap.get(id) {
-            Some(Object::Upvalue(upvalue)) => {
+        match self.heap.upvalue(id) {
+            Some(upvalue) => {
                 if upvalue.is_open() {
                     Ok(self.stack.get(upvalue.slot).copied().unwrap_or(Value::NULL))
                 } else {
@@ -1984,14 +1976,14 @@ impl Vm {
         let Some(frame) = self.frames.last() else {
             return Err(RuntimeError::new("No frame."));
         };
-        let Some(Object::Closure(closure)) = self.heap.get(frame.closure) else {
+        let Some(closure) = self.heap.closure(frame.closure) else {
             return Err(RuntimeError::new("No closure."));
         };
         let Some(id) = closure.upvalues.get(slot).copied() else {
             return Err(RuntimeError::new("No such upvalue."));
         };
-        let target = match self.heap.get(id) {
-            Some(Object::Upvalue(upvalue)) => upvalue.is_open().then_some(upvalue.slot),
+        let target = match self.heap.upvalue(id) {
+            Some(upvalue) => upvalue.is_open().then_some(upvalue.slot),
             _ => return Err(RuntimeError::new("Not an upvalue.")),
         };
         match target {
@@ -2001,7 +1993,7 @@ impl Vm {
                 }
             }
             None => {
-                if let Some(Object::Upvalue(upvalue)) = self.heap.get_mut(id) {
+                if let Some(upvalue) = self.heap.upvalue_mut(id) {
                     upvalue.closed = value;
                 }
             }
@@ -2013,7 +2005,7 @@ impl Vm {
         let Some(frame) = self.frames.last() else {
             return Err(RuntimeError::new("No frame."));
         };
-        let Some(Object::Closure(closure)) = self.heap.get(frame.closure) else {
+        let Some(closure) = self.heap.closure(frame.closure) else {
             return Err(RuntimeError::new("No closure."));
         };
         closure
@@ -2024,9 +2016,9 @@ impl Vm {
     }
 
     fn class_name(&self, class: ObjectId) -> String {
-        match self.heap.get(class) {
-            Some(Object::Class(class)) => match self.heap.get(class.name) {
-                Some(Object::String(name)) => name.as_str().unwrap_or("?").to_string(),
+        match self.heap.class(class) {
+            Some(class) => match self.heap.string(class.name) {
+                Some(name) => name.as_str().unwrap_or("?").to_string(),
                 _ => "?".to_string(),
             },
             _ => "?".to_string(),
@@ -2041,8 +2033,8 @@ impl Vm {
                 "Cannot access a field outside of a class.",
             ));
         };
-        match self.heap.get(id) {
-            Some(Object::Instance(instance)) => Ok(instance
+        match self.heap.instance(id) {
+            Some(instance) => Ok(instance
                 .fields
                 .get(offset + index)
                 .copied()
@@ -2066,8 +2058,8 @@ impl Vm {
                 "Cannot access a field outside of a class.",
             ));
         };
-        match self.heap.get_mut(id) {
-            Some(Object::Instance(instance)) => {
+        match self.heap.instance_mut(id) {
+            Some(instance) => {
                 let at = offset + index;
                 if instance.fields.len() <= at {
                     instance.fields.resize(at + 1, Value::NULL);
@@ -2096,8 +2088,8 @@ impl Vm {
         let Some(owner) = self.owner_class() else {
             return Value::NULL;
         };
-        match self.heap.get(owner) {
-            Some(Object::Class(class)) => class
+        match self.heap.class(owner) {
+            Some(class) => class
                 .static_fields
                 .get(index)
                 .copied()
@@ -2112,7 +2104,7 @@ impl Vm {
                 "Cannot use a static field outside of a class definition.",
             ));
         };
-        if let Some(Object::Class(class)) = self.heap.get_mut(owner) {
+        if let Some(class) = self.heap.class_mut(owner) {
             if class.static_fields.len() <= index {
                 class.static_fields.resize(index + 1, Value::NULL);
             }
@@ -2136,8 +2128,8 @@ impl Vm {
         let Some(superclass_id) = superclass.as_object() else {
             return Err(RuntimeError::new("Class must inherit from a class."));
         };
-        let inherited = match self.heap.get(superclass_id) {
-            Some(Object::Class(class)) => class.num_fields.max(0) as usize,
+        let inherited = match self.heap.class(superclass_id) {
+            Some(class) => class.num_fields.max(0) as usize,
             _ => return Err(RuntimeError::new("Class must inherit from a class.")),
         };
 
@@ -2171,8 +2163,8 @@ impl Vm {
         };
 
         // A metaclass, so the class can carry static methods and a constructor.
-        let class_name = match self.heap.get(name_id) {
-            Some(Object::String(text)) => text.as_str().unwrap_or("?").to_string(),
+        let class_name = match self.heap.string(name_id) {
+            Some(text) => text.as_str().unwrap_or("?").to_string(),
             _ => "?".to_string(),
         };
         let metaclass_name = self
@@ -2233,16 +2225,16 @@ impl Vm {
         // `Object`, where `name` is not, rather than through `Class`, where it
         // is.
         let target = if is_static {
-            match self.heap.get(class_id) {
-                Some(Object::Class(class)) => class.metaclass.unwrap_or(class_id),
+            match self.heap.class(class_id) {
+                Some(class) => class.metaclass.unwrap_or(class_id),
                 _ => class_id,
             }
         } else {
             class_id
         };
 
-        let superclass = match self.heap.get(target) {
-            Some(Object::Class(class)) => class.superclass,
+        let superclass = match self.heap.class(target) {
+            Some(class) => class.superclass,
             _ => None,
         };
 
@@ -2250,15 +2242,15 @@ impl Vm {
         // method's fields from zero; now that the class is known, so is how
         // many fields the superclass already occupies.
         let inherited = match superclass {
-            Some(superclass) => match self.heap.get(superclass) {
-                Some(Object::Class(superclass)) => superclass.num_fields.max(0) as usize,
+            Some(superclass) => match self.heap.class(superclass) {
+                Some(superclass) => superclass.num_fields.max(0) as usize,
                 _ => 0,
             },
             None => 0,
         };
         self.set_field_offset(closure, inherited, superclass, class_id);
 
-        if let Some(Object::Class(class)) = self.heap.get_mut(target) {
+        if let Some(class) = self.heap.class_mut(target) {
             class.define(symbol, crate::object::closure_entry(closure));
         }
         Ok(())
@@ -2276,21 +2268,21 @@ impl Vm {
         superclass: Option<ObjectId>,
         owner: ObjectId,
     ) {
-        let Some(Object::Closure(closure)) = self.heap.get(closure) else {
+        let Some(closure) = self.heap.closure(closure) else {
             return;
         };
         let function = closure.function;
-        let nested: Vec<ObjectId> = match self.heap.get(function) {
-            Some(Object::Fn(function)) => function
+        let nested: Vec<ObjectId> = match self.heap.function(function) {
+            Some(function) => function
                 .chunk
                 .constants
                 .iter()
                 .filter_map(|constant| constant.as_object())
-                .filter(|id| matches!(self.heap.get(*id), Some(Object::Fn(_))))
+                .filter(|id| self.heap.function(*id).is_some())
                 .collect(),
             _ => Vec::new(),
         };
-        if let Some(Object::Fn(function)) = self.heap.get_mut(function) {
+        if let Some(function) = self.heap.function_mut(function) {
             function.field_offset = offset;
             function.super_class = superclass;
             function.owner_class = Some(owner);
@@ -2307,17 +2299,17 @@ impl Vm {
         superclass: Option<ObjectId>,
         owner: ObjectId,
     ) {
-        let nested: Vec<ObjectId> = match self.heap.get(function) {
-            Some(Object::Fn(function)) => function
+        let nested: Vec<ObjectId> = match self.heap.function(function) {
+            Some(function) => function
                 .chunk
                 .constants
                 .iter()
                 .filter_map(|constant| constant.as_object())
-                .filter(|id| matches!(self.heap.get(*id), Some(Object::Fn(_))))
+                .filter(|id| self.heap.function(*id).is_some())
                 .collect(),
             _ => return,
         };
-        if let Some(Object::Fn(function)) = self.heap.get_mut(function) {
+        if let Some(function) = self.heap.function_mut(function) {
             function.field_offset = offset;
             function.super_class = superclass;
             function.owner_class = Some(owner);
@@ -2331,8 +2323,8 @@ impl Vm {
         let Some(class_id) = class.as_object() else {
             return Err(RuntimeError::new("Not a class."));
         };
-        let fields = match self.heap.get(class_id) {
-            Some(Object::Class(class)) => class.num_fields.max(0) as usize,
+        let fields = match self.heap.class(class_id) {
+            Some(class) => class.num_fields.max(0) as usize,
             _ => return Err(RuntimeError::new("Not a class.")),
         };
         let id = self.heap.allocate(Object::Instance(ObjInstance {
