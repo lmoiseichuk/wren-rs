@@ -33,9 +33,9 @@ fn interesting() -> Vec<f64> {
         -1e-300,
         1e300,
         -1e300,
-        4503599627370496.0,  // 2^52, the last value with fractional bits
+        4503599627370496.0, // 2^52, the last value with fractional bits
         4503599627370495.5,
-        9007199254740992.0,  // 2^53
+        9007199254740992.0, // 2^53
         f64::MIN_POSITIVE,
         f64::MAX,
         f64::MIN,
@@ -80,7 +80,11 @@ fn trunc_matches_std() {
 #[test]
 fn floor_matches_std() {
     for x in interesting() {
-        assert_eq!(fallback::floor(x).to_bits(), x.floor().to_bits(), "floor({x})");
+        assert_eq!(
+            fallback::floor(x).to_bits(),
+            x.floor().to_bits(),
+            "floor({x})"
+        );
     }
     assert!(fallback::floor(f64::NAN).is_nan());
 }
@@ -111,7 +115,10 @@ fn sqrt_matches_std() {
             continue;
         }
         let ulps = (ours.to_bits() as i64 - theirs.to_bits() as i64).abs();
-        assert!(ulps <= 1, "sqrt({x}) gave {ours}, std gave {theirs}, {ulps} ulps apart");
+        assert!(
+            ulps <= 1,
+            "sqrt({x}) gave {ours}, std gave {theirs}, {ulps} ulps apart"
+        );
     }
 }
 

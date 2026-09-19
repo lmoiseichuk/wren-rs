@@ -325,7 +325,9 @@ pub struct ObjList {
 
 impl ObjList {
     pub fn new() -> ObjList {
-        ObjList { elements: Vec::new() }
+        ObjList {
+            elements: Vec::new(),
+        }
     }
 }
 
@@ -371,7 +373,10 @@ pub struct ObjMap {
 
 impl ObjMap {
     pub fn new() -> ObjMap {
-        ObjMap { entries: Vec::new(), count: 0 }
+        ObjMap {
+            entries: Vec::new(),
+            count: 0,
+        }
     }
 
     /// Is this slot holding a real entry?
@@ -388,10 +393,11 @@ impl ObjMap {
 
     /// Every live entry, in slot order.
     pub fn live(&self) -> impl Iterator<Item = &MapEntry> {
-        self.entries.iter().filter(|entry| !entry.key.is_undefined())
+        self.entries
+            .iter()
+            .filter(|entry| !entry.key.is_undefined())
     }
 }
-
 
 impl Default for ObjMap {
     fn default() -> ObjMap {

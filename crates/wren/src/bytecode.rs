@@ -253,7 +253,12 @@ impl Chunk {
     /// added. Writing it to the file would cost bytes for a table nothing
     /// reads.
     pub fn from_parts(code: Vec<u8>, constants: Vec<Value>, lines: Vec<u16>) -> Chunk {
-        Chunk { code, constants, lookup: BTreeMap::new(), lines }
+        Chunk {
+            code,
+            constants,
+            lookup: BTreeMap::new(),
+            lines,
+        }
     }
 
     pub fn emit_op(&mut self, op: Op, line: u16) {
@@ -375,14 +380,26 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
 
         let mut operand = alloc::string::String::new();
         match op {
-            Op::Constant | Op::LoadModuleVar | Op::StoreModuleVar | Op::MethodInstance
-            | Op::MethodStatic | Op::ImportModule => {
+            Op::Constant
+            | Op::LoadModuleVar
+            | Op::StoreModuleVar
+            | Op::MethodInstance
+            | Op::MethodStatic
+            | Op::ImportModule => {
                 let _ = write!(operand, " {}", chunk.read_short(offset));
                 offset += 2;
             }
-            Op::LoadLocal | Op::StoreLocal | Op::LoadUpvalue | Op::StoreUpvalue
-            | Op::LoadFieldThis | Op::StoreFieldThis | Op::LoadField | Op::StoreField
-            | Op::LoadStaticField | Op::StoreStaticField | Op::Class => {
+            Op::LoadLocal
+            | Op::StoreLocal
+            | Op::LoadUpvalue
+            | Op::StoreUpvalue
+            | Op::LoadFieldThis
+            | Op::StoreFieldThis
+            | Op::LoadField
+            | Op::StoreField
+            | Op::LoadStaticField
+            | Op::StoreStaticField
+            | Op::Class => {
                 let _ = write!(operand, " {}", chunk.code[offset]);
                 offset += 1;
             }
@@ -397,7 +414,12 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                 offset += 2;
             }
             Op::ImportVariable => {
-                let _ = write!(operand, " {} {}", chunk.read_short(offset), chunk.read_short(offset + 2));
+                let _ = write!(
+                    operand,
+                    " {} {}",
+                    chunk.read_short(offset),
+                    chunk.read_short(offset + 2)
+                );
                 offset += 4;
             }
             Op::Call | Op::Super => {

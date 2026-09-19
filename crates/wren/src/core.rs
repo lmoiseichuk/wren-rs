@@ -75,17 +75,14 @@ fn argument(vm: &Vm, at: usize, index: usize) -> Value {
 /// **Wren distinguishes "not a number" from "not an integer"** and the suite
 /// checks both messages, so this cannot collapse into one check. `noun` is the
 /// word the message starts with -- "Index", "Iterator", "Count".
-fn integer_argument(
-    vm: &Vm,
-    at: usize,
-    index: usize,
-    noun: &str,
-) -> Result<f64, RuntimeError> {
+fn integer_argument(vm: &Vm, at: usize, index: usize, noun: &str) -> Result<f64, RuntimeError> {
     let value = argument(vm, at, index)
         .as_num()
         .ok_or_else(|| RuntimeError::new(alloc::format!("{noun} must be a number.")))?;
     if value != math::trunc(value) {
-        return Err(RuntimeError::new(alloc::format!("{noun} must be an integer.")));
+        return Err(RuntimeError::new(alloc::format!(
+            "{noun} must be an integer."
+        )));
     }
     Ok(value)
 }
@@ -215,10 +212,13 @@ fn install_object(vm: &mut Vm) {
 
     // `Object.same(a, b)` is identity, ignoring any `==` a class defines --
     // which is the point of having it.
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Object metaclass")));
-    let object_metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("Object metaclass")));
+    let object_metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(object)) = vm.heap.get_mut(class) {
         object.metaclass = Some(object_metaclass);
     }
@@ -226,12 +226,18 @@ fn install_object(vm: &mut Vm) {
         // **Value types compare by value**, so `Object.same(1..2, 1..2)` is
         // true even though they are two objects. What `same` ignores is any
         // `==` a *class* defines -- not the identity of the built-in values.
-        Ok(Value::bool(values_equal(vm, argument(vm, at, 1), argument(vm, at, 2))))
+        Ok(Value::bool(values_equal(
+            vm,
+            argument(vm, at, 1),
+            argument(vm, at, 2),
+        )))
     });
 
-    define(vm, class, "type", |vm, at| match vm.class_of(receiver(vm, at)) {
-        Some(class) => Ok(Value::object(class)),
-        None => Ok(Value::NULL),
+    define(vm, class, "type", |vm, at| {
+        match vm.class_of(receiver(vm, at)) {
+            Some(class) => Ok(Value::object(class)),
+            None => Ok(Value::NULL),
+        }
     });
 }
 
@@ -257,9 +263,7 @@ fn install_class(vm: &mut Vm) {
         };
         match vm.heap.get(id) {
             // `Object` has no supertype, which is what makes it the root.
-            Some(Object::Class(class)) => Ok(class
-                .superclass
-                .map_or(Value::NULL, Value::object)),
+            Some(Object::Class(class)) => Ok(class.superclass.map_or(Value::NULL, Value::object)),
             _ => Err(RuntimeError::new("Receiver must be a class.")),
         }
     });
@@ -294,10 +298,13 @@ fn install_class(vm: &mut Vm) {
 fn install_fn(vm: &mut Vm) {
     let class = vm.fn_class;
 
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Fn metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("Fn metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(function)) = vm.heap.get_mut(class) {
         function.metaclass = Some(metaclass);
     }
@@ -359,10 +366,13 @@ fn signature_for(name: &str, arity: usize) -> alloc::string::String {
 fn install_fiber(vm: &mut Vm) {
     let class = vm.fiber_class;
 
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Fiber metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("Fiber metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(fiber)) = vm.heap.get_mut(class) {
         fiber.metaclass = Some(metaclass);
     }
@@ -378,9 +388,13 @@ fn install_fiber(vm: &mut Vm) {
         // A fiber's function receives at most the one value it was resumed
         // with, so anything taking more could never be called.
         if vm.arity_of(closure).unwrap_or(0) > 1 {
-            return Err(RuntimeError::new("Function cannot take more than one parameter."));
+            return Err(RuntimeError::new(
+                "Function cannot take more than one parameter.",
+            ));
         }
-        let id = vm.heap.allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
+        let id = vm
+            .heap
+            .allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
         Ok(Value::object(id))
     });
 
@@ -401,25 +415,33 @@ fn install_fiber(vm: &mut Vm) {
         Err(RuntimeError::new(text))
     });
 
-    define(vm, metaclass, "yield()", |vm, _| yield_to_caller(vm, Value::NULL));
+    define(vm, metaclass, "yield()", |vm, _| {
+        yield_to_caller(vm, Value::NULL)
+    });
     define(vm, metaclass, "yield(_)", |vm, at| {
         let value = argument(vm, at, 1);
         yield_to_caller(vm, value)
     });
 
-    define(vm, class, "call()", |vm, at| switch_into(vm, at, Value::NULL, true, false));
+    define(vm, class, "call()", |vm, at| {
+        switch_into(vm, at, Value::NULL, true, false)
+    });
     define(vm, class, "call(_)", |vm, at| {
         let value = argument(vm, at, 1);
         switch_into(vm, at, value, true, false)
     });
-    define(vm, class, "try()", |vm, at| switch_into(vm, at, Value::NULL, true, true));
+    define(vm, class, "try()", |vm, at| {
+        switch_into(vm, at, Value::NULL, true, true)
+    });
     define(vm, class, "try(_)", |vm, at| {
         let value = argument(vm, at, 1);
         switch_into(vm, at, value, true, true)
     });
     // `transfer` does not record a caller, so the fiber it leaves is not
     // resumed when the target finishes -- a jump rather than a call.
-    define(vm, class, "transfer()", |vm, at| switch_into(vm, at, Value::NULL, false, false));
+    define(vm, class, "transfer()", |vm, at| {
+        switch_into(vm, at, Value::NULL, false, false)
+    });
     define(vm, class, "transfer(_)", |vm, at| {
         let value = argument(vm, at, 1);
         switch_into(vm, at, value, false, false)
@@ -488,12 +510,10 @@ fn switch_into(
 
 /// Suspend the running fiber and hand `value` back to whoever resumed it.
 fn yield_to_caller(vm: &mut Vm, value: Value) -> Result<Value, RuntimeError> {
-    let caller = vm
-        .current_fiber
-        .and_then(|id| match vm.heap.get(id) {
-            Some(Object::Fiber(fiber)) => fiber.caller,
-            _ => None,
-        });
+    let caller = vm.current_fiber.and_then(|id| match vm.heap.get(id) {
+        Some(Object::Fiber(fiber)) => fiber.caller,
+        _ => None,
+    });
     let Some(caller) = caller else {
         // **Yielding from the root fiber stops the program.** There is nobody
         // to hand control back to, and upstream treats that as the end of the
@@ -538,13 +558,21 @@ fn install_num(vm: &mut Vm) {
     define(vm, class, "..(_)", |vm, at| {
         let from = receiver(vm, at).as_num().unwrap_or(f64::NAN);
         let to = number_argument(vm, at, 1)?;
-        let id = vm.heap.allocate(Object::Range(ObjRange { from, to, is_inclusive: true }));
+        let id = vm.heap.allocate(Object::Range(ObjRange {
+            from,
+            to,
+            is_inclusive: true,
+        }));
         Ok(Value::object(id))
     });
     define(vm, class, "...(_)", |vm, at| {
         let from = receiver(vm, at).as_num().unwrap_or(f64::NAN);
         let to = number_argument(vm, at, 1)?;
-        let id = vm.heap.allocate(Object::Range(ObjRange { from, to, is_inclusive: false }));
+        let id = vm.heap.allocate(Object::Range(ObjRange {
+            from,
+            to,
+            is_inclusive: false,
+        }));
         Ok(Value::object(id))
     });
 
@@ -571,16 +599,24 @@ fn install_num(vm: &mut Vm) {
         Ok(Value::num(-receiver(vm, at).as_num().unwrap_or(f64::NAN)))
     });
     define(vm, class, "abs", |vm, at| {
-        Ok(Value::num(math::abs(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+        Ok(Value::num(math::abs(
+            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+        )))
     });
     define(vm, class, "floor", |vm, at| {
-        Ok(Value::num(math::floor(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+        Ok(Value::num(math::floor(
+            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+        )))
     });
     define(vm, class, "ceil", |vm, at| {
-        Ok(Value::num(math::ceil(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+        Ok(Value::num(math::ceil(
+            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+        )))
     });
     define(vm, class, "sqrt", |vm, at| {
-        Ok(Value::num(math::sqrt(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+        Ok(Value::num(math::sqrt(
+            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+        )))
     });
     define(vm, class, "toString", |vm, at| {
         let text = vm.to_string(receiver(vm, at));
@@ -590,7 +626,9 @@ fn install_num(vm: &mut Vm) {
 
 fn install_bool(vm: &mut Vm) {
     let class = vm.bool_class;
-    define(vm, class, "!", |vm, at| Ok(Value::bool(receiver(vm, at).is_falsy())));
+    define(vm, class, "!", |vm, at| {
+        Ok(Value::bool(receiver(vm, at).is_falsy()))
+    });
     define(vm, class, "toString", |vm, at| {
         let text = vm.to_string(receiver(vm, at));
         Ok(vm.new_string(&text))
@@ -647,10 +685,18 @@ fn install_string(vm: &mut Vm) {
     define(vm, class, "toString", |vm, at| Ok(receiver(vm, at)));
 
     define(vm, class, "==(_)", |vm, at| {
-        Ok(Value::bool(strings_equal(vm, receiver(vm, at), argument(vm, at, 1))))
+        Ok(Value::bool(strings_equal(
+            vm,
+            receiver(vm, at),
+            argument(vm, at, 1),
+        )))
     });
     define(vm, class, "!=(_)", |vm, at| {
-        Ok(Value::bool(!strings_equal(vm, receiver(vm, at), argument(vm, at, 1))))
+        Ok(Value::bool(!strings_equal(
+            vm,
+            receiver(vm, at),
+            argument(vm, at, 1),
+        )))
     });
 }
 
@@ -697,7 +743,9 @@ fn install_num_extras(vm: &mut Vm) {
     });
 
     define(vm, class, "truncate", |vm, at| {
-        Ok(Value::num(math::trunc(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+        Ok(Value::num(math::trunc(
+            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+        )))
     });
     define(vm, class, "fraction", |vm, at| {
         let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
@@ -724,13 +772,19 @@ fn install_num_extras(vm: &mut Vm) {
     });
     define(vm, class, "isInteger", |vm, at| {
         let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
-        Ok(Value::bool(value.is_finite() && value == math::trunc(value)))
+        Ok(Value::bool(
+            value.is_finite() && value == math::trunc(value),
+        ))
     });
     define(vm, class, "isNan", |vm, at| {
-        Ok(Value::bool(receiver(vm, at).as_num().unwrap_or(0.0).is_nan()))
+        Ok(Value::bool(
+            receiver(vm, at).as_num().unwrap_or(0.0).is_nan(),
+        ))
     });
     define(vm, class, "isInfinity", |vm, at| {
-        Ok(Value::bool(receiver(vm, at).as_num().unwrap_or(0.0).is_infinite()))
+        Ok(Value::bool(
+            receiver(vm, at).as_num().unwrap_or(0.0).is_infinite(),
+        ))
     });
 
     // **Wren's bitwise operators work on 32-bit unsigned values**, so a double
@@ -739,8 +793,12 @@ fn install_num_extras(vm: &mut Vm) {
     define(vm, class, "&(_)", |vm, at| bitwise(vm, at, |a, b| a & b));
     define(vm, class, "|(_)", |vm, at| bitwise(vm, at, |a, b| a | b));
     define(vm, class, "^(_)", |vm, at| bitwise(vm, at, |a, b| a ^ b));
-    define(vm, class, "<<(_)", |vm, at| bitwise(vm, at, |a, b| a.wrapping_shl(b & 31)));
-    define(vm, class, ">>(_)", |vm, at| bitwise(vm, at, |a, b| a.wrapping_shr(b & 31)));
+    define(vm, class, "<<(_)", |vm, at| {
+        bitwise(vm, at, |a, b| a.wrapping_shl(b & 31))
+    });
+    define(vm, class, ">>(_)", |vm, at| {
+        bitwise(vm, at, |a, b| a.wrapping_shr(b & 31))
+    });
     define(vm, class, "~", |vm, at| {
         let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
         Ok(Value::num(!(value as i64 as u32) as f64))
@@ -756,7 +814,9 @@ fn install_num_extras(vm: &mut Vm) {
         use crate::math::real;
 
         define(vm, class, "round", |vm, at| {
-            Ok(Value::num(real::round(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::round(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "pow(_)", |vm, at| {
             let base = receiver(vm, at).as_num().unwrap_or(f64::NAN);
@@ -764,34 +824,54 @@ fn install_num_extras(vm: &mut Vm) {
             Ok(Value::num(real::pow(base, exponent)))
         });
         define(vm, class, "log", |vm, at| {
-            Ok(Value::num(real::ln(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::ln(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "log2", |vm, at| {
-            Ok(Value::num(real::log2(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::log2(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "exp", |vm, at| {
-            Ok(Value::num(real::exp(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::exp(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "cbrt", |vm, at| {
-            Ok(Value::num(real::cbrt(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::cbrt(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "sin", |vm, at| {
-            Ok(Value::num(real::sin(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::sin(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "cos", |vm, at| {
-            Ok(Value::num(real::cos(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::cos(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "tan", |vm, at| {
-            Ok(Value::num(real::tan(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::tan(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "asin", |vm, at| {
-            Ok(Value::num(real::asin(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::asin(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "acos", |vm, at| {
-            Ok(Value::num(real::acos(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::acos(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "atan", |vm, at| {
-            Ok(Value::num(real::atan(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
+            Ok(Value::num(real::atan(
+                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            )))
         });
         define(vm, class, "atan(_)", |vm, at| {
             let y = receiver(vm, at).as_num().unwrap_or(f64::NAN);
@@ -800,10 +880,13 @@ fn install_num_extras(vm: &mut Vm) {
         });
     }
 
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Num metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("Num metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(num)) = vm.heap.get_mut(class) {
         num.metaclass = Some(metaclass);
     }
@@ -814,8 +897,13 @@ fn install_num_extras(vm: &mut Vm) {
             return Ok(Value::NULL);
         }
         // Hexadecimal is written the same way a literal is.
-        let parsed = match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
-            Some(digits) => u64::from_str_radix(digits, 16).ok().map(|value| value as f64),
+        let parsed = match trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
+            Some(digits) => u64::from_str_radix(digits, 16)
+                .ok()
+                .map(|value| value as f64),
             None => trimmed.parse::<f64>().ok(),
         };
         // **Null rather than an error for junk**: the caller asked whether the
@@ -831,14 +919,26 @@ fn install_num_extras(vm: &mut Vm) {
         }
     });
 
-    define(vm, metaclass, "pi", |_, _| Ok(Value::num(core::f64::consts::PI)));
-    define(vm, metaclass, "e", |_, _| Ok(Value::num(core::f64::consts::E)));
-    define(vm, metaclass, "infinity", |_, _| Ok(Value::num(f64::INFINITY)));
+    define(vm, metaclass, "pi", |_, _| {
+        Ok(Value::num(core::f64::consts::PI))
+    });
+    define(vm, metaclass, "e", |_, _| {
+        Ok(Value::num(core::f64::consts::E))
+    });
+    define(vm, metaclass, "infinity", |_, _| {
+        Ok(Value::num(f64::INFINITY))
+    });
     define(vm, metaclass, "nan", |_, _| Ok(Value::num(f64::NAN)));
     define(vm, metaclass, "largest", |_, _| Ok(Value::num(f64::MAX)));
-    define(vm, metaclass, "smallest", |_, _| Ok(Value::num(f64::MIN_POSITIVE)));
-    define(vm, metaclass, "maxSafeInteger", |_, _| Ok(Value::num(9007199254740991.0)));
-    define(vm, metaclass, "minSafeInteger", |_, _| Ok(Value::num(-9007199254740991.0)));
+    define(vm, metaclass, "smallest", |_, _| {
+        Ok(Value::num(f64::MIN_POSITIVE))
+    });
+    define(vm, metaclass, "maxSafeInteger", |_, _| {
+        Ok(Value::num(9007199254740991.0))
+    });
+    define(vm, metaclass, "minSafeInteger", |_, _| {
+        Ok(Value::num(-9007199254740991.0))
+    });
 }
 
 fn bitwise(vm: &Vm, at: usize, operation: fn(u32, u32) -> u32) -> Result<Value, RuntimeError> {
@@ -846,7 +946,9 @@ fn bitwise(vm: &Vm, at: usize, operation: fn(u32, u32) -> u32) -> Result<Value, 
     let right = argument(vm, at, 1)
         .as_num()
         .ok_or_else(|| RuntimeError::new("Right operand must be a number."))?;
-    Ok(Value::num(operation(left as i64 as u32, right as i64 as u32) as f64))
+    Ok(Value::num(
+        operation(left as i64 as u32, right as i64 as u32) as f64,
+    ))
 }
 
 /// The rest of `String`.
@@ -900,7 +1002,9 @@ fn install_string_extras(vm: &mut Vm) {
     define(vm, class, "indexOf(_)", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
         let needle = string_argument(vm, at, 1)?;
-        Ok(Value::num(text.find(&needle).map_or(-1.0, |index| index as f64)))
+        Ok(Value::num(
+            text.find(&needle).map_or(-1.0, |index| index as f64),
+        ))
     });
 
     define(vm, class, "isEmpty", |vm, at| {
@@ -916,7 +1020,11 @@ fn install_string_extras(vm: &mut Vm) {
         // Negative counts from the end, as every other index in the language
         // does. Equal to the length is allowed -- searching an empty tail is a
         // sensible question with the answer -1.
-        let resolved = if start < 0.0 { start + text.len() as f64 } else { start };
+        let resolved = if start < 0.0 {
+            start + text.len() as f64
+        } else {
+            start
+        };
         // The start must be a position *in* the string, so equal to the
         // length is already past the end.
         if resolved < 0.0 || resolved >= text.len() as f64 {
@@ -983,8 +1091,10 @@ fn install_string_extras(vm: &mut Vm) {
         if separator.is_empty() {
             return Err(RuntimeError::new("Separator cannot be empty."));
         }
-        let parts: Vec<alloc::string::String> =
-            text.split(&separator).map(|part| part.to_string()).collect();
+        let parts: Vec<alloc::string::String> = text
+            .split(&separator)
+            .map(|part| part.to_string())
+            .collect();
         let values: Vec<Value> = parts.iter().map(|part| vm.new_string(part)).collect();
         Ok(new_list(vm, values))
     });
@@ -1046,15 +1156,26 @@ fn install_string_extras(vm: &mut Vm) {
         Ok(vm.new_string_bytes(character_bytes(&bytes, index as usize)))
     });
 
-    define(vm, class, "<(_)", |vm, at| compare_strings(vm, at, |o| o < 0));
-    define(vm, class, ">(_)", |vm, at| compare_strings(vm, at, |o| o > 0));
-    define(vm, class, "<=(_)", |vm, at| compare_strings(vm, at, |o| o <= 0));
-    define(vm, class, ">=(_)", |vm, at| compare_strings(vm, at, |o| o >= 0));
+    define(vm, class, "<(_)", |vm, at| {
+        compare_strings(vm, at, |o| o < 0)
+    });
+    define(vm, class, ">(_)", |vm, at| {
+        compare_strings(vm, at, |o| o > 0)
+    });
+    define(vm, class, "<=(_)", |vm, at| {
+        compare_strings(vm, at, |o| o <= 0)
+    });
+    define(vm, class, ">=(_)", |vm, at| {
+        compare_strings(vm, at, |o| o >= 0)
+    });
 
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("String metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("String metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(string)) = vm.heap.get_mut(class) {
         string.metaclass = Some(metaclass);
     }
@@ -1064,10 +1185,14 @@ fn install_string_extras(vm: &mut Vm) {
             return Err(RuntimeError::new("Code point cannot be negative."));
         }
         if point > 0x10ffff as f64 {
-            return Err(RuntimeError::new("Code point cannot be greater than 0x10ffff."));
+            return Err(RuntimeError::new(
+                "Code point cannot be greater than 0x10ffff.",
+            ));
         }
         let Some(character) = char::from_u32(point as u32) else {
-            return Err(RuntimeError::new("Code point cannot be greater than 0x10ffff."));
+            return Err(RuntimeError::new(
+                "Code point cannot be greater than 0x10ffff.",
+            ));
         };
         let text = alloc::string::String::from(character);
         Ok(vm.new_string(&text))
@@ -1075,7 +1200,9 @@ fn install_string_extras(vm: &mut Vm) {
     define(vm, metaclass, "fromByte(_)", |vm, at| {
         let byte = number_argument(vm, at, 1)?;
         if !(0.0..=255.0).contains(&byte) || byte != math::trunc(byte) {
-            return Err(RuntimeError::new("Byte must be an integer between 0 and 255."));
+            return Err(RuntimeError::new(
+                "Byte must be an integer between 0 and 255.",
+            ));
         }
         let id = vm
             .heap
@@ -1084,13 +1211,12 @@ fn install_string_extras(vm: &mut Vm) {
     });
 }
 
-fn compare_strings(
-    vm: &Vm,
-    at: usize,
-    accept: fn(i32) -> bool,
-) -> Result<Value, RuntimeError> {
+fn compare_strings(vm: &Vm, at: usize, accept: fn(i32) -> bool) -> Result<Value, RuntimeError> {
     let left = string_bytes(vm, receiver(vm, at));
-    let right = match argument(vm, at, 1).as_object().and_then(|id| vm.heap.get(id)) {
+    let right = match argument(vm, at, 1)
+        .as_object()
+        .and_then(|id| vm.heap.get(id))
+    {
         Some(Object::String(text)) => text.bytes.clone(),
         _ => return Err(RuntimeError::new("Right operand must be a string.")),
     };
@@ -1127,7 +1253,11 @@ fn string_value_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, Runt
 }
 
 /// An argument that must be a string, with upstream's wording.
-fn string_argument(vm: &Vm, at: usize, index: usize) -> Result<alloc::string::String, RuntimeError> {
+fn string_argument(
+    vm: &Vm,
+    at: usize,
+    index: usize,
+) -> Result<alloc::string::String, RuntimeError> {
     let value = argument(vm, at, index);
     if !vm.is_string(value) {
         return Err(RuntimeError::new("Argument must be a string."));
@@ -1226,8 +1356,9 @@ fn install_string_views(vm: &mut Vm) {
         let bytes = string_bytes(vm, string);
         let index = number_argument(vm, at, 1)?;
         let index = resolve_index(index, bytes.len())?;
-        Ok(Value::num(code_point_at(&bytes, index)
-            .map_or(-1.0, |character| character as u32 as f64)))
+        Ok(Value::num(
+            code_point_at(&bytes, index).map_or(-1.0, |character| character as u32 as f64),
+        ))
     });
     define(vm, class, "iterate(_)", |vm, at| {
         // The same walk `String.iterate` does: one byte on, then past any
@@ -1258,8 +1389,9 @@ fn install_string_views(vm: &mut Vm) {
         let index = integer_argument(vm, at, 1, "Iterator")?;
         let index = resolve_index(index, bytes.len())
             .map_err(|_| RuntimeError::new("Iterator out of bounds."))?;
-        Ok(Value::num(code_point_at(&bytes, index)
-            .map_or(-1.0, |character| character as u32 as f64)))
+        Ok(Value::num(
+            code_point_at(&bytes, index).map_or(-1.0, |character| character as u32 as f64),
+        ))
     });
 }
 
@@ -1461,7 +1593,11 @@ fn install_sequence(vm: &mut Vm) {
     define(vm, class, "take(_)", |vm, at| {
         let count = counting_argument(vm, at, 1)?;
         let class = vm.take_sequence_class;
-        Ok(new_view(vm, class, &[receiver(vm, at), Value::num(count), Value::num(0.0)]))
+        Ok(new_view(
+            vm,
+            class,
+            &[receiver(vm, at), Value::num(count), Value::num(0.0)],
+        ))
     });
     define(vm, class, "skip(_)", |vm, at| {
         let count = counting_argument(vm, at, 1)?;
@@ -1636,16 +1772,17 @@ fn install_list(vm: &mut Vm) {
     // `List` has to be reachable by name, because a list literal compiles to
     // `List.new` followed by an `addCore(_)` per element rather than to an
     // opcode of its own.
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("List metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("List metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(list)) = vm.heap.get_mut(class) {
         list.metaclass = Some(metaclass);
     }
-    define(vm, metaclass, "new()", |vm, _| {
-        Ok(new_list(vm, Vec::new()))
-    });
+    define(vm, metaclass, "new()", |vm, _| Ok(new_list(vm, Vec::new())));
     vm.modules[0].define("List", Value::object(class));
 
     // Like `add(_)`, but returns the *list* rather than the element, so a list
@@ -1777,7 +1914,11 @@ fn install_list_extras(vm: &mut Vm) {
         let length = list_length(vm, list);
         // `insert` accepts one past the end, where the other index-taking
         // methods do not: appending is a legitimate insertion point.
-        let at_index = if index < 0.0 { index + length as f64 + 1.0 } else { index };
+        let at_index = if index < 0.0 {
+            index + length as f64 + 1.0
+        } else {
+            index
+        };
         if at_index < 0.0 || at_index > length as f64 {
             return Err(RuntimeError::new("Index out of bounds."));
         }
@@ -1852,8 +1993,9 @@ fn install_list_extras(vm: &mut Vm) {
     });
 
     define(vm, class, "clear()", |vm, at| {
-        if let Some(Object::List(list)) =
-            receiver(vm, at).as_object().and_then(|id| vm.heap.get_mut(id))
+        if let Some(Object::List(list)) = receiver(vm, at)
+            .as_object()
+            .and_then(|id| vm.heap.get_mut(id))
         {
             list.elements.clear();
         }
@@ -1975,7 +2117,11 @@ fn list_elements(vm: &Vm, list: Value) -> Vec<Value> {
     }
 }
 
-fn join_elements(vm: &mut Vm, list: Value, separator: &str) -> Result<alloc::string::String, RuntimeError> {
+fn join_elements(
+    vm: &mut Vm,
+    list: Value,
+    separator: &str,
+) -> Result<alloc::string::String, RuntimeError> {
     let mut out = alloc::string::String::new();
     for (index, element) in list_elements(vm, list).into_iter().enumerate() {
         if index > 0 {
@@ -2001,7 +2147,11 @@ fn resolve_index(index: f64, length: usize) -> Result<usize, RuntimeError> {
     if index != math::trunc(index) {
         return Err(RuntimeError::new("Index must be an integer."));
     }
-    let resolved = if index < 0.0 { index + length as f64 } else { index };
+    let resolved = if index < 0.0 {
+        index + length as f64
+    } else {
+        index
+    };
     if resolved < 0.0 || resolved >= length as f64 {
         return Err(RuntimeError::new("Index out of bounds."));
     }
@@ -2012,10 +2162,13 @@ fn resolve_index(index: f64, length: usize) -> Result<usize, RuntimeError> {
 fn install_map(vm: &mut Vm) {
     let class = vm.map_class;
 
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Map metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("Map metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(map)) = vm.heap.get_mut(class) {
         map.metaclass = Some(metaclass);
     }
@@ -2073,7 +2226,10 @@ fn install_map(vm: &mut Vm) {
                 // **A tombstone, not an empty slot.** A key that collided with
                 // this one probed past it on the way in; blanking the slot
                 // would end that probe early and lose the key entirely.
-                map.entries[slot] = MapEntry { key: Value::UNDEFINED, value: Value::TRUE };
+                map.entries[slot] = MapEntry {
+                    key: Value::UNDEFINED,
+                    value: Value::TRUE,
+                };
                 map.count -= 1;
                 Ok(removed)
             }
@@ -2082,7 +2238,9 @@ fn install_map(vm: &mut Vm) {
     });
 
     define(vm, class, "clear()", |vm, at| {
-        if let Some(Object::Map(map)) = receiver(vm, at).as_object().and_then(|id| vm.heap.get_mut(id))
+        if let Some(Object::Map(map)) = receiver(vm, at)
+            .as_object()
+            .and_then(|id| vm.heap.get_mut(id))
         {
             map.entries.clear();
             map.count = 0;
@@ -2180,18 +2338,28 @@ fn install_map(vm: &mut Vm) {
             vm.invoke_with(map, "iterate(_)", &[iterator])
         });
     }
-    define(vm, vm.map_key_sequence_class, "iteratorValue(_)", |vm, at| {
-        let map = instance_field(vm, receiver(vm, at), 0);
-        let iterator = argument(vm, at, 1);
-        let entry = vm.invoke_with(map, "iteratorValue(_)", &[iterator])?;
-        Ok(instance_field(vm, entry, 0))
-    });
-    define(vm, vm.map_value_sequence_class, "iteratorValue(_)", |vm, at| {
-        let map = instance_field(vm, receiver(vm, at), 0);
-        let iterator = argument(vm, at, 1);
-        let entry = vm.invoke_with(map, "iteratorValue(_)", &[iterator])?;
-        Ok(instance_field(vm, entry, 1))
-    });
+    define(
+        vm,
+        vm.map_key_sequence_class,
+        "iteratorValue(_)",
+        |vm, at| {
+            let map = instance_field(vm, receiver(vm, at), 0);
+            let iterator = argument(vm, at, 1);
+            let entry = vm.invoke_with(map, "iteratorValue(_)", &[iterator])?;
+            Ok(instance_field(vm, entry, 0))
+        },
+    );
+    define(
+        vm,
+        vm.map_value_sequence_class,
+        "iteratorValue(_)",
+        |vm, at| {
+            let map = instance_field(vm, receiver(vm, at), 0);
+            let iterator = argument(vm, at, 1);
+            let entry = vm.invoke_with(map, "iteratorValue(_)", &[iterator])?;
+            Ok(instance_field(vm, entry, 1))
+        },
+    );
 
     // `MapEntry` itself: two fields, reachable by name.
     let entry_class = vm.map_entry_class;
@@ -2216,8 +2384,12 @@ fn install_map(vm: &mut Vm) {
         Ok(Value::object(id))
     });
 
-    define(vm, entry_class, "key", |vm, at| Ok(instance_field(vm, receiver(vm, at), 0)));
-    define(vm, entry_class, "value", |vm, at| Ok(instance_field(vm, receiver(vm, at), 1)));
+    define(vm, entry_class, "key", |vm, at| {
+        Ok(instance_field(vm, receiver(vm, at), 0))
+    });
+    define(vm, entry_class, "value", |vm, at| {
+        Ok(instance_field(vm, receiver(vm, at), 1))
+    });
     define(vm, entry_class, "toString", |vm, at| {
         let key = instance_field(vm, receiver(vm, at), 0);
         let value = instance_field(vm, receiver(vm, at), 1);
@@ -2261,7 +2433,11 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
         // Hash the bits, folded, so that nearby numbers do not all land in
         // nearby slots. `0.0` and `-0.0` are equal under `==` and must hash
         // alike, so the sign of zero is normalised away first.
-        let bits = if number == 0.0 { 0.0f64.to_bits() } else { number.to_bits() };
+        let bits = if number == 0.0 {
+            0.0f64.to_bits()
+        } else {
+            number.to_bits()
+        };
         return (bits as u32) ^ ((bits >> 32) as u32);
     }
     if value.is_null() {
@@ -2286,7 +2462,10 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
         }
         // A class is identified by which object it is, so its handle is its
         // identity and hashing it is enough.
-        _ => value.as_object().map_or(0, |id| id.raw()).wrapping_mul(2654435761),
+        _ => value
+            .as_object()
+            .map_or(0, |id| id.raw())
+            .wrapping_mul(2654435761),
     }
 }
 
@@ -2331,7 +2510,10 @@ fn grow_map(vm: &mut Vm, id: crate::handle::ObjectId, wanted: usize) {
         Some(Object::Map(map)) => map.entries.clone(),
         _ => return,
     };
-    let empty = MapEntry { key: Value::UNDEFINED, value: Value::FALSE };
+    let empty = MapEntry {
+        key: Value::UNDEFINED,
+        value: Value::FALSE,
+    };
     let mut entries = alloc::vec![empty; capacity];
 
     let mut count = 0;
@@ -2422,10 +2604,14 @@ fn install_range(vm: &mut Vm) {
     let class = vm.range_class;
 
     define(vm, class, "from", |vm, at| {
-        Ok(Value::num(range_of(vm, receiver(vm, at)).map_or(f64::NAN, |r| r.from)))
+        Ok(Value::num(
+            range_of(vm, receiver(vm, at)).map_or(f64::NAN, |r| r.from),
+        ))
     });
     define(vm, class, "to", |vm, at| {
-        Ok(Value::num(range_of(vm, receiver(vm, at)).map_or(f64::NAN, |r| r.to)))
+        Ok(Value::num(
+            range_of(vm, receiver(vm, at)).map_or(f64::NAN, |r| r.to),
+        ))
     });
     define(vm, class, "min", |vm, at| {
         let range = range_of(vm, receiver(vm, at));
@@ -2481,10 +2667,14 @@ fn install_range(vm: &mut Vm) {
 
     // For a range the iterator *is* the value, which is why iterating one
     // allocates nothing at all.
-    define(vm, class, "iteratorValue(_)", |vm, at| Ok(argument(vm, at, 1)));
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        Ok(argument(vm, at, 1))
+    });
 
     define(vm, class, "isInclusive", |vm, at| {
-        Ok(Value::bool(range_of(vm, receiver(vm, at)).is_some_and(|r| r.is_inclusive)))
+        Ok(Value::bool(
+            range_of(vm, receiver(vm, at)).is_some_and(|r| r.is_inclusive),
+        ))
     });
 
     // **All three fields, so `2..5` and `2...5` are different ranges.** They
@@ -2527,7 +2717,11 @@ fn slice_indices(range: &ObjRange, length: usize) -> Result<Vec<usize>, RuntimeE
     // `list[0..-1]` and `list[0...list.count]` copy a list that may be empty:
     // without it, a start equal to the length is out of bounds and the idiom
     // fails on exactly the case it exists for.
-    let end = if range.is_inclusive { -1.0 } else { length as f64 };
+    let end = if range.is_inclusive {
+        -1.0
+    } else {
+        length as f64
+    };
     if range.from == length as f64 && range.to == end {
         return Ok(Vec::new());
     }
@@ -2536,7 +2730,11 @@ fn slice_indices(range: &ObjRange, length: usize) -> Result<Vec<usize>, RuntimeE
         if value != math::trunc(value) {
             return Err(RuntimeError::new("Range start must be an integer."));
         }
-        let resolved = if value < 0.0 { value + length as f64 } else { value };
+        let resolved = if value < 0.0 {
+            value + length as f64
+        } else {
+            value
+        };
         Ok(resolved as isize)
     };
 
@@ -2589,12 +2787,17 @@ fn range_of(vm: &Vm, value: Value) -> Option<ObjRange> {
 
 /// `System`, and the metaclass that holds its static methods.
 fn install_system(vm: &mut Vm) {
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("System metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("System metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
 
-    let name = vm.heap.allocate(Object::String(ObjString::from_text("System")));
+    let name = vm
+        .heap
+        .allocate(Object::String(ObjString::from_text("System")));
     let mut class = ObjClass::new(name, None);
     class.metaclass = Some(metaclass);
     let system = vm.heap.allocate(Object::Class(Box::new(class)));
@@ -2678,7 +2881,10 @@ fn install_system(vm: &mut Vm) {
         ("MapValueSequence", vm.map_value_sequence_class),
         ("ClassAttributes", vm.class_attributes_class),
         ("StringByteSequence", vm.string_byte_sequence_class),
-        ("StringCodePointSequence", vm.string_code_point_sequence_class),
+        (
+            "StringCodePointSequence",
+            vm.string_code_point_sequence_class,
+        ),
         ("String", vm.string_class),
     ] {
         vm.modules[0].define(name, Value::object(class));
@@ -2697,10 +2903,22 @@ fn install_metaclasses(vm: &mut Vm) {
     // without one is what makes `Class.type == Class` and the chain of
     // `.type.type.type` settle rather than growing a new metaclass each step.
     let classes = [
-        vm.object_class, vm.bool_class, vm.fiber_class, vm.fn_class,
-        vm.list_class, vm.map_class, vm.map_entry_class, vm.null_class, vm.num_class,
-        vm.range_class, vm.string_class, vm.sequence_class, vm.map_sequence_class,
-        vm.where_sequence_class, vm.take_sequence_class, vm.skip_sequence_class,
+        vm.object_class,
+        vm.bool_class,
+        vm.fiber_class,
+        vm.fn_class,
+        vm.list_class,
+        vm.map_class,
+        vm.map_entry_class,
+        vm.null_class,
+        vm.num_class,
+        vm.range_class,
+        vm.string_class,
+        vm.sequence_class,
+        vm.map_sequence_class,
+        vm.where_sequence_class,
+        vm.take_sequence_class,
+        vm.skip_sequence_class,
     ];
     for class in classes {
         let existing = match vm.heap.get(class) {
@@ -2718,9 +2936,11 @@ fn install_metaclasses(vm: &mut Vm) {
             Some(Object::String(text)) => text.as_str().unwrap_or("?").to_string(),
             _ => "?".to_string(),
         };
-        let metaclass_name = vm
-            .heap
-            .allocate(Object::String(ObjString::from_text(&alloc::format!("{text} metaclass"))));
+        let metaclass_name =
+            vm.heap
+                .allocate(Object::String(ObjString::from_text(&alloc::format!(
+                    "{text} metaclass"
+                ))));
         let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
             metaclass_name,
             Some(vm.class_class),
@@ -2739,15 +2959,21 @@ fn install_metaclasses(vm: &mut Vm) {
 /// into one each, and the wrapper's error messages are kept because they are
 /// what a program sees.
 pub fn install_meta(vm: &mut Vm) -> usize {
-    let name = vm.heap.allocate(Object::String(ObjString::from_text("Meta")));
-    let class = vm
+    let name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(name, Some(vm.object_class)))));
+        .allocate(Object::String(ObjString::from_text("Meta")));
+    let class = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        name,
+        Some(vm.object_class),
+    ))));
 
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Meta metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("Meta metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(meta)) = vm.heap.get_mut(class) {
         meta.metaclass = Some(metaclass);
     }
@@ -2806,9 +3032,12 @@ pub fn install_meta(vm: &mut Vm) -> usize {
             owner_class: None,
             module,
         })));
-        let closure = vm.heap.allocate(Object::Closure(Box::new(
-            crate::object::ObjClosure { function, upvalues: Vec::new() },
-        )));
+        let closure = vm
+            .heap
+            .allocate(Object::Closure(Box::new(crate::object::ObjClosure {
+                function,
+                upvalues: Vec::new(),
+            })));
 
         let base = vm.stack.len();
         vm.stack.push(Value::object(closure));
@@ -2823,7 +3052,8 @@ pub fn install_meta(vm: &mut Vm) -> usize {
     module.define("Meta", Value::object(class));
     vm.modules.push(module);
     let index = vm.modules.len() - 1;
-    vm.module_index.insert(alloc::string::String::from("meta"), index);
+    vm.module_index
+        .insert(alloc::string::String::from("meta"), index);
     index
 }
 
@@ -2840,15 +3070,21 @@ pub fn install_meta(vm: &mut Vm) -> usize {
 /// would buy nothing. If a program ever needs to reproduce upstream's stream
 /// from a seed, that is the point at which WELL512a becomes worth writing.
 pub fn install_random(vm: &mut Vm) -> usize {
-    let name = vm.heap.allocate(Object::String(ObjString::from_text("Random")));
-    let class = vm
+    let name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(name, Some(vm.object_class)))));
+        .allocate(Object::String(ObjString::from_text("Random")));
+    let class = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        name,
+        Some(vm.object_class),
+    ))));
 
-    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Random metaclass")));
-    let metaclass = vm
+    let metaclass_name = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+        .allocate(Object::String(ObjString::from_text("Random metaclass")));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
     if let Some(Object::Class(random)) = vm.heap.get_mut(class) {
         random.metaclass = Some(metaclass);
         // Four `u32` words of state, each exactly representable as an `f64`.
@@ -2879,9 +3115,7 @@ pub fn install_random(vm: &mut Vm) -> usize {
                     // so two equal sequences would seed differently -- which
                     // defeats the point of seeding from one.
                     let Some(number) = element.as_num() else {
-                        return Err(RuntimeError::new(
-                            "Sequence elements must all be numbers.",
-                        ));
+                        return Err(RuntimeError::new("Sequence elements must all be numbers."));
                     };
                     seed = seed.wrapping_mul(31).wrapping_add(number as i64 as u32);
                 }
@@ -2985,7 +3219,8 @@ pub fn install_random(vm: &mut Vm) -> usize {
     module.define("Random", Value::object(class));
     vm.modules.push(module);
     let index = vm.modules.len() - 1;
-    vm.module_index.insert(alloc::string::String::from("random"), index);
+    vm.module_index
+        .insert(alloc::string::String::from("random"), index);
     index
 }
 
@@ -3004,7 +3239,9 @@ fn new_random(vm: &mut Vm, class: crate::handle::ObjectId, seed: u32) -> Value {
         step(&mut state);
     }
     let fields = state.iter().map(|word| Value::num(*word as f64)).collect();
-    let id = vm.heap.allocate(Object::Instance(ObjInstance { class, fields }));
+    let id = vm
+        .heap
+        .allocate(Object::Instance(ObjInstance { class, fields }));
     Value::object(id)
 }
 
@@ -3021,12 +3258,19 @@ fn step(state: &mut [u32; 4]) -> u32 {
 }
 
 fn next_u32(vm: &mut Vm, receiver: Value) -> u32 {
-    let Some(id) = receiver.as_object() else { return 0 };
+    let Some(id) = receiver.as_object() else {
+        return 0;
+    };
     let mut state = [0u32; 4];
     match vm.heap.get(id) {
         Some(Object::Instance(instance)) => {
             for (slot, word) in state.iter_mut().enumerate() {
-                *word = instance.fields.get(slot).copied().and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+                *word = instance
+                    .fields
+                    .get(slot)
+                    .copied()
+                    .and_then(|v| v.as_num())
+                    .unwrap_or(0.0) as u32;
             }
         }
         _ => return 0,

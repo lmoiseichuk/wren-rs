@@ -143,6 +143,22 @@ impl Heap {
         self.slots.get_mut(id.raw() as usize)?.as_mut()
     }
 
+    /// Every live handle, in allocation order.
+    ///
+    /// **Not a traversal the running VM does.** This exists for the one-off
+    /// passes that have to see the whole heap -- flattening the class
+    /// hierarchy after the core library is installed, and diagnostics. The
+    /// collector does not use it: it walks from roots, which is the point of
+    /// having roots.
+    pub fn ids(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            if slot.is_none() {
+                return None;
+            }
+            Some(ObjectId::new(index as u32))
+        })
+    }
+
     /// Is the live set big enough that collecting is worth it?
     ///
     /// The VM asks this between instructions, where its roots are well defined,
@@ -225,7 +241,11 @@ impl Heap {
         self.threshold = (bytes * GROWTH_NUMERATOR / GROWTH_DENOMINATOR).max(INITIAL_THRESHOLD);
         self.collections += 1;
 
-        Collection { before, after: live, bytes_after: bytes }
+        Collection {
+            before,
+            after: live,
+            bytes_after: bytes,
+        }
     }
 
     fn is_marked(&self, index: usize) -> bool {

@@ -49,8 +49,10 @@ fn keywords_are_not_names() {
     use TokenKind::*;
     assert_eq!(
         kinds("class Foo is Bar { construct new() { super() } }"),
-        [Class, Name, Is, Name, LeftBrace, Construct, Name, LeftParen, RightParen,
-         LeftBrace, Super, LeftParen, RightParen, RightBrace, RightBrace]
+        [
+            Class, Name, Is, Name, LeftBrace, Construct, Name, LeftParen, RightParen, LeftBrace,
+            Super, LeftParen, RightParen, RightBrace, RightBrace
+        ]
     );
 }
 
@@ -99,7 +101,10 @@ fn a_line_number_survives_comments_and_strings() {
 fn block_comments_nest() {
     // The reason block comments exist is to comment out a region, and regions
     // contain comments. A scan for the first `*/` gets this wrong.
-    assert_eq!(kinds("a /* outer /* inner */ still outer */ b"), [TokenKind::Name; 2]);
+    assert_eq!(
+        kinds("a /* outer /* inner */ still outer */ b"),
+        [TokenKind::Name; 2]
+    );
 }
 
 #[test]
@@ -152,7 +157,11 @@ fn fields_are_distinguished_by_their_underscores() {
     use TokenKind::*;
     assert_eq!(
         spans("_field __static plain"),
-        [(Field, "_field".into()), (StaticField, "__static".into()), (Name, "plain".into())]
+        [
+            (Field, "_field".into()),
+            (StaticField, "__static".into()),
+            (Name, "plain".into())
+        ]
     );
 }
 
@@ -205,7 +214,11 @@ fn interpolation_splits_a_string_around_its_expression() {
     // `"a%(b)c"` is the pieces `a`, the expression `b`, and the rest `c`.
     assert_eq!(
         spans(r#""a%(b)c""#),
-        [(Interpolation, "a".into()), (Name, "b".into()), (String, "c".into())]
+        [
+            (Interpolation, "a".into()),
+            (Name, "b".into()),
+            (String, "c".into())
+        ]
     );
 }
 
@@ -230,10 +243,7 @@ fn interpolation_holds_parentheses_inside_the_expression() {
 fn interpolation_nests() {
     use TokenKind::*;
     let kinds = kinds(r#""a%("b%(c)d")e""#);
-    assert_eq!(
-        kinds,
-        [Interpolation, Interpolation, Name, String, String]
-    );
+    assert_eq!(kinds, [Interpolation, Interpolation, Name, String, String]);
 }
 
 #[test]
@@ -265,10 +275,40 @@ fn every_operator_lexes_to_its_own_kind() {
     assert_eq!(
         kinds("( ) [ ] { } : , . .. ... * / % # + - << >> | || ^ & && ! ~ ? = < > <= >= == !="),
         [
-            LeftParen, RightParen, LeftBracket, RightBracket, LeftBrace, RightBrace,
-            Colon, Comma, Dot, DotDot, DotDotDot, Star, Slash, Percent, Hash,
-            Plus, Minus, LtLt, GtGt, Pipe, PipePipe, Caret, Amp, AmpAmp,
-            Bang, Tilde, Question, Eq, Lt, Gt, LtEq, GtEq, EqEq, BangEq,
+            LeftParen,
+            RightParen,
+            LeftBracket,
+            RightBracket,
+            LeftBrace,
+            RightBrace,
+            Colon,
+            Comma,
+            Dot,
+            DotDot,
+            DotDotDot,
+            Star,
+            Slash,
+            Percent,
+            Hash,
+            Plus,
+            Minus,
+            LtLt,
+            GtGt,
+            Pipe,
+            PipePipe,
+            Caret,
+            Amp,
+            AmpAmp,
+            Bang,
+            Tilde,
+            Question,
+            Eq,
+            Lt,
+            Gt,
+            LtEq,
+            GtEq,
+            EqEq,
+            BangEq,
         ]
     );
 }
@@ -327,5 +367,8 @@ System.print("sum is %(t.sum)")
         }
         count += 1;
     }
-    assert!(count > 100, "expected a substantial token stream, got {count}");
+    assert!(
+        count > 100,
+        "expected a substantial token stream, got {count}"
+    );
 }

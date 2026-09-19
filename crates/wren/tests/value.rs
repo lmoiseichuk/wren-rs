@@ -10,7 +10,16 @@ use wren::Value;
 
 #[test]
 fn numbers_survive_a_round_trip() {
-    for number in [0.0, -0.0, 1.0, -1.0, core::f64::consts::PI, 1e300, -1e300, 1e-300] {
+    for number in [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        core::f64::consts::PI,
+        1e300,
+        -1e300,
+        1e-300,
+    ] {
         let value = Value::num(number);
         assert!(value.is_num(), "{number} should be a number");
         assert_eq!(value.as_num(), Some(number));
@@ -65,7 +74,10 @@ fn every_flavour_of_nan_stays_a_number() {
         let bits = 0x7ff0_0000_0000_0000u64 | (1u64 << shift);
         let number = f64::from_bits(bits);
         assert!(number.is_nan(), "0x{bits:016x} should be NaN");
-        assert!(Value::num(number).is_num(), "0x{bits:016x} should read as a number");
+        assert!(
+            Value::num(number).is_num(),
+            "0x{bits:016x} should read as a number"
+        );
     }
 }
 
@@ -152,5 +164,8 @@ fn debug_says_what_it_is() {
     assert_eq!(format!("{:?}", Value::TRUE), "True");
     assert_eq!(format!("{:?}", Value::FALSE), "False");
     assert_eq!(format!("{:?}", Value::UNDEFINED), "Undefined");
-    assert_eq!(format!("{:?}", Value::object(ObjectId::new(3))), "Object(3)");
+    assert_eq!(
+        format!("{:?}", Value::object(ObjectId::new(3))),
+        "Object(3)"
+    );
 }

@@ -44,7 +44,10 @@ impl RuntimeError {
         // The line is filled in by the interpreter loop, which is the only
         // place that knows where it is. A primitive raising an error does not
         // have to thread one through.
-        RuntimeError { message: message.into(), line: 0 }
+        RuntimeError {
+            message: message.into(),
+            line: 0,
+        }
     }
 }
 
@@ -101,11 +104,19 @@ const _: () = ();
 
 /// One call in progress.
 ///
-/// `Copy`, which is what lets the interpreter take a frame out of the stack to
-/// read its fields without borrowing `self` for the rest of the expression.
-/// Three words is cheap enough that the alternative -- a borrow that conflicts
-/// with the next `self.stack.push` -- is not worth arguing with.
-#[derive(Debug, Clone, Copy)]
+/// **The frame carries its own code and module**, which is the difference
+/// between a return costing a field read and a return costing four heap
+/// lookups. Resuming a caller needs its chunk and the module its variables
+/// resolve against; both are reachable from `closure`, but only by going
+/// closure -> function -> chunk through the heap table, twice, on every single
+/// return. Storing them costs two words per frame and a refcount bump per
+/// call, and removes that walk from the hot path entirely.
+///
+/// It used to be `Copy`, so the interpreter could lift a frame out of the
+/// stack without borrowing `self`. An `Rc` makes that impossible, so the
+/// handful of sites that did it read the fields they need through a borrow
+/// that ends in the same statement instead.
+#[derive(Debug, Clone)]
 pub struct Frame {
     pub closure: ObjectId,
     /// Where to resume. Only written when this frame stops being the running
@@ -114,6 +125,30 @@ pub struct Frame {
     /// The stack slot holding the receiver. Local slot *n* is `base + n`, and
     /// slot 0 is `this`.
     pub base: usize,
+    /// The code this frame runs, so resuming it does not have to find it again.
+    pub chunk: Rc<Chunk>,
+    /// The module this frame's code resolves its variables against.
+    pub module: usize,
+    /// Where this method's own fields start in its receiver.
+    ///
+    /// **Read on every field access**, which is why it is here rather than
+    /// fetched. A method defined on a subclass sees its fields after the ones
+    /// its superclass declared, so the offset is a property of the function
+    /// and fixed for as long as the frame runs. Finding it used to mean
+    /// walking closure -> function through the heap for each `x` and each
+    /// `x = ...`; a `u16` on the frame makes it a field read. Wren caps a
+    /// class at 255 fields, so the width is not a limit anyone can reach.
+    pub field_offset: u16,
+}
+
+/// What entering a call needs from the closure it is entering.
+///
+/// See [`Vm::call_target`], which fills it in with a single walk of the heap.
+struct CallTarget {
+    chunk: Rc<Chunk>,
+    arity: usize,
+    module: usize,
+    field_offset: u16,
 }
 
 /// A request from a primitive to continue in a different fiber.
@@ -156,7 +191,11 @@ impl Default for Module {
 
 impl Module {
     pub fn new() -> Module {
-        Module { name: String::new(), names: SymbolTable::new(), values: Vec::new() }
+        Module {
+            name: String::new(),
+            names: SymbolTable::new(),
+            values: Vec::new(),
+        }
     }
 
     /// The value of a variable by name.
@@ -399,6 +438,9 @@ impl Vm {
         }
 
         core::install(&mut vm);
+        // **Only now.** The classes above were created empty and populated by
+        // `install`, so flattening any earlier would have copied nothing.
+        vm.flatten_class_hierarchy();
         vm.core_variables = vm.modules[0].values.len();
 
         // On a host there is an obvious clock and no reason to make every
@@ -420,8 +462,10 @@ impl Vm {
     /// [`Vm::run_closure`] with a loaded closure instead.
     #[cfg(feature = "compiler")]
     pub fn interpret(&mut self, source: &str) -> Result<(), WrenError> {
-        let chunk = compiler::compile(self, source)
-            .map_err(|error| WrenError::Compile { message: error.message, line: error.line })?;
+        let chunk = compiler::compile(self, source).map_err(|error| WrenError::Compile {
+            message: error.message,
+            line: error.line,
+        })?;
         self.run(Rc::new(chunk)).map_err(WrenError::Runtime)
     }
 
@@ -472,17 +516,27 @@ impl Vm {
         // source to find, and a firmware with no loader at all should still be
         // able to `import "random"`.
         if name == "random" {
-            return Ok((core::install_random(self), None));
+            let index = core::install_random(self);
+            // `random` brings a class and a metaclass with it, neither of
+            // which existed when the hierarchy was last flattened.
+            self.flatten_class_hierarchy();
+            return Ok((index, None));
         }
         if name == "meta" {
-            return Ok((core::install_meta(self), None));
+            let index = core::install_meta(self);
+            self.flatten_class_hierarchy();
+            return Ok((index, None));
         }
 
         let Some(loader) = self.module_loader.as_ref() else {
-            return Err(RuntimeError::new(format!("Could not load module '{name}'.")));
+            return Err(RuntimeError::new(format!(
+                "Could not load module '{name}'."
+            )));
         };
         let Some(source) = loader(name) else {
-            return Err(RuntimeError::new(format!("Could not load module '{name}'.")));
+            return Err(RuntimeError::new(format!(
+                "Could not load module '{name}'."
+            )));
         };
 
         // A fresh namespace seeded with the core library.
@@ -579,24 +633,108 @@ impl Vm {
         }
     }
 
-    /// Find a method, walking up the superclass chain.
+    /// Find a method. **One array index, no chain walk.**
+    ///
+    /// Every class's table already holds its inherited methods, copied down
+    /// when the class was created -- see [`Vm::inherit_methods`]. So this is a
+    /// bounds check and a load, whatever the depth of the hierarchy, which is
+    /// what upstream does and why its dispatch is quick.
+    ///
+    /// The chain is still walked for `is` and for `super`, which are about the
+    /// hierarchy rather than about finding a method in it.
     fn find_method(&self, class: ObjectId, symbol: usize) -> Option<Method> {
-        let mut current = Some(class);
-        while let Some(id) = current {
-            let Some(Object::Class(class)) = self.heap.get(id) else {
-                return None;
-            };
-            if let Some(method) = class.method(symbol) {
-                return Some(method);
-            }
-            current = class.superclass;
+        match self.heap.get(class) {
+            Some(Object::Class(class)) => class.method(symbol),
+            _ => None,
         }
-        None
+    }
+
+    /// Copy `parent`'s methods into `child`, for the ones `child` has not
+    /// defined itself.
+    ///
+    /// **This is what makes dispatch a single index**, and it is upstream's
+    /// `bindSuperclass` under another name. It works because a Wren class is
+    /// closed: methods are bound when the class body runs and nothing can add
+    /// one afterwards, so a copy taken at creation cannot go stale. A language
+    /// that allowed reopening a class would have to invalidate these instead,
+    /// and would probably be better off walking the chain.
+    ///
+    /// The `is_none` guard is what makes an override win. It matters for the
+    /// core classes, which are populated before they are flattened and so
+    /// already hold their own definitions of things like `toString`.
+    fn inherit_methods(&mut self, child: ObjectId, parent: ObjectId) {
+        let inherited = match self.heap.get(parent) {
+            Some(Object::Class(parent)) => parent.methods.clone(),
+            _ => return,
+        };
+        let Some(Object::Class(child)) = self.heap.get_mut(child) else {
+            return;
+        };
+        if child.methods.len() < inherited.len() {
+            child.methods.resize(inherited.len(), None);
+        }
+        for (symbol, method) in inherited.iter().enumerate() {
+            if child.methods[symbol].is_none() {
+                child.methods[symbol] = *method;
+            }
+        }
+    }
+
+    /// Flatten every class in the heap, parents before children.
+    ///
+    /// Run once after the core library is installed, and again after a lazily
+    /// built module -- `random`, `meta` -- adds classes. Classes made by
+    /// running Wren code do not need it: [`Vm::make_class`] copies from the
+    /// superclass at creation, by which time the superclass is already flat.
+    ///
+    /// Sorting by depth is what lets one pass do it. A child flattened after
+    /// its parent inherits the parent's *complete* table, ancestors included,
+    /// so nothing has to be visited twice.
+    fn flatten_class_hierarchy(&mut self) {
+        let mut classes: Vec<(usize, ObjectId)> = Vec::new();
+        for id in self.heap.ids() {
+            if !matches!(self.heap.get(id), Some(Object::Class(_))) {
+                continue;
+            }
+            // Depth is counted with a step limit rather than trusted: a cycle
+            // here would hang the VM at start-up, which is the worst place to
+            // find out that a superclass was wired up wrongly.
+            let mut depth = 0;
+            let mut current = match self.heap.get(id) {
+                Some(Object::Class(class)) => class.superclass,
+                _ => None,
+            };
+            while let Some(parent) = current {
+                depth += 1;
+                if depth > 64 {
+                    break;
+                }
+                current = match self.heap.get(parent) {
+                    Some(Object::Class(parent)) => parent.superclass,
+                    _ => None,
+                };
+            }
+            classes.push((depth, id));
+        }
+        classes.sort_by_key(|(depth, _)| *depth);
+
+        for (_, id) in classes {
+            let parent = match self.heap.get(id) {
+                Some(Object::Class(class)) => class.superclass,
+                _ => None,
+            };
+            if let Some(parent) = parent {
+                self.inherit_methods(id, parent);
+            }
+        }
     }
 
     /// Allocate a string and return a value referring to it.
     pub fn new_string(&mut self, text: &str) -> Value {
-        Value::object(self.heap.allocate(Object::String(ObjString::from_text(text))))
+        Value::object(
+            self.heap
+                .allocate(Object::String(ObjString::from_text(text))),
+        )
     }
 
     /// Build the `ClassAttributes` pair a class's attributes come back as.
@@ -721,28 +859,51 @@ impl Vm {
         if self.frames.len() >= MAX_FRAMES {
             return Err(RuntimeError::new("Stack overflow."));
         }
-        let chunk = self.chunk_of(closure)?;
-        self.frames.push(Frame { closure, ip: 0, base });
-        Ok(chunk)
+        let target = self.call_target(closure)?;
+        self.frames.push(Frame {
+            closure,
+            ip: 0,
+            base,
+            chunk: target.chunk.clone(),
+            module: target.module,
+            field_offset: target.field_offset,
+        });
+        Ok(target.chunk)
     }
 
-    /// The code a closure runs.
+    /// Everything entering a call needs from a closure, found in **one** walk.
     ///
-    /// Returns an `Rc` clone rather than a reference, and that is the point of
-    /// storing chunks behind an `Rc` at all. A `&Chunk` borrowed out of the
-    /// heap would be a live immutable borrow of `self` for as long as the call
-    /// runs -- and the very next instruction pushes onto `self.stack`. The
-    /// choices were an `Rc` clone once per call, `unsafe` to sever the borrow,
-    /// or copying the whole chunk per call. A refcount bump per *call* (not per
-    /// instruction) is the cheapest of the three by a wide margin.
-    fn chunk_of(&self, closure: ObjectId) -> Result<Rc<Chunk>, RuntimeError> {
+    /// This is the fix for the indirection the design note complained about.
+    /// Making the call used to ask the heap for the same two objects three
+    /// times over: `function_of` for the arity, `chunk_of` for the code, and
+    /// `module_of` for the namespace -- six table lookups, each a bounds check
+    /// and an enum match, to read three fields that sit beside each other in
+    /// the same `ObjFn`. Now it is two lookups and three field reads.
+    ///
+    /// It is a struct rather than a tuple because the caller assigns the
+    /// fields into the interpreter's hoisted locals, and `target.module` is
+    /// much harder to get wrong there than `.2`.
+    ///
+    /// **Why the chunk is an `Rc` clone and not a reference.** A `&Chunk`
+    /// borrowed out of the heap would be a live immutable borrow of `self` for
+    /// as long as the call runs -- and the very next instruction pushes onto
+    /// `self.stack`. The choices were an `Rc` clone once per call, `unsafe` to
+    /// sever the borrow, or copying the whole chunk per call. A refcount bump
+    /// per *call* -- not per instruction -- is the cheapest of the three by a
+    /// wide margin.
+    fn call_target(&self, closure: ObjectId) -> Result<CallTarget, RuntimeError> {
         let Some(Object::Closure(closure)) = self.heap.get(closure) else {
             return Err(RuntimeError::new("Not a closure."));
         };
         let Some(Object::Fn(function)) = self.heap.get(closure.function) else {
             return Err(RuntimeError::new("Closure has no function."));
         };
-        Ok(function.chunk.clone())
+        Ok(CallTarget {
+            chunk: function.chunk.clone(),
+            arity: function.arity,
+            module: function.module,
+            field_offset: function.field_offset as u16,
+        })
     }
 
     /// How many arguments a closure takes.
@@ -752,7 +913,8 @@ impl Vm {
 
     /// Which module a closure's code resolves its variables against.
     fn module_of(&self, closure: ObjectId) -> usize {
-        self.function_of(closure).map_or(0, |function| function.module)
+        self.function_of(closure)
+            .map_or(0, |function| function.module)
     }
 
     /// The module of whatever frame is on top.
@@ -785,9 +947,10 @@ impl Vm {
                 }
             }
         }
-        let id = self
-            .heap
-            .allocate(Object::Upvalue(ObjUpvalue { slot, closed: Value::UNDEFINED }));
+        let id = self.heap.allocate(Object::Upvalue(ObjUpvalue {
+            slot,
+            closed: Value::UNDEFINED,
+        }));
         self.open_upvalues.push(id);
         id
     }
@@ -853,13 +1016,28 @@ impl Vm {
         // stopped mentioning them by name, and freeing `Num` mid-program would
         // be spectacular.
         for class in [
-            self.num_class, self.bool_class, self.null_class, self.string_class,
-            self.list_class, self.map_class, self.range_class, self.class_class,
-            self.object_class, self.fn_class, self.map_entry_class, self.fiber_class,
-            self.random_class, self.sequence_class, self.map_sequence_class,
-            self.where_sequence_class, self.take_sequence_class, self.skip_sequence_class,
-            self.map_key_sequence_class, self.map_value_sequence_class,
-            self.class_attributes_class, self.string_byte_sequence_class,
+            self.num_class,
+            self.bool_class,
+            self.null_class,
+            self.string_class,
+            self.list_class,
+            self.map_class,
+            self.range_class,
+            self.class_class,
+            self.object_class,
+            self.fn_class,
+            self.map_entry_class,
+            self.fiber_class,
+            self.random_class,
+            self.sequence_class,
+            self.map_sequence_class,
+            self.where_sequence_class,
+            self.take_sequence_class,
+            self.skip_sequence_class,
+            self.map_key_sequence_class,
+            self.map_value_sequence_class,
+            self.class_attributes_class,
+            self.string_byte_sequence_class,
             self.string_code_point_sequence_class,
         ] {
             roots.push(Value::object(class));
@@ -949,7 +1127,15 @@ impl Vm {
             if arity > 0 {
                 stack.push(value);
             }
-            frames.push(Frame { closure: entry, ip: 0, base: 0 });
+            let target = self.call_target(entry)?;
+            frames.push(Frame {
+                closure: entry,
+                ip: 0,
+                base: 0,
+                chunk: target.chunk,
+                module: target.module,
+                field_offset: target.field_offset,
+            });
         } else {
             // Resuming it: the value is the result of the `yield` that
             // suspended it, and the call that yielded is waiting for exactly
@@ -988,7 +1174,9 @@ impl Vm {
     fn catcher(&self) -> Option<ObjectId> {
         let mut current = self.current_fiber;
         while let Some(id) = current {
-            let Some(Object::Fiber(fiber)) = self.heap.get(id) else { return None };
+            let Some(Object::Fiber(fiber)) = self.heap.get(id) else {
+                return None;
+            };
             if fiber.catching {
                 return fiber.caller;
             }
@@ -1045,7 +1233,11 @@ impl Vm {
     /// block: `list.map { ... }` has to actually run the block once per
     /// element. The receiver slot holds the function itself, which is what a
     /// closure's slot zero is.
-    pub fn call_function(&mut self, function: Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    pub fn call_function(
+        &mut self,
+        function: Value,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
         let Some(closure) = function.as_object() else {
             return Err(RuntimeError::new("Argument must be a function."));
         };
@@ -1088,7 +1280,9 @@ impl Vm {
     /// does after the parse, and nothing it does before.
     pub fn run_closure(&mut self, closure: ObjectId) -> Result<(), RuntimeError> {
         if self.current_fiber.is_none() {
-            let root = self.heap.allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
+            let root = self
+                .heap
+                .allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
             self.current_fiber = Some(root);
             self.root_fiber = Some(root);
         }
@@ -1116,15 +1310,18 @@ impl Vm {
             owner_class: None,
             module,
         })));
-        let closure = self
-            .heap
-            .allocate(Object::Closure(Box::new(ObjClosure { function, upvalues: Vec::new() })));
+        let closure = self.heap.allocate(Object::Closure(Box::new(ObjClosure {
+            function,
+            upvalues: Vec::new(),
+        })));
 
         // The module runs in a root fiber, so that `Fiber.yield` at the top
         // level has something to complain about and `Fiber.current` has an
         // answer.
         if self.current_fiber.is_none() {
-            let root = self.heap.allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
+            let root = self
+                .heap
+                .allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
             self.current_fiber = Some(root);
             self.root_fiber = Some(root);
         }
@@ -1162,7 +1359,10 @@ impl Vm {
             ip += 1;
 
             let Some(op) = Op::from_byte(byte) else {
-                return Err(RuntimeError { message: format!("bad opcode {byte}"), line });
+                return Err(RuntimeError {
+                    message: format!("bad opcode {byte}"),
+                    line,
+                });
             };
 
             match op {
@@ -1391,35 +1591,51 @@ impl Vm {
                                         None => unreachable!("deliver_error returns or switches"),
                                     }
                                 }
-                                let frame = *self.frames.last().expect("a frame to resume");
+                                let frame = self.frames.last().expect("a frame to resume");
                                 ip = frame.ip;
                                 base = frame.base;
-                                chunk = self.chunk_of(frame.closure)?;
-                                module = self.module_of(frame.closure);
+                                chunk = frame.chunk.clone();
+                                module = frame.module;
                                 continue;
                             }
                             self.stack.push(value);
                         }
                         Method::Closure(closure) => {
-                            let wanted = self
-                                .function_of(closure)
-                                .map(|function| function.arity)
-                                .unwrap_or(0);
-                            if wanted != arity {
+                            // **One walk to the closure, not three.** Arity,
+                            // code and module all come from the same `ObjFn`,
+                            // and asking for them separately was the bulk of
+                            // what a call cost.
+                            let target = self.call_target(closure)?;
+                            if target.arity != arity {
                                 return Err(RuntimeError {
                                     message: format!(
-                                        "Function expects {wanted} argument(s) but got {arity}."
+                                        "Function expects {} argument(s) but got {arity}.",
+                                        target.arity
                                     ),
+                                    line,
+                                });
+                            }
+                            if self.frames.len() >= MAX_FRAMES {
+                                return Err(RuntimeError {
+                                    message: "Stack overflow.".into(),
                                     line,
                                 });
                             }
                             if let Some(frame) = self.frames.last_mut() {
                                 frame.ip = ip;
                             }
-                            chunk = self.push_frame(closure, receiver_at)?;
+                            self.frames.push(Frame {
+                                closure,
+                                ip: 0,
+                                base: receiver_at,
+                                chunk: target.chunk.clone(),
+                                module: target.module,
+                                field_offset: target.field_offset,
+                            });
+                            chunk = target.chunk;
                             ip = 0;
                             base = receiver_at;
-                            module = self.module_of(closure);
+                            module = target.module;
                         }
                     }
                 }
@@ -1559,11 +1775,11 @@ impl Vm {
                                 },
                                 ip,
                             )?;
-                            let frame = *self.frames.last().expect("a frame to resume");
+                            let frame = self.frames.last().expect("a frame to resume");
                             ip = frame.ip;
                             base = frame.base;
-                            chunk = self.chunk_of(frame.closure)?;
-                            module = self.module_of(frame.closure);
+                            chunk = frame.chunk.clone();
+                            module = frame.module;
                             continue;
                         }
                         if finished {
@@ -1577,11 +1793,14 @@ impl Vm {
                     }
 
                     self.stack.push(result);
-                    let frame = *self.frames.last().unwrap();
+                    // **The return path.** This ran twice per call before --
+                    // closure to function to chunk, and again for the module --
+                    // and is now two field reads and a refcount bump.
+                    let frame = self.frames.last().expect("a frame to return to");
                     ip = frame.ip;
                     base = frame.base;
-                    chunk = self.chunk_of(frame.closure)?;
-                    module = self.module_of(frame.closure);
+                    chunk = frame.chunk.clone();
+                    module = frame.module;
                 }
                 Op::Jump => {
                     let offset = chunk.read_short(ip) as usize;
@@ -1691,9 +1910,8 @@ impl Vm {
             },
             ip,
         )?;
-        let frame = *self.frames.last().expect("a frame to resume");
-        let chunk = self.chunk_of(frame.closure)?;
-        Ok(Some((chunk, frame.ip, frame.base)))
+        let frame = self.frames.last().expect("a frame to resume");
+        Ok(Some((frame.chunk.clone(), frame.ip, frame.base)))
     }
 
     fn read_upvalue(&self, base: usize, slot: usize) -> Result<Value, RuntimeError> {
@@ -1776,13 +1994,19 @@ impl Vm {
     fn field_of(&self, receiver: Value, _base: usize, index: usize) -> Result<Value, RuntimeError> {
         let offset = self.current_field_offset();
         let Some(id) = receiver.as_object() else {
-            return Err(RuntimeError::new("Cannot access a field outside of a class."));
+            return Err(RuntimeError::new(
+                "Cannot access a field outside of a class.",
+            ));
         };
         match self.heap.get(id) {
-            Some(Object::Instance(instance)) => {
-                Ok(instance.fields.get(offset + index).copied().unwrap_or(Value::NULL))
-            }
-            _ => Err(RuntimeError::new("Cannot access a field outside of a class.")),
+            Some(Object::Instance(instance)) => Ok(instance
+                .fields
+                .get(offset + index)
+                .copied()
+                .unwrap_or(Value::NULL)),
+            _ => Err(RuntimeError::new(
+                "Cannot access a field outside of a class.",
+            )),
         }
     }
 
@@ -1795,7 +2019,9 @@ impl Vm {
     ) -> Result<(), RuntimeError> {
         let offset = self.current_field_offset();
         let Some(id) = receiver.as_object() else {
-            return Err(RuntimeError::new("Cannot access a field outside of a class."));
+            return Err(RuntimeError::new(
+                "Cannot access a field outside of a class.",
+            ));
         };
         match self.heap.get_mut(id) {
             Some(Object::Instance(instance)) => {
@@ -1806,7 +2032,9 @@ impl Vm {
                 instance.fields[at] = value;
                 Ok(())
             }
-            _ => Err(RuntimeError::new("Cannot access a field outside of a class.")),
+            _ => Err(RuntimeError::new(
+                "Cannot access a field outside of a class.",
+            )),
         }
     }
 
@@ -1822,11 +2050,15 @@ impl Vm {
         // Unset reads as null rather than as an error, which is what
         // `use_before_set` expects: a static field springs into existence the
         // first time it is mentioned.
-        let Some(owner) = self.owner_class() else { return Value::NULL };
+        let Some(owner) = self.owner_class() else {
+            return Value::NULL;
+        };
         match self.heap.get(owner) {
-            Some(Object::Class(class)) => {
-                class.static_fields.get(index).copied().unwrap_or(Value::NULL)
-            }
+            Some(Object::Class(class)) => class
+                .static_fields
+                .get(index)
+                .copied()
+                .unwrap_or(Value::NULL),
             _ => Value::NULL,
         }
     }
@@ -1849,8 +2081,7 @@ impl Vm {
     fn current_field_offset(&self) -> usize {
         self.frames
             .last()
-            .and_then(|frame| self.function_of(frame.closure))
-            .map_or(0, |function| function.field_offset)
+            .map_or(0, |frame| frame.field_offset as usize)
     }
 
     fn make_class(
@@ -1873,9 +2104,16 @@ impl Vm {
         // have to be both that and an object with fields. Upstream refuses for
         // the same reason and with this wording.
         let builtin = [
-            self.bool_class, self.class_class, self.fiber_class, self.fn_class,
-            self.list_class, self.map_class, self.null_class, self.num_class,
-            self.range_class, self.string_class,
+            self.bool_class,
+            self.class_class,
+            self.fiber_class,
+            self.fn_class,
+            self.list_class,
+            self.map_class,
+            self.null_class,
+            self.num_class,
+            self.range_class,
+            self.string_class,
         ];
         if builtin.contains(&superclass_id) {
             let child = self.to_string(name);
@@ -1896,7 +2134,9 @@ impl Vm {
         };
         let metaclass_name = self
             .heap
-            .allocate(Object::String(ObjString::from_text(&format!("{class_name} metaclass"))));
+            .allocate(Object::String(ObjString::from_text(&format!(
+                "{class_name} metaclass"
+            ))));
         let metaclass = self.heap.allocate(Object::Class(Box::new(ObjClass::new(
             metaclass_name,
             Some(self.class_class),
@@ -1914,7 +2154,18 @@ impl Vm {
         let mut class = ObjClass::new(name_id, Some(superclass_id));
         class.num_fields = (inherited + declared) as i32;
         class.metaclass = Some(metaclass);
-        Ok(Value::object(self.heap.allocate(Object::Class(Box::new(class)))))
+        let class_id = self.heap.allocate(Object::Class(Box::new(class)));
+
+        // **Inherit before the body binds anything.** The class body's methods
+        // are bound after this returns, so they land on top of the copied ones
+        // and an override wins by being written second.
+        self.inherit_methods(class_id, superclass_id);
+        // A metaclass inherits from `Class` the same way, which is what makes
+        // `SomeClass.name` and `SomeClass.toString` work without a chain walk.
+        let class_class = self.class_class;
+        self.inherit_methods(metaclass, class_class);
+
+        Ok(Value::object(class_id))
     }
 
     fn bind_method(

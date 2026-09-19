@@ -34,11 +34,21 @@ const fn out(
     source: &'static str,
     expect: &'static str,
 ) -> Probe {
-    Probe { chapter, feature, source, expect: Expect::Output(expect) }
+    Probe {
+        chapter,
+        feature,
+        source,
+        expect: Expect::Output(expect),
+    }
 }
 
 const fn bad(chapter: &'static str, feature: &'static str, source: &'static str) -> Probe {
-    Probe { chapter, feature, source, expect: Expect::Error }
+    Probe {
+        chapter,
+        feature,
+        source,
+        expect: Expect::Error,
+    }
 }
 
 fn probes() -> Vec<Probe> {
@@ -357,7 +367,10 @@ fn main() {
                 if vm.output_str() == *want {
                     ("works", String::new())
                 } else {
-                    ("differs", format!("printed {:?}, spec says {:?}", vm.output_str(), want))
+                    (
+                        "differs",
+                        format!("printed {:?}, spec says {:?}", vm.output_str(), want),
+                    )
                 }
             }
             (Ok(()), Expect::Error) => ("differs", "should have failed, did not".to_string()),
@@ -367,7 +380,13 @@ fn main() {
             }
             (Err(error), Expect::Output(_)) => ("missing", error.message().to_string()),
         };
-        rows.push((probe.chapter.to_string(), probe.feature, probe.source, status.to_string(), note));
+        rows.push((
+            probe.chapter.to_string(),
+            probe.feature,
+            probe.source,
+            status.to_string(),
+            note,
+        ));
     }
 
     let works = rows.iter().filter(|row| row.3 == "works").count();
@@ -411,7 +430,11 @@ fn main() {
         let w = mine.iter().filter(|row| row.3 == "works").count();
         let d = mine.iter().filter(|row| row.3 == "differs").count();
         let m = mine.iter().filter(|row| row.3 == "missing").count();
-        let _ = writeln!(page, "| [{chapter}](#{}) | {w} | {d} | {m} |", anchor(chapter));
+        let _ = writeln!(
+            page,
+            "| [{chapter}](#{}) | {w} | {d} | {m} |",
+            anchor(chapter)
+        );
     }
     let _ = writeln!(page);
 
@@ -434,7 +457,10 @@ fn main() {
     let path = "doc/wren-rs/language.md";
     std::fs::create_dir_all("doc/wren-rs").ok();
     std::fs::write(path, page).expect("write the report");
-    println!("{works} work, {differs} differ, {missing} missing, of {}", rows.len());
+    println!(
+        "{works} work, {differs} differ, {missing} missing, of {}",
+        rows.len()
+    );
     println!("written: {path}");
 }
 

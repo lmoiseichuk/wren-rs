@@ -79,9 +79,9 @@ impl LoadError {
     pub fn message(&self) -> String {
         match self {
             LoadError::NotBytecode => "Not a .wrenc file.".to_string(),
-            LoadError::WrongVersion { found, expected } => alloc::format!(
-                "Bytecode is version {found}, this build reads version {expected}."
-            ),
+            LoadError::WrongVersion { found, expected } => {
+                alloc::format!("Bytecode is version {found}, this build reads version {expected}.")
+            }
             LoadError::Truncated => "Bytecode ends unexpectedly.".to_string(),
             LoadError::Malformed(what) => alloc::format!("Bytecode is malformed: {what}."),
         }
@@ -134,11 +134,24 @@ fn table_operands(code: &[u8]) -> Result<Vec<(Table, usize)>, LoadError> {
                 let count = *code.get(at + 2).ok_or(LoadError::Truncated)? as usize;
                 at += 3 + count * 2;
             }
-            Op::Constant | Op::ImportModule | Op::Jump | Op::Loop | Op::JumpIf | Op::And
+            Op::Constant
+            | Op::ImportModule
+            | Op::Jump
+            | Op::Loop
+            | Op::JumpIf
+            | Op::And
             | Op::Or => at += 2,
-            Op::LoadLocal | Op::StoreLocal | Op::LoadUpvalue | Op::StoreUpvalue
-            | Op::LoadFieldThis | Op::StoreFieldThis | Op::LoadField | Op::StoreField
-            | Op::LoadStaticField | Op::StoreStaticField | Op::Class => at += 1,
+            Op::LoadLocal
+            | Op::StoreLocal
+            | Op::LoadUpvalue
+            | Op::StoreUpvalue
+            | Op::LoadFieldThis
+            | Op::StoreFieldThis
+            | Op::LoadField
+            | Op::StoreField
+            | Op::LoadStaticField
+            | Op::StoreStaticField
+            | Op::Class => at += 1,
             _ => {}
         }
     }
@@ -220,11 +233,17 @@ pub fn write(vm: &Vm, chunk: &Chunk, source: &[u8]) -> Result<Vec<u8>, LoadError
 
     write_u32(&mut out, names.symbols.len() as u32);
     for index in &names.symbols {
-        write_bytes(&mut out, vm.method_names.name(*index).unwrap_or("").as_bytes());
+        write_bytes(
+            &mut out,
+            vm.method_names.name(*index).unwrap_or("").as_bytes(),
+        );
     }
     write_u32(&mut out, names.variables.len() as u32);
     for index in &names.variables {
-        write_bytes(&mut out, vm.modules[0].names.name(*index).unwrap_or("").as_bytes());
+        write_bytes(
+            &mut out,
+            vm.modules[0].names.name(*index).unwrap_or("").as_bytes(),
+        );
     }
 
     write_function(vm, &mut out, chunk, 0, 0, "(module)", &names)?;
@@ -426,7 +445,10 @@ pub fn load(vm: &mut Vm, bytes: &[u8]) -> Result<Loaded, LoadError> {
     }
     let version = reader.u16()?;
     if version != VERSION {
-        return Err(LoadError::WrongVersion { found: version, expected: VERSION });
+        return Err(LoadError::WrongVersion {
+            found: version,
+            expected: VERSION,
+        });
     }
 
     let mut source_digest = [0u8; 32];
@@ -458,11 +480,15 @@ pub fn load(vm: &mut Vm, bytes: &[u8]) -> Result<Loaded, LoadError> {
     }
 
     let function = read_function(vm, &mut reader, &symbols, &variables)?;
-    let closure = vm
-        .heap
-        .allocate(Object::Closure(Box::new(ObjClosure { function, upvalues: Vec::new() })));
+    let closure = vm.heap.allocate(Object::Closure(Box::new(ObjClosure {
+        function,
+        upvalues: Vec::new(),
+    })));
 
-    Ok(Loaded { closure, source_digest })
+    Ok(Loaded {
+        closure,
+        source_digest,
+    })
 }
 
 fn read_function(
@@ -521,16 +547,22 @@ fn read_constant(
         3 => Ok(Value::num(f64::from_bits(reader.u64()?))),
         4 => {
             let bytes = reader.blob()?.to_vec();
-            Ok(Value::object(vm.heap.allocate(Object::String(ObjString::new(bytes)))))
+            Ok(Value::object(
+                vm.heap.allocate(Object::String(ObjString::new(bytes))),
+            ))
         }
-        5 => Ok(Value::object(read_function(vm, reader, symbols, variables)?)),
+        5 => Ok(Value::object(read_function(
+            vm, reader, symbols, variables,
+        )?)),
         6 => {
             let count = reader.u32()? as usize;
             let mut elements = Vec::with_capacity(count);
             for _ in 0..count {
                 elements.push(read_constant(vm, reader, symbols, variables)?);
             }
-            Ok(Value::object(vm.heap.allocate(Object::List(crate::object::ObjList { elements }))))
+            Ok(Value::object(vm.heap.allocate(Object::List(
+                crate::object::ObjList { elements },
+            ))))
         }
         7 => {
             let count = reader.u32()? as usize;
@@ -554,9 +586,9 @@ fn read_constant(
             }
             // The only instance that can be a constant is a `ClassAttributes`.
             let class = vm.class_attributes_class;
-            Ok(Value::object(
-                vm.heap.allocate(Object::Instance(crate::object::ObjInstance { class, fields })),
-            ))
+            Ok(Value::object(vm.heap.allocate(Object::Instance(
+                crate::object::ObjInstance { class, fields },
+            ))))
         }
         _ => Err(LoadError::Malformed("unknown constant tag")),
     }

@@ -45,8 +45,8 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 
 use crate::bytecode::{Chunk, Op};
-use crate::object::{ObjFn, Object};
 use crate::lexer::{Lexer, Token, TokenKind};
+use crate::object::{ObjFn, Object};
 use crate::value::Value;
 use crate::vm::Vm;
 
@@ -62,10 +62,10 @@ pub struct CompileError {
 enum Precedence {
     None,
     Lowest,
-    Assignment,  // =
-    Conditional, // ?:
-    LogicalOr,   // ||
-    LogicalAnd, // &&
+    Assignment,   // =
+    Conditional,  // ?:
+    LogicalOr,    // ||
+    LogicalAnd,   // &&
     Equality,     // == !=
     Is,           // is
     Comparison,   // < > <= >=
@@ -74,10 +74,10 @@ enum Precedence {
     BitwiseAnd,   // &
     BitwiseShift, // << >>
     Range,        // .. ...
-    Term,       // + -
-    Factor,     // * / %
-    Unary,      // - !
-    Call,       // . ( [
+    Term,         // + -
+    Factor,       // * / %
+    Unary,        // - !
+    Call,         // . ( [
 }
 
 /// The longest a variable or method name may be, matching upstream.
@@ -307,7 +307,12 @@ struct Compiler<'a> {
 
 impl<'a> Compiler<'a> {
     fn new(vm: &'a mut Vm, source: &'a str, module: usize) -> Compiler<'a> {
-        let placeholder = Token { kind: TokenKind::Eof, start: 0, end: 0, line: 1 };
+        let placeholder = Token {
+            kind: TokenKind::Eof,
+            start: 0,
+            end: 0,
+            line: 1,
+        };
         let mut body = FnState::new("(module)".to_string(), "", false);
         // **Module level is scope -1**, where a `var` becomes a module variable
         // rather than a stack slot. Upstream uses the same sentinel.
@@ -400,7 +405,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn error_at(&self, token: Token, message: &str) -> CompileError {
-        CompileError { message: message.to_string(), line: clamp_line(token.line) }
+        CompileError {
+            message: message.to_string(),
+            line: clamp_line(token.line),
+        }
     }
 
     fn line(&self) -> u16 {
@@ -426,7 +434,9 @@ impl<'a> Compiler<'a> {
             if self.state().locals.len() <= 1 {
                 break;
             }
-            let Some(local) = self.state().locals.last() else { break };
+            let Some(local) = self.state().locals.last() else {
+                break;
+            };
             if local.depth < depth {
                 break;
             }
@@ -444,7 +454,10 @@ impl<'a> Compiler<'a> {
 
     fn resolve_local(&self, name: &str) -> Option<usize> {
         // Backwards, so an inner scope's variable shadows an outer one.
-        self.state().locals.iter().rposition(|local| local.name == name)
+        self.state()
+            .locals
+            .iter()
+            .rposition(|local| local.name == name)
     }
 
     /// Declare a local occupying the slot the value on top of the stack is in.
@@ -484,10 +497,7 @@ impl<'a> Compiler<'a> {
             .iter()
             .any(|local| local.depth == depth && local.name == name)
         {
-            return Err(self.error_at(
-                self.previous,
-                "Variable is already defined in this scope.",
-            ));
+            return Err(self.error_at(self.previous, "Variable is already defined in this scope."));
         }
 
         // 256, upstream's `MAX_LOCALS`, which is what a `u8` slot index can
@@ -500,9 +510,11 @@ impl<'a> Compiler<'a> {
             ));
         }
         let depth = self.state().scope_depth;
-        self.state_mut()
-            .locals
-            .push(Local { name: name.to_string(), depth, is_captured: false });
+        self.state_mut().locals.push(Local {
+            name: name.to_string(),
+            depth,
+            is_captured: false,
+        });
         Ok(self.state().locals.len() - 1)
     }
 
@@ -638,7 +650,8 @@ impl<'a> Compiler<'a> {
                 let key = self.previous.text(self.source).to_string();
                 let value = self.attribute_value()?;
                 if keep {
-                    self.pending_attributes.push((Some(first.clone()), key, value));
+                    self.pending_attributes
+                        .push((Some(first.clone()), key, value));
                 }
                 self.skip_newlines()?;
                 if !self.match_token(TokenKind::Comma)? {
@@ -646,7 +659,10 @@ impl<'a> Compiler<'a> {
                 }
             }
             self.skip_newlines()?;
-            self.consume(TokenKind::RightParen, "Expected ')' after grouped attributes.")?;
+            self.consume(
+                TokenKind::RightParen,
+                "Expected ')' after grouped attributes.",
+            )?;
         } else if self.check(TokenKind::Eq) || self.check(TokenKind::Line) {
             let value = self.attribute_value()?;
             if keep {
@@ -748,7 +764,10 @@ impl<'a> Compiler<'a> {
         let path = String::from_utf8_lossy(&path).into_owned();
         let path_value = self.vm.new_string(&path);
         let Some(path_constant) = self.chunk_mut().add_constant(path_value) else {
-            return Err(self.error_at(self.previous, "A function may only contain 65536 unique constants."));
+            return Err(self.error_at(
+                self.previous,
+                "A function may only contain 65536 unique constants.",
+            ));
         };
 
         self.chunk_mut().emit_op(Op::ImportModule, line);
@@ -776,7 +795,10 @@ impl<'a> Compiler<'a> {
 
             let name_value = self.vm.new_string(&imported);
             let Some(name_constant) = self.chunk_mut().add_constant(name_value) else {
-                return Err(self.error_at(self.previous, "A function may only contain 65536 unique constants."));
+                return Err(self.error_at(
+                    self.previous,
+                    "A function may only contain 65536 unique constants.",
+                ));
             };
             self.chunk_mut().emit_op(Op::ImportVariable, line);
             self.chunk_mut().emit_short(path_constant, line);
@@ -938,9 +960,11 @@ impl<'a> Compiler<'a> {
 
     fn begin_loop(&mut self, start: usize) {
         let locals_at_start = self.state().locals.len();
-        self.state_mut()
-            .loops
-            .push(LoopState { start, breaks: Vec::new(), locals_at_start });
+        self.state_mut().loops.push(LoopState {
+            start,
+            breaks: Vec::new(),
+            locals_at_start,
+        });
     }
 
     fn end_loop(&mut self) -> Result<(), CompileError> {
@@ -974,7 +998,12 @@ impl<'a> Compiler<'a> {
         self.discard_locals_to(keep)?;
         let line = self.line();
         let jump = self.chunk_mut().emit_jump(Op::Jump, line);
-        self.state_mut().loops.last_mut().expect("a loop").breaks.push(jump);
+        self.state_mut()
+            .loops
+            .last_mut()
+            .expect("a loop")
+            .breaks
+            .push(jump);
         Ok(())
     }
 
@@ -1260,7 +1289,10 @@ impl<'a> Compiler<'a> {
         let else_jump = self.chunk_mut().emit_jump(Op::JumpIf, line);
         self.parse_precedence(Precedence::Conditional)?;
         self.skip_newlines()?;
-        self.consume(TokenKind::Colon, "Expect ':' after then branch of conditional operator.")?;
+        self.consume(
+            TokenKind::Colon,
+            "Expect ':' after then branch of conditional operator.",
+        )?;
         self.skip_newlines()?;
 
         let end_jump = self.chunk_mut().emit_jump(Op::Jump, line);
@@ -1430,7 +1462,10 @@ impl<'a> Compiler<'a> {
     fn is_this_call(&self, name: &str) -> bool {
         !self.classes.is_empty()
             && self.method_depth > 0
-            && name.chars().next().is_some_and(|first| first.is_lowercase())
+            && name
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_lowercase())
     }
 
     /// Emit a load of whatever `name` refers to: a local, a captured variable,
@@ -1463,11 +1498,15 @@ impl<'a> Compiler<'a> {
         if let Some(index) = self.vm.modules[self.module].names.find(name) {
             return Ok(index);
         }
-        let capitalised = name.chars().next().is_some_and(|first| first.is_uppercase());
+        let capitalised = name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_uppercase());
         if !capitalised {
             return Err(self.error_at(self.previous, "Variable is not defined."));
         }
-        self.implicit.push((name.to_string(), clamp_line(self.previous.line)));
+        self.implicit
+            .push((name.to_string(), clamp_line(self.previous.line)));
         Ok(self.vm.modules[self.module].define(name, Value::NULL))
     }
 
@@ -1523,10 +1562,18 @@ impl<'a> Compiler<'a> {
             ));
         }
         if self.class_state().in_static {
-            return Err(self.error_at(self.previous, "Cannot use an instance field in a static method."));
+            return Err(self.error_at(
+                self.previous,
+                "Cannot use an instance field in a static method.",
+            ));
         }
 
-        let index = match self.class_state().fields.iter().position(|field| *field == name) {
+        let index = match self
+            .class_state()
+            .fields
+            .iter()
+            .position(|field| *field == name)
+        {
             Some(index) => index,
             None => {
                 let class = self.classes.last_mut().expect("a class being compiled");
@@ -1552,11 +1599,23 @@ impl<'a> Compiler<'a> {
             self.advance()?;
             self.skip_newlines()?;
             self.expression()?;
-            self.chunk_mut()
-                .emit_op(if direct { Op::StoreFieldThis } else { Op::StoreField }, line);
+            self.chunk_mut().emit_op(
+                if direct {
+                    Op::StoreFieldThis
+                } else {
+                    Op::StoreField
+                },
+                line,
+            );
         } else {
-            self.chunk_mut()
-                .emit_op(if direct { Op::LoadFieldThis } else { Op::LoadField }, line);
+            self.chunk_mut().emit_op(
+                if direct {
+                    Op::LoadFieldThis
+                } else {
+                    Op::LoadField
+                },
+                line,
+            );
         }
         self.chunk_mut().emit_byte(index as u8, line);
         Ok(())
@@ -1589,7 +1648,9 @@ impl<'a> Compiler<'a> {
             None => {
                 let class = self.classes.last_mut().expect("a class being compiled");
                 if class.static_fields.len() >= u8::MAX as usize {
-                    return Err(self.error_at(self.previous, "A class can only have 255 static fields."));
+                    return Err(
+                        self.error_at(self.previous, "A class can only have 255 static fields.")
+                    );
                 }
                 class.static_fields.push(name);
                 class.static_fields.len() - 1
@@ -1801,7 +1862,8 @@ impl<'a> Compiler<'a> {
     // --- functions ----------------------------------------------------------
 
     fn push_function(&mut self, name: String, receiver: &str, is_initializer: bool) {
-        self.states.push(FnState::new(name, receiver, is_initializer));
+        self.states
+            .push(FnState::new(name, receiver, is_initializer));
     }
 
     /// Finish the innermost function and emit a `Closure` for it in its parent.
@@ -1872,7 +1934,10 @@ impl<'a> Compiler<'a> {
 
     fn return_statement(&mut self) -> Result<(), CompileError> {
         let line = self.line();
-        if self.check(TokenKind::Line) || self.check(TokenKind::RightBrace) || self.check(TokenKind::Eof) {
+        if self.check(TokenKind::Line)
+            || self.check(TokenKind::RightBrace)
+            || self.check(TokenKind::Eof)
+        {
             // **A bare `return` in a constructor still yields the instance.**
             // An ordinary method returns null; a constructor has no other
             // answer to give, and returning null from one would hand back
@@ -2022,10 +2087,16 @@ impl<'a> Compiler<'a> {
             self.chunk_mut().emit_op(Op::StoreModuleVar, line);
             self.chunk_mut().emit_short(index as u16, line);
             self.chunk_mut().emit_op(Op::Pop, line);
-            return Ok(Variable { index, is_local: false });
+            return Ok(Variable {
+                index,
+                is_local: false,
+            });
         }
         let slot = self.add_local(name)?;
-        Ok(Variable { index: slot, is_local: true })
+        Ok(Variable {
+            index: slot,
+            is_local: true,
+        })
     }
 
     fn load_variable(&mut self, variable: Variable, line: u16) {
@@ -2075,13 +2146,21 @@ impl<'a> Compiler<'a> {
             if !full.contains('(') {
                 return Err(self.error_at(self.previous, "A constructor cannot be a getter."));
             }
-            if !full.chars().next().is_some_and(|first| first.is_alphabetic() || first == '_') {
+            if !full
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_alphabetic() || first == '_')
+            {
                 return Err(self.error_at(self.previous, "A constructor cannot be an operator."));
             }
         }
         // A constructor's body is an instance method under a name no program
         // can write, and `new` on the metaclass is generated to call it.
-        let body_signature = if is_constructor { format!("init {full}") } else { full.clone() };
+        let body_signature = if is_constructor {
+            format!("init {full}")
+        } else {
+            full.clone()
+        };
 
         // Whatever attributes preceded this method belong to it.
         let attributes = core::mem::take(&mut self.pending_attributes);
@@ -2095,12 +2174,20 @@ impl<'a> Compiler<'a> {
                     // **Keyed as the program would name it**, so a static and
                     // an instance method of the same signature do not collide:
                     // `Methods.attributes.methods["static method()"]`.
-                    if is_static { format!("static {full}") } else { full.clone() },
+                    if is_static {
+                        format!("static {full}")
+                    } else {
+                        full.clone()
+                    },
                     attributes,
                 ));
         }
 
-        let marker = if is_static { format!("static {body_signature}") } else { body_signature.clone() };
+        let marker = if is_static {
+            format!("static {body_signature}")
+        } else {
+            body_signature.clone()
+        };
         if self.class_state().defined.contains(&marker) {
             return Err(self.error_at(
                 self.previous,
@@ -2110,13 +2197,13 @@ impl<'a> Compiler<'a> {
                 ),
             ));
         }
-        self.classes.last_mut().expect("a class").defined.push(marker);
+        self.classes
+            .last_mut()
+            .expect("a class")
+            .defined
+            .push(marker);
 
-        self.push_function(
-            body_signature.clone(),
-            "this",
-            is_constructor,
-        );
+        self.push_function(body_signature.clone(), "this", is_constructor);
         let depth_was = self.method_depth;
         self.method_depth = self.states.len();
 
@@ -2133,8 +2220,14 @@ impl<'a> Compiler<'a> {
         let variable = self.class_state().variable;
         self.load_variable(variable, line);
         let symbol = self.vm.method_names.ensure(&body_signature);
-        self.chunk_mut()
-            .emit_op(if is_static { Op::MethodStatic } else { Op::MethodInstance }, line);
+        self.chunk_mut().emit_op(
+            if is_static {
+                Op::MethodStatic
+            } else {
+                Op::MethodInstance
+            },
+            line,
+        );
         self.chunk_mut().emit_short(symbol as u16, line);
 
         if is_constructor {
@@ -2147,7 +2240,12 @@ impl<'a> Compiler<'a> {
     ///
     /// Three instructions: allocate an instance in place of the class, run the
     /// constructor body on it, return it. Upstream generates the same thing.
-    fn emit_constructor(&mut self, full: &str, arity: usize, line: u16) -> Result<(), CompileError> {
+    fn emit_constructor(
+        &mut self,
+        full: &str,
+        arity: usize,
+        line: u16,
+    ) -> Result<(), CompileError> {
         self.push_function(full.to_string(), "this", false);
         self.state_mut().arity = arity;
         for index in 0..arity {
@@ -2505,7 +2603,6 @@ fn read_code_point(characters: &mut core::str::Chars<'_>, digits: usize) -> Resu
     let value = read_hex(characters, digits, "Unicode")?;
     char::from_u32(value).ok_or_else(|| "Invalid Unicode escape sequence.".to_string())
 }
-
 
 /// Narrow a lexer line number to what a chunk stores.
 ///

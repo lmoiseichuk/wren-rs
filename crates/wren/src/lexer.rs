@@ -159,7 +159,9 @@ impl Token {
         }
         let text = self.text(source);
         match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-            Some(digits) => u64::from_str_radix(digits, 16).ok().map(|value| value as f64),
+            Some(digits) => u64::from_str_radix(digits, 16)
+                .ok()
+                .map(|value| value as f64),
             None => f64::from_str(text).ok(),
         }
     }
@@ -197,7 +199,11 @@ impl<'a> Lexer<'a> {
         // U+FEFF encoded as UTF-8.
         let bytes = source.as_bytes();
         let mark: &[u8] = &[0xef, 0xbb, 0xbf];
-        let mut skip = if bytes.starts_with(mark) { mark.len() } else { 0 };
+        let mut skip = if bytes.starts_with(mark) {
+            mark.len()
+        } else {
+            0
+        };
 
         // **A `#!` on the very first line is a shebang**, not an attribute.
         // Only there: `#!` anywhere else is a runtime attribute, and the
@@ -351,7 +357,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn make(&self, kind: TokenKind) -> Token {
-        Token { kind, start: self.start, end: self.current, line: self.line }
+        Token {
+            kind,
+            start: self.start,
+            end: self.current,
+            line: self.line,
+        }
     }
 
     /// A token whose text is a sub-slice of what was scanned.
@@ -359,7 +370,12 @@ impl<'a> Lexer<'a> {
     /// Strings want this: the token should cover the contents, not the quotes,
     /// so that `text()` gives what was written between them.
     fn make_spanning(&self, kind: TokenKind, start: usize, end: usize) -> Token {
-        Token { kind, start, end, line: self.line }
+        Token {
+            kind,
+            start,
+            end,
+            line: self.line,
+        }
     }
 
     /// Whitespace, line comments and nestable block comments.
@@ -531,11 +547,7 @@ impl<'a> Lexer<'a> {
             };
             match c {
                 b'"' => {
-                    return self.make_spanning(
-                        TokenKind::String,
-                        contents_start,
-                        self.current - 1,
-                    )
+                    return self.make_spanning(TokenKind::String, contents_start, self.current - 1)
                 }
                 b'\\' => {
                     // Skip whatever follows, without interpreting it: an escaped
@@ -572,7 +584,10 @@ impl<'a> Lexer<'a> {
             if self.current >= self.bytes.len() {
                 return self.make(TokenKind::Error);
             }
-            if self.peek() == b'"' && self.peek_next() == b'"' && self.byte_at(self.current + 2) == b'"' {
+            if self.peek() == b'"'
+                && self.peek_next() == b'"'
+                && self.byte_at(self.current + 2) == b'"'
+            {
                 let end = self.current;
                 self.current += 3;
                 return self.make_spanning(TokenKind::String, contents_start, end);

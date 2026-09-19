@@ -32,7 +32,11 @@ fn arithmetic_and_precedence() {
     assert_eq!(run("System.print(1 + 2)"), "3\n");
     assert_eq!(run("System.print(2 + 3 * 4)"), "14\n");
     assert_eq!(run("System.print((2 + 3) * 4)"), "20\n");
-    assert_eq!(run("System.print(10 - 4 - 3)"), "3\n", "minus is left-associative");
+    assert_eq!(
+        run("System.print(10 - 4 - 3)"),
+        "3\n",
+        "minus is left-associative"
+    );
     assert_eq!(run("System.print(10 / 4)"), "2.5\n");
     assert_eq!(run("System.print(10 % 3)"), "1\n");
 }
@@ -98,7 +102,11 @@ fn only_false_and_null_are_falsy() {
     assert_eq!(run("System.print(!false)"), "true\n");
     assert_eq!(run("System.print(!null)"), "true\n");
     assert_eq!(run("System.print(!0)"), "false\n", "zero is truthy in Wren");
-    assert_eq!(run("System.print(!\"\")"), "false\n", "the empty string is truthy");
+    assert_eq!(
+        run("System.print(!\"\")"),
+        "false\n",
+        "the empty string is truthy"
+    );
 }
 
 // --- logical operators ------------------------------------------------------
@@ -170,8 +178,14 @@ fn if_without_else() {
 
 #[test]
 fn if_else_on_one_line() {
-    assert_eq!(run("if (3 > 2) System.print(\"big\") else System.print(\"small\")"), "big\n");
-    assert_eq!(run("if (1 > 2) System.print(\"big\") else System.print(\"small\")"), "small\n");
+    assert_eq!(
+        run("if (3 > 2) System.print(\"big\") else System.print(\"small\")"),
+        "big\n"
+    );
+    assert_eq!(
+        run("if (1 > 2) System.print(\"big\") else System.print(\"small\")"),
+        "small\n"
+    );
 }
 
 #[test]
@@ -249,7 +263,10 @@ for (i in 1..2) {
 
 #[test]
 fn a_loop_accumulating_into_a_variable() {
-    assert_eq!(run("var t = 0\nfor (i in 1..10) t = t + i\nSystem.print(t)"), "55\n");
+    assert_eq!(
+        run("var t = 0\nfor (i in 1..10) t = t + i\nSystem.print(t)"),
+        "55\n"
+    );
 }
 
 // --- lists ------------------------------------------------------------------
@@ -257,7 +274,11 @@ fn a_loop_accumulating_into_a_variable() {
 #[test]
 fn list_literal_and_indexing() {
     assert_eq!(run("var l = [1, 2, 3]\nSystem.print(l[0])"), "1\n");
-    assert_eq!(run("var l = [1, 2, 3]\nSystem.print(l[-1])"), "3\n", "negative indexes count back");
+    assert_eq!(
+        run("var l = [1, 2, 3]\nSystem.print(l[-1])"),
+        "3\n",
+        "negative indexes count back"
+    );
 }
 
 #[test]
@@ -267,7 +288,10 @@ fn list_index_assignment() {
 
 #[test]
 fn list_add_and_count() {
-    assert_eq!(run("var l = []\nl.add(1)\nl.add(2)\nSystem.print(l.count)"), "2\n");
+    assert_eq!(
+        run("var l = []\nl.add(1)\nl.add(2)\nSystem.print(l.count)"),
+        "2\n"
+    );
 }
 
 #[test]
@@ -277,7 +301,10 @@ fn a_list_prints_its_elements() {
 
 #[test]
 fn an_out_of_range_index_is_a_runtime_error() {
-    assert_eq!(error("var l = [1]\nSystem.print(l[5])"), "Index out of bounds.");
+    assert_eq!(
+        error("var l = [1]\nSystem.print(l[5])"),
+        "Index out of bounds."
+    );
 }
 
 // --- strings ----------------------------------------------------------------
@@ -291,7 +318,10 @@ fn string_concatenation() {
 fn concatenating_a_non_string_is_an_error() {
     // Wren does not coerce. `"a" + 1` is an error, and quietly making it work
     // would be a different language.
-    assert_eq!(error("System.print(\"a\" + 1)"), "Right operand must be a string.");
+    assert_eq!(
+        error("System.print(\"a\" + 1)"),
+        "Right operand must be a string."
+    );
 }
 
 #[test]
@@ -342,7 +372,10 @@ fn a_range_prints_with_its_operator() {
 
 #[test]
 fn an_unknown_method_names_the_class_and_the_signature() {
-    assert_eq!(error("System.print(1.nope)"), "Num does not implement 'nope'.");
+    assert_eq!(
+        error("System.print(1.nope)"),
+        "Num does not implement 'nope'."
+    );
 }
 
 #[test]
@@ -354,7 +387,10 @@ fn a_runtime_error_reports_its_line() {
 
 #[test]
 fn wrong_operand_type() {
-    assert_eq!(error("System.print(1 + \"a\")"), "Right operand must be a number.");
+    assert_eq!(
+        error("System.print(1 + \"a\")"),
+        "Right operand must be a number."
+    );
 }
 
 // --- the collector, under a running program ---------------------------------
@@ -387,13 +423,19 @@ fn deeply_nested_expressions() {
 
 #[test]
 fn a_function_literal_can_be_called() {
-    assert_eq!(run("var f = Fn.new { |a, b| a + b }\nSystem.print(f.call(1, 2))"), "3\n");
+    assert_eq!(
+        run("var f = Fn.new { |a, b| a + b }\nSystem.print(f.call(1, 2))"),
+        "3\n"
+    );
 }
 
 #[test]
 fn a_closure_sees_later_writes_to_what_it_captured() {
     // Capturing takes the variable, not a copy of its value at the time.
-    assert_eq!(run("var n = 1\nvar f = Fn.new { n }\nn = 2\nSystem.print(f.call())"), "2\n");
+    assert_eq!(
+        run("var n = 1\nvar f = Fn.new { n }\nn = 2\nSystem.print(f.call())"),
+        "2\n"
+    );
 }
 
 #[test]
@@ -559,7 +601,10 @@ while (i <= 2) {
 
 #[test]
 fn a_fiber_runs_and_returns() {
-    assert_eq!(run("var f = Fiber.new { 7 }\nSystem.print(f.call())"), "7\n");
+    assert_eq!(
+        run("var f = Fiber.new { 7 }\nSystem.print(f.call())"),
+        "7\n"
+    );
 }
 
 #[test]
@@ -581,7 +626,10 @@ System.print(f.call())
 
 #[test]
 fn a_fiber_reports_when_it_is_done() {
-    assert_eq!(run("var f = Fiber.new { 1 }\nf.call()\nSystem.print(f.isDone)"), "true\n");
+    assert_eq!(
+        run("var f = Fiber.new { 1 }\nf.call()\nSystem.print(f.isDone)"),
+        "true\n"
+    );
 }
 
 #[test]
@@ -594,7 +642,10 @@ var error = f.try()
 System.print(error)
 System.print(\"still running\")
 ";
-    assert_eq!(run(source), "Num does not implement 'nope'.\nstill running\n");
+    assert_eq!(
+        run(source),
+        "Num does not implement 'nope'.\nstill running\n"
+    );
 }
 
 #[test]
@@ -660,7 +711,10 @@ fn run_with_modules(source: &str, modules: &[(&'static str, &'static str)]) -> S
 #[test]
 fn a_bare_import_runs_the_module() {
     assert_eq!(
-        run_with_modules("import \"m\"\nSystem.print(\"after\")", &[("m", "System.print(\"ran\")")]),
+        run_with_modules(
+            "import \"m\"\nSystem.print(\"after\")",
+            &[("m", "System.print(\"ran\")")]
+        ),
         "ran\nafter\n"
     );
 }
@@ -697,7 +751,10 @@ System.print(A)
 System.print(B)
 ";
     assert_eq!(
-        run_with_modules(source, &[("m", "var A = 1\nvar B = 2\nSystem.print(\"ran\")")]),
+        run_with_modules(
+            source,
+            &[("m", "var A = 1\nvar B = 2\nSystem.print(\"ran\")")]
+        ),
         "ran\n1\n2\n"
     );
 }
@@ -713,7 +770,10 @@ System.print(name)
 System.print(exported)
 ";
     assert_eq!(
-        run_with_modules(source, &[("m", "var name = \"module\"\nvar exported = name")]),
+        run_with_modules(
+            source,
+            &[("m", "var name = \"module\"\nvar exported = name")]
+        ),
         "main\nmodule\n"
     );
 }
@@ -973,15 +1033,24 @@ System.print(Naturals.new().where { |n| n % 3 == 0 }.take(3).toList)
 
 #[test]
 fn skip_and_take_compose() {
-    assert_eq!(run("System.print((1..10).skip(2).take(3).toList)"), "[3, 4, 5]\n");
+    assert_eq!(
+        run("System.print((1..10).skip(2).take(3).toList)"),
+        "[3, 4, 5]\n"
+    );
 }
 
 #[test]
 fn sequence_methods_work_on_every_built_in_collection() {
     // List, Range, Map and String all inherit from Sequence, so the same
     // methods reach all of them.
-    assert_eq!(run("System.print([1, 2, 3].map { |x| x * 2 }.toList)"), "[2, 4, 6]\n");
-    assert_eq!(run("System.print((1..4).where { |x| x % 2 == 0 }.toList)"), "[2, 4]\n");
+    assert_eq!(
+        run("System.print([1, 2, 3].map { |x| x * 2 }.toList)"),
+        "[2, 4, 6]\n"
+    );
+    assert_eq!(
+        run("System.print((1..4).where { |x| x % 2 == 0 }.toList)"),
+        "[2, 4]\n"
+    );
     assert_eq!(run("System.print(\"abc\".toList)"), "[a, b, c]\n");
     assert_eq!(run("System.print((1..3).reduce { |a, b| a + b })"), "6\n");
     assert_eq!(run("System.print([1, 2, 3].join(\"-\"))"), "1-2-3\n");
@@ -1002,7 +1071,10 @@ fn sequence_predicates() {
 
 #[test]
 fn take_and_skip_reject_a_bad_count() {
-    assert_eq!(error("(1..3).take(-1)"), "Count must be a non-negative integer.");
+    assert_eq!(
+        error("(1..3).take(-1)"),
+        "Count must be a non-negative integer."
+    );
     assert_eq!(error("(1..3).take(1.5)"), "Count must be an integer.");
     assert_eq!(error("(1..3).skip(\"two\")"), "Count must be a number.");
 }
@@ -1018,7 +1090,10 @@ fn a_map_key_must_be_a_value_type() {
 fn ranges_work_as_map_keys() {
     // Which needs range equality by value: two separately built `1..3` are the
     // same key.
-    assert_eq!(run("var m = {}\nm[1..3] = \"yes\"\nSystem.print(m[1..3])"), "yes\n");
+    assert_eq!(
+        run("var m = {}\nm[1..3] = \"yes\"\nSystem.print(m[1..3])"),
+        "yes\n"
+    );
 }
 
 #[test]
@@ -1115,7 +1190,10 @@ System.print(m.count)
 #[test]
 fn negative_zero_and_zero_are_the_same_key() {
     // They are `==`, so they must hash alike or one would be unreachable.
-    assert_eq!(run("var m = {}\nm[0] = \"a\"\nm[-0.0] = \"b\"\nSystem.print(m.count)\nSystem.print(m[0])"), "1\nb\n");
+    assert_eq!(
+        run("var m = {}\nm[0] = \"a\"\nm[-0.0] = \"b\"\nSystem.print(m.count)\nSystem.print(m[0])"),
+        "1\nb\n"
+    );
 }
 
 #[test]
@@ -1171,30 +1249,66 @@ fn a_class_cannot_inherit_from_a_built_in() {
 #[test]
 fn a_class_may_inherit_from_object_and_sequence() {
     // The two that are not representations, only behaviour.
-    assert_eq!(run("class A is Object { construct new() {} }\nSystem.print(A.new() is A)"), "true\n");
-    assert_eq!(run("class B is Sequence { construct new() {} }\nSystem.print(B.new() is Sequence)"), "true\n");
+    assert_eq!(
+        run("class A is Object { construct new() {} }\nSystem.print(A.new() is A)"),
+        "true\n"
+    );
+    assert_eq!(
+        run("class B is Sequence { construct new() {} }\nSystem.print(B.new() is Sequence)"),
+        "true\n"
+    );
 }
 
 #[test]
 fn a_constructor_must_be_a_named_method() {
     // Every other shape is called on an instance that already exists, which is
     // the one thing a constructor does not have.
-    assert_eq!(error("class A { construct +(o) {} }"), "A constructor cannot be an operator.");
-    assert_eq!(error("class A { construct v { } }"), "A constructor cannot be a getter.");
-    assert_eq!(error("class A { construct v=(x) {} }"), "A constructor cannot be a setter.");
-    assert_eq!(error("class A { construct [i] {} }"), "A constructor cannot be a subscript.");
-    assert_eq!(error("class A { static construct new() {} }"), "A constructor cannot be static.");
+    assert_eq!(
+        error("class A { construct +(o) {} }"),
+        "A constructor cannot be an operator."
+    );
+    assert_eq!(
+        error("class A { construct v { } }"),
+        "A constructor cannot be a getter."
+    );
+    assert_eq!(
+        error("class A { construct v=(x) {} }"),
+        "A constructor cannot be a setter."
+    );
+    assert_eq!(
+        error("class A { construct [i] {} }"),
+        "A constructor cannot be a subscript."
+    );
+    assert_eq!(
+        error("class A { static construct new() {} }"),
+        "A constructor cannot be static."
+    );
 }
 
 #[test]
 fn a_bad_escape_is_a_compile_error() {
     // It used to keep both characters, which quietly turned a typo into
     // output.
-    assert_eq!(error("System.print(\"\\q\")"), "Invalid escape character 'q'.");
-    assert_eq!(error("System.print(\"\\x1\")"), "Incomplete byte escape sequence.");
-    assert_eq!(error("System.print(\"\\xzz\")"), "Invalid byte escape sequence.");
-    assert_eq!(error("System.print(\"\\u12\")"), "Incomplete Unicode escape sequence.");
-    assert_eq!(error("System.print(\"\\uzzzz\")"), "Invalid Unicode escape sequence.");
+    assert_eq!(
+        error("System.print(\"\\q\")"),
+        "Invalid escape character 'q'."
+    );
+    assert_eq!(
+        error("System.print(\"\\x1\")"),
+        "Incomplete byte escape sequence."
+    );
+    assert_eq!(
+        error("System.print(\"\\xzz\")"),
+        "Invalid byte escape sequence."
+    );
+    assert_eq!(
+        error("System.print(\"\\u12\")"),
+        "Incomplete Unicode escape sequence."
+    );
+    assert_eq!(
+        error("System.print(\"\\uzzzz\")"),
+        "Invalid Unicode escape sequence."
+    );
 }
 
 #[test]
@@ -1256,12 +1370,18 @@ fn string_methods_reject_a_non_string_argument() {
 
 #[test]
 fn from_code_point_checks_its_range() {
-    assert_eq!(error("String.fromCodePoint(-1)"), "Code point cannot be negative.");
+    assert_eq!(
+        error("String.fromCodePoint(-1)"),
+        "Code point cannot be negative."
+    );
     assert_eq!(
         error("String.fromCodePoint(1114112)"),
         "Code point cannot be greater than 0x10ffff."
     );
-    assert_eq!(error("String.fromCodePoint(1.5)"), "Code point must be an integer.");
+    assert_eq!(
+        error("String.fromCodePoint(1.5)"),
+        "Code point must be an integer."
+    );
 }
 
 #[test]
@@ -1308,7 +1428,10 @@ fn block_comments_nest() {
 
 #[test]
 fn a_subscript_must_take_a_parameter() {
-    assert_eq!(error("class A { [] { 1 } }"), "Expect subscript parameters.");
+    assert_eq!(
+        error("class A { [] { 1 } }"),
+        "Expect subscript parameters."
+    );
 }
 
 // --- fibers and closures over the same variable -----------------------------
@@ -1398,7 +1521,9 @@ System.print(Chain.new().
 #[test]
 fn a_superclass_constructor_needs_an_argument_list() {
     assert_eq!(
-        error("class A {\n construct new() {}\n}\nclass B is A {\n construct new() {\n  super\n }\n}"),
+        error(
+            "class A {\n construct new() {}\n}\nclass B is A {\n construct new() {\n  super\n }\n}"
+        ),
         "A superclass constructor must have an argument list."
     );
 }
@@ -1473,5 +1598,8 @@ fn string_search_and_replace() {
     assert_eq!(run("System.print(\"abcd\".indexOf(\"cd\", 0))"), "2\n");
     assert_eq!(run("System.print(\"abcd\".indexOf(\"cd\", 3))"), "-1\n");
     assert_eq!(run("System.print(\"aaaaa\".indexOf(\"aaaa\", 1))"), "1\n");
-    assert_eq!(run("System.print(\"a-b-c\".replace(\"-\", \"+\"))"), "a+b+c\n");
+    assert_eq!(
+        run("System.print(\"a-b-c\".replace(\"-\", \"+\"))"),
+        "a+b+c\n"
+    );
 }

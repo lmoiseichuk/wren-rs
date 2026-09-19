@@ -217,7 +217,10 @@ fn a_range_holds_no_references() {
 #[test]
 fn collection_is_wanted_only_once_the_threshold_is_passed() {
     let mut heap = Heap::new();
-    assert!(!heap.should_collect(), "a fresh heap has nothing to collect");
+    assert!(
+        !heap.should_collect(),
+        "a fresh heap has nothing to collect"
+    );
 
     while !heap.should_collect() {
         let _ = string(&mut heap, "filling the heap up with something");
@@ -245,7 +248,10 @@ fn the_threshold_follows_the_live_set() {
     // Nothing was garbage, so the live set is unchanged and the next
     // collection has to be further away or the VM would collect continuously.
     assert_eq!(heap.bytes(), before);
-    assert!(!heap.should_collect(), "threshold should have moved past the live set");
+    assert!(
+        !heap.should_collect(),
+        "threshold should have moved past the live set"
+    );
     assert_eq!(heap.collections(), 1);
 }
 
@@ -253,5 +259,12 @@ fn the_threshold_follows_the_live_set() {
 fn collecting_an_empty_heap_is_harmless() {
     let mut heap = Heap::new();
     let report = heap.collect([]);
-    assert_eq!(report, wren::heap::Collection { before: 0, after: 0, bytes_after: 0 });
+    assert_eq!(
+        report,
+        wren::heap::Collection {
+            before: 0,
+            after: 0,
+            bytes_after: 0
+        }
+    );
 }

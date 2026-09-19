@@ -20,8 +20,10 @@ fn main() {
     // read as the name of a failure to filter by, and the run reported nothing
     // at all rather than saying the argument made no sense.
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let positional: Vec<&String> =
-        arguments.iter().filter(|argument| !argument.starts_with("--")).collect();
+    let positional: Vec<&String> = arguments
+        .iter()
+        .filter(|argument| !argument.starts_with("--"))
+        .collect();
 
     let root = positional
         .first()
@@ -83,9 +85,7 @@ fn main() {
     println!(
         "  {real_passed} of {real_total} produce the right output -- the number that means something"
     );
-    println!(
-        "  {error_passed} of {error_total} are error tests, which pass on any error at all\n"
-    );
+    println!("  {error_passed} of {error_total} are error tests, which pass on any error at all\n");
 
     println!("{:<14} {:>8}", "group", "passed");
     println!("{}", "-".repeat(46));
@@ -102,7 +102,11 @@ fn main() {
         ranked.sort_by_key(|outcome| core::cmp::Reverse(outcome.elapsed));
         println!("\nslowest files:");
         for outcome in ranked.iter().take(15) {
-            println!("  {:>8.2}s  {}", outcome.elapsed.as_secs_f64(), outcome.path.display());
+            println!(
+                "  {:>8.2}s  {}",
+                outcome.elapsed.as_secs_f64(),
+                outcome.path.display()
+            );
         }
         return;
     }
@@ -123,9 +127,15 @@ fn main() {
                     continue;
                 }
             }
-            let Ok(source) = std::fs::read_to_string(&outcome.path) else { continue };
+            let Ok(source) = std::fs::read_to_string(&outcome.path) else {
+                continue;
+            };
             let expected: Vec<String> = source.lines().filter_map(expectation).collect();
-            let directory = outcome.path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let directory = outcome
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
             let mut vm = wren::Vm::new();
             let name = {
                 let text = outcome.path.display().to_string();
@@ -136,7 +146,10 @@ fn main() {
             vm.set_main_module_name(&name);
             let base = directory.clone();
             vm.set_module_loader(move |name| {
-                std::fs::read_to_string(base.join(format!("{}.wren", name.trim_start_matches("./")))).ok()
+                std::fs::read_to_string(
+                    base.join(format!("{}.wren", name.trim_start_matches("./"))),
+                )
+                .ok()
             });
             let _ = vm.interpret(&source);
             let got: Vec<&str> = vm.output_str().lines().collect();
@@ -197,9 +210,19 @@ fn run_in_parallel(files: &[PathBuf], root: &str) -> Vec<Outcome> {
     let outcomes: Vec<Outcome> = std::thread::scope(|scope| {
         let handles: Vec<_> = files
             .chunks(chunk)
-            .map(|slice| scope.spawn(move || slice.iter().filter_map(|path| one(path, root)).collect::<Vec<_>>()))
+            .map(|slice| {
+                scope.spawn(move || {
+                    slice
+                        .iter()
+                        .filter_map(|path| one(path, root))
+                        .collect::<Vec<_>>()
+                })
+            })
             .collect();
-        handles.into_iter().flat_map(|handle| handle.join().unwrap_or_default()).collect()
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
     });
 
     let _ = std::panic::take_hook();
@@ -222,7 +245,11 @@ fn one(path: &Path, root: &str) -> Option<Outcome> {
     // the modules its import tests load, and counting them as tests in their
     // own right scores a helper against expectations it never had -- 25 files
     // that were quietly making the denominator and the failure list both wrong.
-    if source.lines().next().is_some_and(|line| line.contains("nontest")) {
+    if source
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains("nontest"))
+    {
         return None;
     }
 
@@ -264,7 +291,10 @@ fn collect(directory: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect(&path, out);
-        } else if path.extension().is_some_and(|extension| extension == "wren") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "wren")
+        {
             out.push(path);
         }
     }
@@ -363,24 +393,33 @@ fn check(source: &str, directory: &Path, module_name: &str) -> Result<(), String
 /// symbol table already holds the names the compile interned, which is the
 /// case a fresh VM would not exercise.
 fn run_via_bytecode(vm: &mut wren::Vm, source: &str) -> Result<(), wren::WrenError> {
-    let chunk = wren::compiler::compile(vm, source)
-        .map_err(|error| wren::WrenError::Compile { message: error.message, line: error.line })?;
+    let chunk = wren::compiler::compile(vm, source).map_err(|error| wren::WrenError::Compile {
+        message: error.message,
+        line: error.line,
+    })?;
 
     let bytes = match wren::wrenc::write(vm, &chunk, source.as_bytes()) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return Err(wren::WrenError::Compile { message: error.message(), line: 0 })
+            return Err(wren::WrenError::Compile {
+                message: error.message(),
+                line: 0,
+            })
         }
     };
 
     let loaded = match wren::wrenc::load(vm, &bytes) {
         Ok(loaded) => loaded,
         Err(error) => {
-            return Err(wren::WrenError::Compile { message: error.message(), line: 0 })
+            return Err(wren::WrenError::Compile {
+                message: error.message(),
+                line: 0,
+            })
         }
     };
 
-    vm.run_closure(loaded.closure).map_err(wren::WrenError::Runtime)
+    vm.run_closure(loaded.closure)
+        .map_err(wren::WrenError::Runtime)
 }
 
 /// The text a `// expect:` comment asks for, if the line carries one.
