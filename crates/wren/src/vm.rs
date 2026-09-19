@@ -27,8 +27,7 @@ use crate::core;
 use crate::handle::ObjectId;
 use crate::heap::Heap;
 use crate::object::{
-    Method, ObjClass, ObjClosure, ObjFiber, ObjFn, ObjInstance, ObjString, ObjUpvalue, Object,
-    ObjectType,
+    Method, ObjClass, ObjClosure, ObjFiber, ObjFn, ObjString, ObjUpvalue, Object, ObjectType,
 };
 use crate::symbol::SymbolTable;
 use crate::value::Value;
@@ -813,10 +812,7 @@ impl Vm {
     /// Build the `ClassAttributes` pair a class's attributes come back as.
     pub fn new_class_attributes(&mut self, own: Value, methods: Value) -> Value {
         let class = self.class_attributes_class;
-        Value::object(self.heap.allocate(Object::Instance(ObjInstance {
-            class,
-            fields: alloc::vec![own, methods],
-        })))
+        Value::object(self.heap.new_instance(class, &[own, methods]))
     }
 
     /// Allocate a string from raw bytes.
@@ -2130,12 +2126,11 @@ impl Vm {
             ));
         };
         match self.heap.instance(id) {
-            Some(instance) => Ok(instance
-                .fields
-                .get(offset + index)
-                .copied()
+            Some(_) => Ok(self
+                .heap
+                .instance_field(id, offset + index)
                 .unwrap_or(Value::NULL)),
-            _ => Err(RuntimeError::new(
+            None => Err(RuntimeError::new(
                 "Cannot access a field outside of a class.",
             )),
         }
@@ -2154,19 +2149,14 @@ impl Vm {
                 "Cannot access a field outside of a class.",
             ));
         };
-        let at = offset + index;
-        match self.heap.instance_mut(id) {
-            Some(instance) => {
-                if instance.fields.len() <= at {
-                    instance.fields.resize(at + 1, Value::NULL);
-                }
-                instance.fields[at] = value;
-                // The barrier, in the shape every one of them takes: store,
-                // then say which object was stored into and what went in.
-                self.heap.wrote(id, value);
+        match self.heap.instance(id) {
+            Some(_) => {
+                // The store and the barrier both live in the heap now, because
+                // the fields do.
+                self.heap.set_instance_field(id, offset + index, value);
                 Ok(())
             }
-            _ => Err(RuntimeError::new(
+            None => Err(RuntimeError::new(
                 "Cannot access a field outside of a class.",
             )),
         }
@@ -2430,10 +2420,9 @@ impl Vm {
             Some(class) => class.num_fields.max(0) as usize,
             _ => return Err(RuntimeError::new("Not a class.")),
         };
-        let id = self.heap.allocate(Object::Instance(ObjInstance {
-            class: class_id,
-            fields: alloc::vec![Value::NULL; fields],
-        }));
+        let id = self
+            .heap
+            .new_instance(class_id, &alloc::vec![Value::NULL; fields]);
         Ok(Value::object(id))
     }
 }

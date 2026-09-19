@@ -235,10 +235,13 @@ fn contents_detail(
     }
 
     match kind {
-        ObjectType::Instance => match heap.instance(id) {
-            Some(it) => pair(it.fields.len(), it.fields.capacity(), VALUE),
-            None => (0, 0, 0),
-        },
+        // **An instance's fields are in the heap's arena now**, not in a
+        // block of its own, so they cost no allocator header and there is no
+        // capacity to be slack.
+        ObjectType::Instance => {
+            let count = heap.instance_fields(id).len();
+            (count * VALUE, count * VALUE, 0)
+        }
         ObjectType::List => match heap.list(id) {
             Some(list) => pair(list.elements.len(), list.elements.capacity(), VALUE),
             None => (0, 0, 0),

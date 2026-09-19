@@ -180,9 +180,7 @@ impl Object {
                 core::mem::size_of::<ObjClass>()
                     + class.methods.capacity() * core::mem::size_of::<u32>()
             }
-            Object::Instance(instance) => {
-                instance.fields.capacity() * core::mem::size_of::<Value>()
-            }
+            Object::Instance(instance) => instance.count() * core::mem::size_of::<Value>(),
             Object::List(list) => list.elements.capacity() * core::mem::size_of::<Value>(),
             Object::Map(map) => map.entries.capacity() * core::mem::size_of::<MapEntry>(),
             Object::Range(_) => 0,
@@ -535,7 +533,51 @@ pub type Primitive =
 #[derive(Debug)]
 pub struct ObjInstance {
     pub class: ObjectId,
-    pub fields: Vec<Value>,
+    /// Where this instance's fields begin in the heap's field arena, **biased
+    /// by one**.
+    ///
+    /// **The fields are not here.** A `Vec` per instance is a call to the
+    /// allocator per object created, with a header and a rounding of its own;
+    /// across `binary_trees` that was a thousand separate blocks and about
+    /// eight kilobytes of headers for twenty-four kilobytes of fields. They
+    /// live end to end in one arena the heap owns instead, and an instance
+    /// records where.
+    ///
+    /// The bias makes this `NonZeroU32`, which is the niche that keeps
+    /// `Option<ObjInstance>` -- what a table slot holds -- down to twelve
+    /// bytes rather than sixteen.
+    at: core::num::NonZeroU32,
+    /// How many fields. Wren caps a class at 255, inherited ones included.
+    count: u16,
+}
+
+impl ObjInstance {
+    /// An instance whose fields start at `at` in the heap's arena.
+    pub fn new(class: ObjectId, at: usize, count: usize) -> ObjInstance {
+        let biased = (at as u32).saturating_add(1);
+        ObjInstance {
+            class,
+            at: core::num::NonZeroU32::new(biased).expect("biased by one"),
+            count: count as u16,
+        }
+    }
+
+    /// Where the fields begin in the arena.
+    pub fn at(&self) -> usize {
+        self.at.get() as usize - 1
+    }
+
+    /// How many fields the instance has.
+    pub fn count(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Point the instance at a different run of the arena.
+    pub fn moved_to(&mut self, at: usize, count: usize) {
+        let biased = (at as u32).saturating_add(1);
+        self.at = core::num::NonZeroU32::new(biased).expect("biased by one");
+        self.count = count as u16;
+    }
 }
 
 // **Layout, pinned.** These are measured, not asserted: the numbers in
@@ -564,7 +606,9 @@ mod layout_f32 {
     const _: () = assert!(core::mem::size_of::<ObjString>() == 16);
     const _: () = assert!(core::mem::size_of::<ObjList>() == 12);
     const _: () = assert!(core::mem::size_of::<ObjMap>() == 16);
-    const _: () = assert!(core::mem::size_of::<ObjInstance>() == 16);
+    // Twelve, not sixteen: the fields moved to the heap's arena, and the
+    // start index is biased so `Option` has a niche to use.
+    const _: () = assert!(core::mem::size_of::<ObjInstance>() == 12);
     // Held to 8 by the same `undefined` trick that holds it to 16 at full
     // width: an `Option<Value>` here would be 12 and would tie `ObjMap`.
     const _: () = assert!(core::mem::size_of::<ObjUpvalue>() == 8);
@@ -605,7 +649,9 @@ mod layout {
     // visible: it is well past `Range`'s 24 bytes.
     const _: () = assert!(core::mem::size_of::<ObjClass>() > 24);
     const _: () = assert!(core::mem::size_of::<Box<ObjClass>>() == 4);
-    const _: () = assert!(core::mem::size_of::<ObjInstance>() == 16);
+    // Twelve, not sixteen: the fields moved to the heap's arena, and the
+    // start index is biased so `Option` has a niche to use.
+    const _: () = assert!(core::mem::size_of::<ObjInstance>() == 12);
     const _: () = assert!(core::mem::size_of::<MapEntry>() == 16);
 }
 
@@ -925,15 +971,15 @@ impl Trace for ObjFiber {
 }
 
 impl Trace for ObjInstance {
+    /// **Only the class.** The fields are in the heap's arena, which this
+    /// cannot see, so `Heap::trace_at` follows them -- the one place where the
+    /// collector needs to know more about a type than the type does.
     fn trace(&self, gray: &mut Vec<ObjectId>) {
         gray.push(self.class);
-        for field in &self.fields {
-            gray_value(*field, gray);
-        }
     }
 
     fn contents_size(&self) -> usize {
-        self.fields.capacity() * core::mem::size_of::<Value>()
+        self.count() * core::mem::size_of::<Value>()
     }
 }
 

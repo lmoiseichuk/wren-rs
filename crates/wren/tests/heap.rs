@@ -1,7 +1,7 @@
 //! The object table and the collector over it.
 
 use wren::heap::Heap;
-use wren::object::{MapEntry, ObjClass, ObjInstance, ObjList, ObjMap, ObjRange, ObjString};
+use wren::object::{MapEntry, ObjClass, ObjList, ObjMap, ObjRange, ObjString};
 use wren::{Object, Value};
 
 fn string(heap: &mut Heap, text: &str) -> Value {
@@ -153,10 +153,9 @@ fn an_instance_keeps_its_class_and_fields() {
     object_class.num_fields = 2;
     let class = heap.allocate(Object::Class(Box::new(object_class)));
     let field = string(&mut heap, "origin");
-    let instance = Value::object(heap.allocate(Object::Instance(ObjInstance {
-        class,
-        fields: alloc_fields(&[field, Value::num(1.0)]),
-    })));
+    // An instance's fields live in the heap's arena, so the heap is the only
+    // thing that can make one.
+    let instance = Value::object(heap.new_instance(class, &[field, Value::num(1.0)]));
 
     heap.collect([instance]);
 
@@ -164,10 +163,6 @@ fn an_instance_keeps_its_class_and_fields() {
     assert_eq!(heap.live(), 4);
     assert!(heap.type_of(class).is_some());
     assert!(heap.type_of(name.as_object().unwrap()).is_some());
-}
-
-fn alloc_fields(values: &[Value]) -> Vec<Value> {
-    values.to_vec()
 }
 
 #[test]

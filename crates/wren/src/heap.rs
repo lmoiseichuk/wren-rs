@@ -44,6 +44,34 @@ use crate::value::Value;
 /// Whether the heap keeps a young generation.
 const NURSERY: bool = cfg!(feature = "nursery");
 
+/// How many `Value`s the *n*th field chunk holds.
+///
+/// **Adaptive, because one size is wrong at both ends.** Four kilobytes is a
+/// good block for a program holding thousands of instances and absurd for one
+/// holding two -- `method_call` allocates two instances in its whole life and
+/// would pay a full chunk for them. So the first chunk is small and they grow
+/// to a ceiling: 512 values, 4 KB, which is where the per-chunk bookkeeping
+/// stops mattering against what the chunk holds.
+///
+/// The ceiling also has to leave room for one instance's fields -- 255 at the
+/// very most, which is 2 KB -- in a chunk of its own.
+fn field_chunk_size(index: usize) -> usize {
+    match index {
+        0 => 32,
+        1 => 128,
+        2 => 256,
+        _ => 512,
+    }
+}
+
+/// How an offset within a chunk is packed into an instance's start index.
+///
+/// The chunk number goes in the high bits and the offset in the low sixteen,
+/// which is what lets chunks differ in size: an index into a flat arena would
+/// have to assume they did not.
+const FIELD_OFFSET_BITS: u32 = 16;
+const FIELD_OFFSET_MASK: usize = (1 << FIELD_OFFSET_BITS) - 1;
+
 /// How much the live set may grow before the next collection.
 ///
 /// **Upstream's default is 10 MB and on these parts that means it never
@@ -361,6 +389,39 @@ pub struct Heap {
     /// whose intermediate results are not yet reachable from any root.
     paused: bool,
     collections: usize,
+    /// Chunks of instance fields, and how far into the last one is used.
+    ///
+    /// **Chunks rather than one growing vector, because the heap is fixed.** A
+    /// single `Vec` doubles, and doubling asks the allocator for one block
+    /// twice the size of the last while still holding it -- on a part with
+    /// 320 KB that is how a program with a few thousand live instances runs
+    /// out of memory to hold a hundred kilobytes of fields. It did.
+    ///
+    /// A chunk is [`FIELD_CHUNK`] values, and growth is one chunk at a time.
+    /// A run of fields never straddles two: an instance is capped at 255
+    /// fields, comfortably inside a chunk, so a run that will not fit in what
+    /// is left starts a new one and the remainder is wasted -- at most a
+    /// couple of hundred bytes, against a doubling that could ask for a
+    /// hundred kilobytes.
+    ///
+    /// Emptied chunks are kept rather than freed, so a program that spikes and
+    /// settles reuses them instead of returning them and asking again.
+    chunks: Vec<Vec<Value>>,
+    /// How much of the last chunk is used.
+    chunk_used: usize,
+    /// Chunks compaction emptied, waiting to be filled again.
+    spare_chunks: Vec<Vec<Value>>,
+    ///
+    /// **One allocation for all of them instead of one each.** A `Vec` inside
+    /// each `ObjInstance` meant a call to the allocator per object created,
+    /// with a header and a rounding of its own; measured across
+    /// `binary_trees`, a thousand instances were a thousand separate blocks.
+    ///
+    /// A run is never moved while the program runs, so an instance's start
+    /// index is stable between collections. A full collection compacts the
+    /// arena and rewrites the starts, which is the one place anything moves --
+    /// and it moves *contents*, not objects: a handle still names the same
+    /// slot, so nothing outside this file notices.
     /// How many objects are in the young generation, kept as a running total.
     young_total: usize,
     /// What those objects cost, so a major collection is not triggered by them.
@@ -459,6 +520,9 @@ impl Heap {
             headroom: None,
             paused: false,
             collections: 0,
+            chunks: Vec::new(),
+            chunk_used: 0,
+            spare_chunks: Vec::new(),
             young_total: 0,
             young_bytes: 0,
             scratch: Vec::new(),
@@ -714,6 +778,112 @@ impl Heap {
             false => None,
         }
     }
+    /// Create an instance whose fields are `fields`.
+    ///
+    /// The only way to make one: an `ObjInstance` records where its fields are
+    /// in the arena, so it cannot be built without the heap that owns it.
+    pub fn new_instance(&mut self, class: ObjectId, fields: &[Value]) -> ObjectId {
+        let at = self.place_fields(fields);
+        self.allocate(Object::Instance(ObjInstance::new(class, at, fields.len())))
+    }
+
+    /// Put a run of fields in a chunk and say where it went.
+    fn place_fields(&mut self, fields: &[Value]) -> usize {
+        let room = match self.chunks.last() {
+            Some(chunk) => chunk.len().saturating_sub(self.chunk_used),
+            None => 0,
+        };
+        // **`is_empty` as well as `room`**, because an instance with no fields
+        // asks for nothing and would otherwise index a chunk that is not there.
+        // A class with no fields is ordinary Wren.
+        if self.chunks.is_empty() || room < fields.len() {
+            let wanted = field_chunk_size(self.chunks.len()).max(fields.len());
+            let chunk = match self.spare_chunks.pop() {
+                Some(chunk) if chunk.len() >= wanted => chunk,
+                other => {
+                    if let Some(chunk) = other {
+                        self.spare_chunks.push(chunk);
+                    }
+                    alloc::vec![Value::NULL; wanted]
+                }
+            };
+            self.chunks.push(chunk);
+            self.chunk_used = 0;
+        }
+        let chunk = self.chunks.len() - 1;
+        let offset = self.chunk_used;
+        self.chunks[chunk][offset..offset + fields.len()].copy_from_slice(fields);
+        self.chunk_used += fields.len();
+        (chunk << FIELD_OFFSET_BITS) | offset
+    }
+
+    /// Split a start index into the chunk it names and the offset within it.
+    fn field_place(at: usize) -> (usize, usize) {
+        (at >> FIELD_OFFSET_BITS, at & FIELD_OFFSET_MASK)
+    }
+
+    /// An instance's fields.
+    ///
+    /// One run never crosses a chunk boundary, which is what lets this hand
+    /// back a slice rather than an iterator.
+    pub fn instance_fields(&self, id: ObjectId) -> &[Value] {
+        let Some(instance) = self.instance(id) else {
+            return &[];
+        };
+        let (chunk, offset) = Self::field_place(instance.at());
+        match self.chunks.get(chunk) {
+            Some(chunk) => match chunk.get(offset..offset + instance.count()) {
+                Some(fields) => fields,
+                None => &[],
+            },
+            None => &[],
+        }
+    }
+
+    /// One field, or `None` if the instance does not have that many.
+    pub fn instance_field(&self, id: ObjectId, index: usize) -> Option<Value> {
+        self.instance_fields(id).get(index).copied()
+    }
+
+    /// Store one field, growing the instance if it is short.
+    ///
+    /// **Growing means relocating**, because the arena is packed: the run
+    /// moves to the end and the old one becomes a hole that the next
+    /// compaction reclaims. It is a path that should not run -- an instance is
+    /// created with the field count its class declares -- but the field index
+    /// comes from bytecode, so it is handled rather than trusted.
+    pub fn set_instance_field(&mut self, id: ObjectId, index: usize, value: Value) {
+        let Some(instance) = self.instance(id) else {
+            return;
+        };
+        let (at, count) = (instance.at(), instance.count());
+        if index < count {
+            let (chunk, offset) = Self::field_place(at);
+            if let Some(slot) = self
+                .chunks
+                .get_mut(chunk)
+                .and_then(|c| c.get_mut(offset + index))
+            {
+                *slot = value;
+            }
+            self.wrote(id, value);
+            return;
+        }
+
+        // Growing means relocating, because a run is packed against its
+        // neighbour. The old run becomes a hole the next compaction closes.
+        let wanted = index + 1;
+        let mut grown = self.instance_fields(id).to_vec();
+        grown.resize(wanted, Value::NULL);
+        grown[index] = value;
+        let moved = self.place_fields(&grown);
+        if let Some(instance) = self.instance_mut(id) {
+            instance.moved_to(moved, wanted);
+        }
+        self.bytes += (wanted - count) * core::mem::size_of::<Value>();
+        self.wrote(id, value);
+    }
+
     /// A heap object's field now holds `new` where it held `old`.
     ///
     /// **The whole of the write barrier.** If an *old* object has just been
@@ -854,6 +1024,91 @@ impl Heap {
         }
     }
 
+    /// Close the holes a sweep left in the field arena.
+    ///
+    /// **The one place anything moves, and it moves contents rather than
+    /// objects.** A dead instance leaves its run of fields behind as a gap;
+    /// without this the arena only grows. Every live instance's fields are
+    /// copied down in order and its start index rewritten -- which is
+    /// invisible outside this file, because a handle still names the same
+    /// slot in the same table.
+    ///
+    /// Only at a full collection. A minor one leaves its holes for the next
+    /// major to close, because walking every instance is a cost proportional
+    /// to the live set and that is exactly what a minor collection exists not
+    /// to pay.
+    fn compact_fields(&mut self) {
+        // **In place, in source order.** Compacting moves every run to an
+        // address at or below where it was, so copying them in increasing
+        // order of where they *are* can never overwrite one that has not been
+        // copied yet. Building a fresh set of chunks instead would mean
+        // holding two copies of the arena at once, which on a fixed heap is
+        // the spike this whole structure exists to avoid.
+        let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+        for index in 0..self.instances.slots.len() {
+            let index = index as u32;
+            if let Some(instance) = self.instances.get(index) {
+                runs.push((instance.at() as u32, instance.count() as u32, index));
+            }
+        }
+        runs.sort_unstable();
+
+        let mut write_chunk = 0usize;
+        let mut write_offset = 0usize;
+        let mut run: Vec<Value> = Vec::new();
+        for (at, count, index) in runs {
+            let count = count as usize;
+            let (from_chunk, from_offset) = Self::field_place(at as usize);
+
+            // A run never straddles a chunk, so a destination that would have
+            // to moves to the next one and the remainder of this one is lost.
+            // At most a couple of hundred bytes, against a doubling arena that
+            // could ask the allocator for a hundred kilobytes.
+            while write_chunk < self.chunks.len()
+                && write_offset + count > self.chunks[write_chunk].len()
+            {
+                write_chunk += 1;
+                write_offset = 0;
+            }
+            if write_chunk >= self.chunks.len() {
+                break;
+            }
+
+            if (write_chunk, write_offset) != (from_chunk, from_offset) {
+                run.clear();
+                for step in 0..count {
+                    let value = self.chunks[from_chunk]
+                        .get(from_offset + step)
+                        .copied()
+                        .unwrap_or(Value::NULL);
+                    run.push(value);
+                }
+                self.chunks[write_chunk][write_offset..write_offset + count].copy_from_slice(&run);
+                if let Some(instance) = self.instances.get_mut(index) {
+                    instance.moved_to((write_chunk << FIELD_OFFSET_BITS) | write_offset, count);
+                }
+            }
+            write_offset += count;
+        }
+
+        // **Emptied chunks are kept, not freed.** A program that spikes and
+        // settles refills them; handing them back only to ask again is how a
+        // fixed heap fragments. But keeping one for every chunk in use doubles
+        // the arena, which is worse than the fragmentation -- so one is kept,
+        // and the rest go back.
+        self.chunk_used = write_offset;
+        let needed = match self.chunks.is_empty() {
+            true => 0,
+            false => write_chunk + 1,
+        };
+        while self.chunks.len() > needed {
+            if let Some(chunk) = self.chunks.pop() {
+                self.spare_chunks.push(chunk);
+            }
+        }
+        self.spare_chunks.truncate(1);
+    }
+
     /// Empty a slot and put it back on its table's free list.
     ///
     /// Dropping the payload releases whatever its `Vec`s held.
@@ -894,7 +1149,17 @@ impl Heap {
             Some(ObjectType::Closure) => trace_slot(self.closures.get(index), gray),
             Some(ObjectType::Fn) => trace_slot(self.functions.get(index), gray),
             Some(ObjectType::Fiber) => trace_slot(self.fibers.get(index), gray),
-            Some(ObjectType::Instance) => trace_slot(self.instances.get(index), gray),
+            Some(ObjectType::Instance) => {
+                trace_slot(self.instances.get(index), gray);
+                // The fields are in the arena, which `ObjInstance::trace`
+                // cannot reach. This is the one type the collector knows more
+                // about than the type knows about itself.
+                for field in self.instance_fields(id) {
+                    if let Some(referent) = field.as_object() {
+                        gray.push(referent);
+                    }
+                }
+            }
             Some(ObjectType::List) => trace_slot(self.lists.get(index), gray),
             Some(ObjectType::Map) => trace_slot(self.maps.get(index), gray),
             Some(ObjectType::Range) => trace_slot(self.ranges.get(index), gray),
@@ -1327,6 +1592,7 @@ impl Heap {
         for id in &dead {
             self.discard(*id);
         }
+        self.compact_fields();
         // A full collection settles the generations too: whatever is still
         // here has survived one, so it is old, and no old object can be
         // pointing at anything young.

@@ -49,7 +49,7 @@ const SLOT: u64 = 24;
 /// `Value` offer no niche between them -- which mattered because upvalues are
 /// 19.2% of everything allocated. Biasing its stack slot by one makes the
 /// field `NonZeroU32`, and that is the niche.
-const OWN: [u64; 10] = [4, 16, 4, 16, 12, 16, 24, 16, 16, 4];
+const OWN: [u64; 10] = [4, 16, 4, 12, 12, 16, 24, 16, 16, 4];
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();

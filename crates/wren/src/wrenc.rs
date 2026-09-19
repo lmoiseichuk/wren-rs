@@ -387,9 +387,7 @@ fn write_constant(
         }
         Some(ObjectType::Instance) => {
             out.push(8);
-            let Some(fields) = vm.heap.instance(id).map(|it| it.fields.clone()) else {
-                return Ok(());
-            };
+            let fields = vm.heap.instance_fields(id).to_vec();
             write_u32(out, fields.len() as u32);
             for field in fields {
                 write_constant(vm, out, field, names)?;
@@ -615,9 +613,7 @@ fn read_constant(
             }
             // The only instance that can be a constant is a `ClassAttributes`.
             let class = vm.class_attributes_class;
-            Ok(Value::object(vm.heap.allocate(Object::Instance(
-                crate::object::ObjInstance { class, fields },
-            ))))
+            Ok(Value::object(vm.heap.new_instance(class, &fields)))
         }
         _ => Err(LoadError::Malformed("unknown constant tag")),
     }

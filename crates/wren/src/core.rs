@@ -46,8 +46,8 @@ use alloc::vec::Vec;
 use crate::handle::ObjectId;
 use crate::math;
 use crate::object::{
-    MapEntry, ObjClass, ObjFiber, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object,
-    ObjectType, Primitive,
+    MapEntry, ObjClass, ObjFiber, ObjList, ObjMap, ObjRange, ObjString, Object, ObjectType,
+    Primitive,
 };
 use crate::value::{Num, Value};
 use crate::vm::{RuntimeError, Switch, Vm};
@@ -1739,24 +1739,14 @@ fn join_sequence(
 }
 
 fn new_view(vm: &mut Vm, class: crate::handle::ObjectId, fields: &[Value]) -> Value {
-    let id = vm.heap.allocate(Object::Instance(ObjInstance {
-        class,
-        fields: fields.to_vec(),
-    }));
-    Value::object(id)
+    Value::object(vm.heap.new_instance(class, fields))
 }
 
 fn set_instance_field(vm: &mut Vm, value: Value, index: usize, to: Value) {
     let Some(id) = value.as_object() else {
         return;
     };
-    if let Some(instance) = vm.heap.instance_mut(id) {
-        if instance.fields.len() <= index {
-            instance.fields.resize(index + 1, Value::NULL);
-        }
-        instance.fields[index] = to;
-    }
-    vm.heap.wrote(id, to);
+    vm.heap.set_instance_field(id, index, to);
 }
 
 fn function_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeError> {
@@ -2345,10 +2335,7 @@ fn install_map(vm: &mut Vm) {
             _ => return Err(RuntimeError::new("Invalid map iterator.")),
         };
         let class = vm.map_entry_class;
-        let id = vm.heap.allocate(Object::Instance(ObjInstance {
-            class,
-            fields: alloc::vec![entry.key, entry.value],
-        }));
+        let id = vm.heap.new_instance(class, &[entry.key, entry.value]);
         Ok(Value::object(id))
     });
 
@@ -2402,10 +2389,7 @@ fn install_map(vm: &mut Vm) {
         let key = argument(vm, at, 1);
         let value = argument(vm, at, 2);
         let class = vm.map_entry_class;
-        let id = vm.heap.allocate(Object::Instance(ObjInstance {
-            class,
-            fields: alloc::vec![key, value],
-        }));
+        let id = vm.heap.new_instance(class, &[key, value]);
         Ok(Value::object(id))
     });
 
@@ -2424,9 +2408,9 @@ fn install_map(vm: &mut Vm) {
 }
 
 fn instance_field(vm: &Vm, value: Value, index: usize) -> Value {
-    match value.as_object().and_then(|id| vm.heap.instance(id)) {
-        Some(instance) => instance.fields.get(index).copied().unwrap_or(Value::NULL),
-        _ => Value::NULL,
+    match value.as_object() {
+        Some(id) => vm.heap.instance_field(id, index).unwrap_or(Value::NULL),
+        None => Value::NULL,
     }
 }
 
@@ -3280,11 +3264,8 @@ fn new_random(vm: &mut Vm, class: crate::handle::ObjectId, seed: u32) -> Value {
     for _ in 0..8 {
         step(&mut state);
     }
-    let fields = state.iter().flat_map(|word| halves(*word)).collect();
-    let id = vm
-        .heap
-        .allocate(Object::Instance(ObjInstance { class, fields }));
-    Value::object(id)
+    let fields: Vec<Value> = state.iter().flat_map(|word| halves(*word)).collect();
+    Value::object(vm.heap.new_instance(class, &fields))
 }
 
 /// Split a state word into the two 16-bit numbers it is stored as.
@@ -3296,13 +3277,8 @@ fn halves(word: u32) -> [Value; 2] {
 }
 
 /// Read one 16-bit half back out of an instance's fields.
-fn field_half(instance: &ObjInstance, slot: usize) -> u32 {
-    match instance
-        .fields
-        .get(slot)
-        .copied()
-        .and_then(|value| value.as_num())
-    {
+fn field_half(fields: &[Value], slot: usize) -> u32 {
+    match fields.get(slot).copied().and_then(|value| value.as_num()) {
         Some(half) => half as u32 & 0xffff,
         None => 0,
     }
@@ -3325,23 +3301,21 @@ fn next_u32(vm: &mut Vm, receiver: Value) -> u32 {
         return 0;
     };
     let mut state = [0u32; 4];
-    match vm.heap.instance(id) {
-        Some(instance) => {
-            for (word, slot) in state.iter_mut().zip((0..8).step_by(2)) {
-                let low = field_half(instance, slot);
-                let high = field_half(instance, slot + 1);
-                *word = low | (high << 16);
-            }
-        }
-        _ => return 0,
+    let fields = vm.heap.instance_fields(id);
+    if fields.len() < 8 {
+        return 0;
     }
+    for (word, slot) in state.iter_mut().zip((0..8).step_by(2)) {
+        let low = field_half(fields, slot);
+        let high = field_half(fields, slot + 1);
+        *word = low | (high << 16);
+    }
+
     let value = step(&mut state);
-    if let Some(instance) = vm.heap.instance_mut(id) {
-        for (word, slot) in state.iter().zip((0..8).step_by(2)) {
-            let [low, high] = halves(*word);
-            instance.fields[slot] = low;
-            instance.fields[slot + 1] = high;
-        }
+    for (word, slot) in state.iter().zip((0..8).step_by(2)) {
+        let [low, high] = halves(*word);
+        vm.heap.set_instance_field(id, slot, low);
+        vm.heap.set_instance_field(id, slot + 1, high);
     }
     value
 }
