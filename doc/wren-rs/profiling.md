@@ -479,6 +479,39 @@ not on its own a reason to change it.
 
 ---
 
+**Cheaper operand reads, in three forms, all refused.** Each operand byte of an
+instruction is bounds-checked separately, and `read_short` reads two. Taking a
+fixed-size window over the code once per instruction should replace all of that
+with a single check, in safe Rust, because indexing a `&[u8; N]` with a
+constant needs no check at all. The chunk is padded so a window always exists;
+`Chunk::seal` does that where the compiler finishes a function and where a file
+is read.
+
+| form | `method_call` | `fib` | `binary_trees` |
+|---|---|---|---|
+| **copied** window, `*chunk.window(at)` | +29.1% | +27.4% | +21.9% |
+| **borrowed** window via `first_chunk` | +2.76% | +1.75% | +3.18% |
+| borrowed window via a constant-width range | +1.21% | −0.44% | +1.84% |
+
+The first is the instructive one. An instruction starts wherever it starts, so
+the window is unaligned, and copying eight unaligned bytes on this part is
+eight byte loads and eight byte stores -- not the two word loads the shape of
+`[u8; 8]` suggests. That is a 27% regression from a line that looks free.
+
+The other two say the idea does not pay even done properly, and the reason is
+that **the checks were mostly not there to begin with**: `read_short` reads
+`code[offset]` and `code[offset + 1]` in one basic block, and the optimiser
+merges those into a single check of the larger index. So a window saves at most
+one check per instruction and costs a pointer kept live across the arm, which
+in a function this size means register pressure. Roughly a wash, measured as a
+small loss.
+
+*The general shape again: the cost that was being removed had already been
+removed by the compiler, and the only way to find that out was to build it.*
+The padding, `seal` and `code_len` are not in the tree.
+
+---
+
 ## The protocol, as it now stands
 
 | the change is… | measure it by |
