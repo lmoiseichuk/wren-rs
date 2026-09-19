@@ -2057,39 +2057,59 @@ impl Vm {
                 }
             }
 
-            // **Between instructions, and only here.** Upstream collects inside
-            // the allocator, which means any allocation can free an object the
-            // caller is half way through building and holding only in a C
-            // local; upstream handles that with a stack of temporary roots the
-            // caller must remember to push, and forgetting one is a classic
-            // source of collector bugs.
-            //
-            // Checking here instead costs a branch per instruction and removes
-            // the whole category: at an instruction boundary the live set is
-            // exactly what `roots` enumerates, with nothing in flight.
-            //
-            // **The nursery is asked first.** A minor collection costs the
-            // young generation; a major costs the live set. Checking the major
-            // threshold first meant it always won -- the heap passes 1.5x its
-            // live size long before a thousand objects accumulate -- and the
-            // nursery never collected at all.
-            if NURSERY && self.heap.young() >= NURSERY_OBJECTS {
-                // **The cheap half of collection**, at the same safe point and
-                // for the same reason. A minor collection costs the young
-                // generation and the remembered set rather than the live set,
-                // so it is worth doing often -- and 84% of what it looks at is
-                // already dead.
-                if let Some(frame) = self.frames.last_mut() {
-                    frame.ip = ip;
-                }
-                self.collect_young();
-            } else if self.heap.should_collect() {
-                if let Some(frame) = self.frames.last_mut() {
-                    frame.ip = ip;
-                }
-                let roots = self.roots();
-                self.heap.collect(roots);
+
+            // **One boolean per instruction, not four field reads.** The two
+            // tests this used to make read `paused`, `bytes`, `young_bytes`
+            // and `threshold` and do saturating arithmetic on them -- about
+            // ten machine instructions, on opcodes like `Pop` and `Jump` that
+            // cost thirty-nine in total. None of those four can change except
+            // by allocating, so the heap works the answer out when it
+            // allocates and leaves it here to be read.
+            if (NURSERY && self.heap.young() >= NURSERY_OBJECTS) || self.heap.collection_due() {
+                self.collect_point(ip);
             }
+        }
+    }
+
+    /// Collect, if the instruction just executed pushed the heap far enough.
+    ///
+    /// **At an instruction boundary, and only after one that could allocate.**
+    /// Upstream collects inside the allocator, which means any allocation can
+    /// free an object the caller is half way through building and holding only
+    /// in a C local; upstream handles that with a stack of temporary roots the
+    /// caller must remember to push, and forgetting one is a classic source of
+    /// collector bugs. Checking at a boundary removes the whole category: the
+    /// live set there is exactly what `roots` enumerates, with nothing in
+    /// flight.
+    ///
+    /// **Reached only when the heap says so.** The test at the call site is a
+    /// single boolean the heap maintains, so everything below is out of the
+    /// dispatch loop's way; `#[inline(always)]` is deliberate, because what
+    /// should be inlined is the branch, not the collection.
+    ///
+    /// **The nursery is asked first.** A minor collection costs the young
+    /// generation; a major costs the live set. Checking the major threshold
+    /// first meant it always won -- the heap passes 1.5x its live size long
+    /// before a thousand objects accumulate -- and the nursery never collected
+    /// at all.
+    #[inline(always)]
+    fn collect_point(&mut self, ip: usize) {
+        if NURSERY && self.heap.young() >= NURSERY_OBJECTS {
+            // **The cheap half of collection**, at the same safe point and
+            // for the same reason. A minor collection costs the young
+            // generation and the remembered set rather than the live set,
+            // so it is worth doing often -- and 84% of what it looks at is
+            // already dead.
+            if let Some(frame) = self.frames.last_mut() {
+                frame.ip = ip;
+            }
+            self.collect_young();
+        } else if self.heap.should_collect() {
+            if let Some(frame) = self.frames.last_mut() {
+                frame.ip = ip;
+            }
+            let roots = self.roots();
+            self.heap.collect(roots);
         }
     }
 

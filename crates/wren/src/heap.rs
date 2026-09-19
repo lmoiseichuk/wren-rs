@@ -432,6 +432,19 @@ pub struct Heap {
     young_total: usize,
     /// What those objects cost, so a major collection is not triggered by them.
     young_bytes: usize,
+    /// Whether [`Heap::should_collect`] currently answers yes.
+    ///
+    /// **A cached answer, because the question is asked far more often than it
+    /// changes.** The VM asks after every instruction; the four fields the
+    /// answer depends on -- `paused`, `bytes`, `young_bytes` and `threshold`
+    /// -- move only when something allocates or a collection finishes. Reading
+    /// one boolean is about three machine instructions where recomputing it is
+    /// about ten, on opcodes that cost thirty-nine in total.
+    ///
+    /// Kept honest by a `debug_assert` in [`Heap::collection_due`], so a path
+    /// that changes one of those four and forgets [`Heap::refresh_due`] fails
+    /// in the tests rather than by quietly never collecting again.
+    due: bool,
     /// A reusable buffer for the short reference lists the barriers build.
     ///
     /// **Without this, counting cost an allocation per allocation.** Every
@@ -531,6 +544,7 @@ impl Heap {
             spare_chunks: Vec::new(),
             young_total: 0,
             young_bytes: 0,
+            due: false,
             scratch: Vec::new(),
             #[cfg(feature = "profile")]
             profile: Profile::default(),
@@ -622,6 +636,7 @@ impl Heap {
         }
 
         self.bytes += cost;
+        self.refresh_due();
         #[cfg(feature = "profile")]
         {
             self.profile.allocated_bytes += cost as u64;
@@ -887,6 +902,7 @@ impl Heap {
             instance.moved_to(moved, wanted);
         }
         self.bytes += (wanted - count) * core::mem::size_of::<Value>();
+        self.refresh_due();
         self.wrote(id, value);
     }
 
@@ -1331,6 +1347,7 @@ impl Heap {
         // `set_growth` clamps: this is set once at start-up and a typo in it
         // should not be an infinite loop.
         self.headroom = bytes.map(|bytes| bytes.max(MIN_HEADROOM));
+        self.refresh_due();
     }
 
     /// The ceiling on floating garbage, if one is set.
@@ -1358,6 +1375,23 @@ impl Heap {
     ///
     /// The VM asks this between instructions, where its roots are well defined,
     /// rather than having the answer forced on it mid-allocation.
+    /// Recompute the cached answer. Called wherever its inputs change.
+    fn refresh_due(&mut self) {
+        self.due = self.should_collect();
+    }
+
+    /// The cached answer to [`Heap::should_collect`], which is what the
+    /// interpreter reads between instructions.
+    #[inline(always)]
+    pub fn collection_due(&self) -> bool {
+        debug_assert_eq!(
+            self.due,
+            self.should_collect(),
+            "a change to the heap did not refresh whether collection is due"
+        );
+        self.due
+    }
+
     pub fn should_collect(&self) -> bool {
         // **A major collection is about the old generation.** Counting the
         // nursery towards its threshold means the major always fires first --
@@ -1375,10 +1409,12 @@ impl Heap {
     /// mechanism.
     pub fn pause(&mut self) {
         self.paused = true;
+        self.refresh_due();
     }
 
     pub fn resume(&mut self) {
         self.paused = false;
+        self.refresh_due();
     }
 
     /// Check the invariant a minor collection depends on.
@@ -1557,6 +1593,7 @@ impl Heap {
         });
         self.young_total = 0;
         self.young_bytes = 0;
+        self.refresh_due();
 
         #[cfg(feature = "profile")]
         {
@@ -1696,6 +1733,7 @@ impl Heap {
             }
         };
         self.collections += 1;
+        self.refresh_due();
 
         Collection {
             before,
