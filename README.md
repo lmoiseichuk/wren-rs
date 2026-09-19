@@ -66,10 +66,10 @@ identical constants on every implementation. Method and caveats:
 
 | benchmark | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| `binary_trees` depth 9 | 7.851 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 13.843 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.494 s | **0.130 s** | 0.154 s |
-| `method_call` | 2.021 s | **0.350 s** | 1.748 s |
+| `binary_trees` depth 9 | 7.625 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 13.497 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.489 s | **0.130 s** | 0.154 s |
+| `method_call` | 1.952 s | **0.350 s** | 1.748 s |
 | **VM resident** | **22,920 B** | 83,036 B | — |
 
 **Four to seven times slower than C, and 72% smaller resident.** The speed is

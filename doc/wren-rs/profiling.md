@@ -613,6 +613,34 @@ it up in a table, and would face exactly this arithmetic.
 
 ---
 
+## Where the interpreter's time goes now
+
+After a day of it, `method_call`'s profile is flat: `run_frames` itself is 21
+samples of 50 and nothing else is above 3. `binary_trees` has one peak left,
+`Heap::collect` at 6 of 50, which is the collector rather than the interpreter.
+
+**What is left is fetch, not execute.** Cycles per instruction sit at 2.58,
+and the changes that moved the clock furthest were the ones that made the code
+*smaller* rather than the ones that made it do less:
+
+| change | work | time |
+|---|---|---|
+| fusing five opcode pairs | −5.7% | −7.3% |
+| moving cold code out of the loop | −0.8% | −2.7% |
+| padding branch targets | 0% | −3.9% |
+
+The last of those removes no instructions at all. `run_frames` compiles to
+17,698 bytes against a 32 KB instruction cache which also serves every
+primitive it calls, and the whole hot set does not comfortably fit.
+
+**So the levers that remain are about size, and they are getting thin.**
+`Op::Closure` and `Op::Class` are rare and long and look like obvious things to
+move out of line; doing it made the function 48 bytes *bigger*, because LLVM
+had already outlined them. The cheap error paths were worth 2,800 bytes and
+2.5% of the clock; there is no second batch of that size.
+
+---
+
 ## The protocol, as it now stands
 
 | the change is… | measure it by |
