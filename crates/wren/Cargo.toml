@@ -35,6 +35,10 @@ name = "wren"
 name = "heap-profile"
 required-features = ["profile"]
 
+[[example]]
+name = "op-profile"
+required-features = ["profile", "std"]
+
 [dependencies]
 libm = { version = "0.2", optional = true }
 

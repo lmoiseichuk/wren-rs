@@ -364,6 +364,19 @@ pub struct Vm {
     /// tests assert on output without a mock, and it is the smaller thing to
     /// change later.
     pub output: Vec<u8>,
+
+    /// How many times each opcode was executed, indexed by its byte.
+    ///
+    /// **A sampling profiler names the code the time was in; this names the
+    /// work the program asked for.** The two disagree on this part, because a
+    /// sample lands on whatever retires after a fetch stall rather than on
+    /// whatever caused it -- see [`doc/wren-rs/profiling.md`]. An opcode
+    /// histogram cannot be wrong in that way: it is what the bytecode said.
+    ///
+    /// Behind `--features profile`, so a shipping build carries neither the
+    /// array nor the increment.
+    #[cfg(feature = "profile")]
+    pub op_counts: [u64; 256],
 }
 
 impl Vm {
@@ -456,6 +469,8 @@ impl Vm {
             open_upvalues: Vec::new(),
             root_handles: Vec::new(),
             output: Vec::new(),
+            #[cfg(feature = "profile")]
+            op_counts: [0; 256],
         };
         // `List`, `Map`, `Range` and `String` are sequences.
         for class in [list_class, map_class, range_class, string_class] {
@@ -1489,6 +1504,10 @@ impl Vm {
             let at = ip;
             let byte = chunk.code[at];
             ip += 1;
+            #[cfg(feature = "profile")]
+            {
+                self.op_counts[byte as usize] += 1;
+            }
 
             let Some(op) = Op::from_byte(byte) else {
                 return Err(RuntimeError {

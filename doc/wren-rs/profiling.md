@@ -330,6 +330,53 @@ other three, which capped what any replacement collector could win — is in
 
 ---
 
+## What the interpreter is actually asked to do
+
+A sampling profiler names the code a sample landed in. An opcode histogram
+names the work the program asked for, and cannot be misattributed by a fetch
+stall. `cargo run --release --features profile,std --example op-profile
+<benchmark>` prints one.
+
+| opcode | `method_call` | `fib` | `binary_trees` | `list_build` |
+|---|---|---|---|---|
+| `Call` | 20.8% | **31.8%** | 21.1% | 20.7% |
+| `LoadLocal` | 12.8% | **31.8%** | **26.8%** | **34.5%** |
+| `LoadFieldThis` | 15.2% | — | 8.4% | — |
+| `Pop` | 13.6% | — | 8.4% | 13.8% |
+| `Return` | 10.4% | 9.1% | 8.5% | — |
+| `Constant` | 3.2% | 18.2% | — | — |
+| `JumpIf` | 4.0% | 9.1% | — | — |
+| bytecode instructions | 1,250,137 | 8,252,786 | 3,549,406 | 290,048 |
+
+**Set that beside the machine instructions the board retires and one number
+falls out of it:**
+
+| | bytecode ops | instructions retired | machine instructions per opcode |
+|---|---|---|---|
+| `method_call` | 1,250,137 | 141,955,880 | **113.6** |
+| `fib` | 8,252,786 | 936,236,660 | **113.4** |
+| `list_build` | 290,048 | 33,547,694 | **115.7** |
+| `binary_trees` | 3,549,406 | 527,728,497 | **148.7** |
+
+**A hundred and fourteen machine instructions per bytecode instruction**, and
+strikingly constant across three programs of completely different shapes — the
+fourth is higher because it is the one that collects. Upstream C Wren runs
+`method_call` 6.8 times faster, which puts it near seventeen. That ratio is the
+whole gap, stated as work rather than as seconds, and it is the number any
+future optimisation should be judged against.
+
+*The arithmetic checks out against the clock, which is worth doing before
+believing a derived figure: 1.25 million opcodes at 113.6 instructions and 2.59
+cycles per instruction is 368 million cycles, and `method_call` at 160 MHz
+takes 2.30 s — 368 million cycles.*
+
+`Call` is between a fifth and a third of every profile, and in `fib` it ties
+`LoadLocal` almost exactly — because arithmetic in Wren *is* method calls, so
+`a - b` dispatches. That makes the call path, in both its forms, the first
+thing worth understanding at this level of detail.
+
+---
+
 ## Which benchmark to optimise against, and in what order
 
 The four are not interchangeable, and two of them answer questions the others
