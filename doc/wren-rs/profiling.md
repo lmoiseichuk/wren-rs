@@ -563,6 +563,56 @@ The padding, `seal` and `code_len` are not in the tree.
 
 ---
 
+## The method cache, built twice and refused
+
+`find_method` was the largest named item in the profile of `fib` -- 7 samples
+of 60 against 2 for the `+` primitive it was looking up -- and it is four
+dependent loads: a table slot holding a `Box`, the `Box`, the `ObjClass`'s
+`Vec` of entries, and the entry. Caching that is the textbook answer.
+
+**The measurements first**, because they say the cache should work:
+
+| | lookups | distinct `(class, symbol)` pairs | call sites | monomorphic |
+|---|---|---|---|---|
+| `method_call` | 270,020 | **19** | 38 | **100%** |
+| `fib` | 2,625,874 | **11** | 18 | **100%** |
+| `binary_trees` | 750,321 | **20** | 67 | 86.7% |
+
+Millions of lookups asking a dozen distinct questions, and essentially every
+call site asks the same one every time. Sixty-four slots hit **99.98% or
+better** on all four benchmarks. A per-call-site cache, which would need a
+bytecode change, could not do better than that.
+
+**And it was slower.** Twice:
+
+| | `method_call` | `fib` | `binary_trees` |
+|---|---|---|---|
+| 64-bit key, two-multiply hash | +4.64% | +6.58% | +3.31% |
+| one-word key, one-multiply hash | +3.54% | +4.97% | +2.53% |
+
+Time moved the same way: `fib` 13.843 s to 14.552 even in the cheaper form.
+
+**The reason is that there is no memory hierarchy to defeat.** A method cache
+is worth having on a machine where chasing four pointers means four chances to
+miss cache and stall for a hundred cycles. This part executes from flash
+through a cache but keeps *data* in SRAM with nothing in front of it, so every
+one of those loads costs the same two or three cycles whether it is the first
+or the fortieth. Four cheap loads beat a hash, a key comparison and a load,
+and no hit rate can change that.
+
+*This is the sharpest instance of the rule this whole page is about: the
+optimisation was chosen from a profile that named the right function, sized
+with measurements that said it would hit, and it still lost -- because the
+reason the textbook recommends it does not hold on this part. The profile said
+where the time was. Only the experiment said whether the fix helped.*
+
+The instrument that sized it is still here -- `op-profile` reports the distinct
+pairs and the monomorphic share -- because the same question comes up for
+quickening, which rewrites a call site to its resolved form rather than looking
+it up in a table, and would face exactly this arithmetic.
+
+---
+
 ## The protocol, as it now stands
 
 | the change is… | measure it by |

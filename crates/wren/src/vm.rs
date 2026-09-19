@@ -405,6 +405,23 @@ pub struct Vm {
     /// megabyte, which is not something to put in every `Vm`.
     #[cfg(feature = "profile")]
     pub op_pairs: alloc::vec::Vec<u64>,
+    /// Every `(class, symbol)` a method lookup asked for, and how often.
+    ///
+    /// **To size a method cache before building one.** If a whole program asks
+    /// about a few dozen pairs, a small table answers nearly everything; if it
+    /// asks about thousands, a direct-mapped cache thrashes. It turned out to
+    /// be a few dozen -- and a cache still lost, for reasons that are in
+    /// `doc/wren-rs/profiling.md`.
+    #[cfg(feature = "profile")]
+    pub lookups: alloc::collections::BTreeMap<(u32, u32), u64>,
+    /// Per call site: which classes its receiver has had, and how often it ran.
+    ///
+    /// **A call site that only ever sees one class is monomorphic**, and one
+    /// cached entry at the site would answer it every time. How much of a
+    /// program is monomorphic is what decides whether a per-site cache could
+    /// beat a shared one -- and here essentially all of it is, so it could not.
+    #[cfg(feature = "profile")]
+    pub call_sites: alloc::collections::BTreeMap<(usize, usize), (alloc::vec::Vec<u32>, u64)>,
     /// The opcode before the one now running, for the pair counter.
     #[cfg(feature = "profile")]
     previous_op: u16,
@@ -516,6 +533,10 @@ impl Vm {
             op_counts: [0; 256],
             #[cfg(feature = "profile")]
             op_pairs: alloc::vec![0; 256 * 256],
+            #[cfg(feature = "profile")]
+            lookups: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "profile")]
+            call_sites: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "profile")]
             previous_op: u16::MAX,
             #[cfg(feature = "profile")]
@@ -1782,6 +1803,21 @@ impl Vm {
                     };
 
                     let receiver_at = self.stack.len() - arity - 1;
+                    #[cfg(feature = "profile")]
+                    {
+                        *self
+                            .lookups
+                            .entry((start_from.raw(), symbol as u32))
+                            .or_insert(0) += 1;
+                        let site = self
+                            .call_sites
+                            .entry((Rc::as_ptr(&chunk) as usize, at))
+                            .or_insert_with(|| (alloc::vec::Vec::new(), 0));
+                        site.1 += 1;
+                        if !site.0.contains(&start_from.raw()) {
+                            site.0.push(start_from.raw());
+                        }
+                    }
                     let found = self.find_method(start_from, symbol);
                     let Some(method) = found else {
                         let name = self.method_names.name(symbol).unwrap_or("?").to_string();

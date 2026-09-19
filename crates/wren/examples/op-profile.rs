@@ -97,6 +97,30 @@ fn main() {
         println!();
         println!("{:<40} {:>14} {:>8}", "adjacent pair", "count", "share");
         println!("{}", "-".repeat(64));
+        // **What a method cache would have to answer.** Not how many lookups
+        // there are -- how few distinct questions they ask, and whether each
+        // call site asks the same one every time.
+        let asked: u64 = vm.lookups.values().sum();
+        let sites_total: u64 = vm.call_sites.values().map(|(_, count)| count).sum();
+        let monomorphic: u64 = vm
+            .call_sites
+            .values()
+            .filter(|(classes, _)| classes.len() == 1)
+            .map(|(_, count)| count)
+            .sum();
+        println!();
+        println!("method lookups");
+        println!(
+            "  {asked} lookups asking {} distinct (class, symbol) pairs",
+            vm.lookups.len()
+        );
+        println!(
+            "  {} call sites, {} of them monomorphic -- {:.1}% of lookups",
+            vm.call_sites.len(),
+            vm.call_sites.values().filter(|(c, _)| c.len() == 1).count(),
+            monomorphic as f64 * 100.0 / sites_total.max(1) as f64
+        );
+
         for (index, count) in pairs.into_iter().take(10) {
             let name = |byte: u8| match Op::from_byte(byte) {
                 Some(op) => format!("{op:?}"),
