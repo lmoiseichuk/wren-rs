@@ -171,6 +171,8 @@ impl FnState {
 struct ClassState {
     /// The class's own name, for its error messages.
     name: String,
+    /// Runtime attributes per method signature, in declaration order.
+    method_attributes: Vec<(String, Vec<(Option<String>, String, Value)>)>,
     /// Signatures already defined, so a duplicate is caught rather than
     /// silently replacing the first one -- which would look like the earlier
     /// definition simply never ran.
@@ -251,6 +253,22 @@ struct Compiler<'a> {
     method_depth: usize,
     /// Parameter names parsed by the signature, waiting for the body's scope.
     pending_parameters: Vec<String>,
+    /// Runtime attributes seen since the last class or method, waiting to be
+    /// attached to whichever comes next.
+    ///
+    /// Each entry is `(group, key, value)` with `None` for an ungrouped one.
+    /// Only `#!` attributes land here: a plain `#` is parsed and discarded, so
+    /// it costs a running program nothing.
+    pending_attributes: Vec<(Option<String>, String, Value)>,
+    /// How many attributes have been seen since the last class or method,
+    /// counted separately from the ones kept.
+    ///
+    /// **A compile-time attribute stores nothing**, so the stored list is
+    /// empty for `#meta` and cannot say whether an attribute was written. Only
+    /// a count can, and misplacing a compile-time attribute has to be an error
+    /// too -- otherwise a typo in tooling metadata is invisible. Upstream
+    /// keeps the same separate counter for the same reason.
+    attributes_seen: usize,
     /// Which module's namespace `var` at the top level writes into.
     ///
     /// Passed in rather than assumed to be zero, because compiling an imported
@@ -276,6 +294,8 @@ impl<'a> Compiler<'a> {
             classes: Vec::new(),
             method_depth: 0,
             pending_parameters: Vec::new(),
+            pending_attributes: Vec::new(),
+            attributes_seen: 0,
             module,
         }
     }
@@ -507,6 +527,22 @@ impl<'a> Compiler<'a> {
     // --- declarations and statements ----------------------------------------
 
     fn declaration(&mut self) -> Result<(), CompileError> {
+        while self.check(TokenKind::Hash) {
+            self.attribute()?;
+        }
+
+        // **Only a class may follow them here.** Inside a class body a method
+        // may, which that loop handles; anywhere else an attribute has nothing
+        // to attach to, and silently dropping it would make a typo invisible.
+        if self.attributes_seen > 0 && !self.check(TokenKind::Class) {
+            self.pending_attributes.clear();
+            self.attributes_seen = 0;
+            return Err(self.error_at(
+                self.current,
+                "Attributes can only specified before a class or a method",
+            ));
+        }
+
         if self.match_token(TokenKind::Import)? {
             self.import_statement()?;
         } else if self.match_token(TokenKind::Class)? {
@@ -521,6 +557,132 @@ impl<'a> Compiler<'a> {
         // a one-line `if`, because `else` would come where the newline was
         // expected. Upstream splits it the same way for the same reason.
         self.consume_line("Expect newline after statement.")
+    }
+
+    /// `#key`, `#key = value`, `#group(key = value, ...)`, each optionally
+    /// after a `!`.
+    ///
+    /// **A `!` means the attribute survives into the running program**, and
+    /// anything without one is parsed and thrown away. That is the whole
+    /// design: attributes are for tooling that reads source, and only the ones
+    /// explicitly marked cost a byte at run time.
+    fn attribute(&mut self) -> Result<(), CompileError> {
+        self.consume(TokenKind::Hash, "Expect '#'.")?;
+        self.attributes_seen += 1;
+        let keep = self.match_token(TokenKind::Bang)?;
+
+        if !self.match_token(TokenKind::Name)? {
+            return Err(self.error_at(self.current, "Expect an attribute definition after #."));
+        }
+        let first = self.previous.text(self.source).to_string();
+
+        if self.match_token(TokenKind::LeftParen)? {
+            // A group: `#!group(a = 1, b)`.
+            self.skip_newlines()?;
+            if self.check(TokenKind::RightParen) {
+                return Err(self.error_at(
+                    self.current,
+                    "Expected attributes in group, group cannot be empty.",
+                ));
+            }
+            loop {
+                self.skip_newlines()?;
+                self.consume(TokenKind::Name, "Expect name for attribute key.")?;
+                let key = self.previous.text(self.source).to_string();
+                let value = self.attribute_value()?;
+                if keep {
+                    self.pending_attributes.push((Some(first.clone()), key, value));
+                }
+                self.skip_newlines()?;
+                if !self.match_token(TokenKind::Comma)? {
+                    break;
+                }
+            }
+            self.skip_newlines()?;
+            self.consume(TokenKind::RightParen, "Expected ')' after grouped attributes.")?;
+        } else if self.check(TokenKind::Eq) || self.check(TokenKind::Line) {
+            let value = self.attribute_value()?;
+            if keep {
+                self.pending_attributes.push((None, first, value));
+            }
+        } else {
+            return Err(self.error_at(
+                self.current,
+                "Expect an equal, newline or grouping after an attribute key.",
+            ));
+        }
+
+        self.consume_line("Expect newline after attribute.")
+    }
+
+    /// `= literal`, or nothing -- which means null.
+    fn attribute_value(&mut self) -> Result<Value, CompileError> {
+        if !self.match_token(TokenKind::Eq)? {
+            return Ok(Value::NULL);
+        }
+        self.advance()?;
+        let token = self.previous;
+        let value = match token.kind {
+            TokenKind::True => Value::TRUE,
+            TokenKind::False => Value::FALSE,
+            TokenKind::Null => Value::NULL,
+            TokenKind::Number => Value::num(
+                token
+                    .number(self.source)
+                    .ok_or_else(|| self.error_at(token, "Invalid number literal."))?,
+            ),
+            TokenKind::String => {
+                let bytes = self.unescaped(token)?;
+                self.vm.new_string_bytes(bytes)
+            }
+            // A bare identifier is its own name as a string, which is what
+            // makes `#!key = value` read the way it looks.
+            TokenKind::Name => {
+                let text = token.text(self.source).to_string();
+                self.vm.new_string(&text)
+            }
+            _ => {
+                return Err(self.error_at(
+                    token,
+                    "Expect a Bool, Num, String or Identifier literal for an attribute value.",
+                ))
+            }
+        };
+        Ok(value)
+    }
+
+    /// Turn a list of `(group, key, value)` into Wren's nested shape:
+    /// `{group: {key: [value, ...]}}`.
+    ///
+    /// The values accumulate into a list per key, which is what lets the same
+    /// key appear more than once in a group and keep both.
+    fn build_attributes(&mut self, entries: &[(Option<String>, String, Value)]) -> Value {
+        let table = crate::core::new_map(self.vm);
+        for (group, key, value) in entries {
+            let group_key = match group {
+                Some(name) => self.vm.new_string(name),
+                None => Value::NULL,
+            };
+            let inner = match crate::core::map_lookup(self.vm, table, group_key) {
+                Some(existing) => existing,
+                None => {
+                    let fresh = crate::core::new_map(self.vm);
+                    crate::core::map_insert(self.vm, table, group_key, fresh);
+                    fresh
+                }
+            };
+            let key_value = self.vm.new_string(key);
+            let items = match crate::core::map_lookup(self.vm, inner, key_value) {
+                Some(existing) => existing,
+                None => {
+                    let fresh = crate::core::new_list(self.vm, Vec::new());
+                    crate::core::map_insert(self.vm, inner, key_value, fresh);
+                    fresh
+                }
+            };
+            crate::core::list_push(self.vm, items, *value);
+        }
+        table
     }
 
     /// `import "name"` and `import "name" for A, B as C`
@@ -1650,6 +1812,10 @@ impl<'a> Compiler<'a> {
     // --- classes ------------------------------------------------------------
 
     fn class_definition(&mut self) -> Result<(), CompileError> {
+        // Whatever attributes preceded `class` belong to this class.
+        let class_attributes = core::mem::take(&mut self.pending_attributes);
+        self.attributes_seen = 0;
+
         self.consume(TokenKind::Name, "Expect class name.")?;
         let name = self.previous.text(self.source).to_string();
         let line = self.line();
@@ -1675,6 +1841,7 @@ impl<'a> Compiler<'a> {
 
         self.classes.push(ClassState {
             name: name.clone(),
+            method_attributes: Vec::new(),
             defined: Vec::new(),
             fields: Vec::new(),
             static_fields: Vec::new(),
@@ -1686,6 +1853,14 @@ impl<'a> Compiler<'a> {
         self.skip_newlines()?;
 
         while !self.check(TokenKind::RightBrace) && !self.check(TokenKind::Eof) {
+            // Attributes attach to the method that follows them.
+            while self.check(TokenKind::Hash) {
+                self.attribute()?;
+                self.skip_newlines()?;
+            }
+            if self.check(TokenKind::RightBrace) || self.check(TokenKind::Eof) {
+                break;
+            }
             self.method()?;
             self.skip_newlines()?;
         }
@@ -1693,6 +1868,33 @@ impl<'a> Compiler<'a> {
 
         let class = self.classes.pop().expect("the class being compiled");
         self.state_mut().chunk.code[field_count_at] = class.fields.len() as u8;
+
+        // Attach the attributes, if the class or any of its methods had one
+        // the runtime can see. A class with only compile-time attributes gets
+        // nothing, which is what `Class.attributes == null` checks.
+        if !class_attributes.is_empty() || !class.method_attributes.is_empty() {
+            let own = if class_attributes.is_empty() {
+                Value::NULL
+            } else {
+                self.build_attributes(&class_attributes)
+            };
+            let methods = if class.method_attributes.is_empty() {
+                Value::NULL
+            } else {
+                let table = crate::core::new_map(self.vm);
+                for (signature, entries) in &class.method_attributes {
+                    let key = self.vm.new_string(signature);
+                    let built = self.build_attributes(entries);
+                    crate::core::map_insert(self.vm, table, key, built);
+                }
+                table
+            };
+
+            let holder = self.vm.new_class_attributes(own, methods);
+            self.load_variable(variable, line);
+            self.emit_constant(holder, line)?;
+            self.chunk_mut().emit_op(Op::SetAttributes, line);
+        }
         Ok(())
     }
 
@@ -1752,6 +1954,23 @@ impl<'a> Compiler<'a> {
         // A constructor's body is an instance method under a name no program
         // can write, and `new` on the metaclass is generated to call it.
         let body_signature = if is_constructor { format!("init {full}") } else { full.clone() };
+
+        // Whatever attributes preceded this method belong to it.
+        let attributes = core::mem::take(&mut self.pending_attributes);
+        self.attributes_seen = 0;
+        if !attributes.is_empty() {
+            self.classes
+                .last_mut()
+                .expect("a class")
+                .method_attributes
+                .push((
+                    // **Keyed as the program would name it**, so a static and
+                    // an instance method of the same signature do not collide:
+                    // `Methods.attributes.methods["static method()"]`.
+                    if is_static { format!("static {full}") } else { full.clone() },
+                    attributes,
+                ));
+        }
 
         let marker = if is_static { format!("static {body_signature}") } else { body_signature.clone() };
         if self.class_state().defined.contains(&marker) {

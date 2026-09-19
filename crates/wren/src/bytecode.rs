@@ -122,6 +122,8 @@ pub enum Op {
     /// constructor body, then a return.
     Construct = 28,
 
+    /// Attach attributes to a class. Pops the attributes, then the class.
+    SetAttributes = 34,
     /// Push static field `operand` of the class this method belongs to.
     /// Operand: `u8`.
     LoadStaticField = 32,
@@ -199,6 +201,7 @@ impl Op {
             31 => Op::ImportVariable,
             32 => Op::LoadStaticField,
             33 => Op::StoreStaticField,
+            34 => Op::SetAttributes,
             _ => return None,
         };
         Some(op)

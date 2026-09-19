@@ -134,6 +134,9 @@ impl Object {
                 // it is worth having actually happened: the omission is
                 // invisible until a collection runs at exactly the wrong
                 // moment, which is the hardest kind of bug to go looking for.
+                if let Some(id) = class.attributes.as_object() {
+                    gray.push(id);
+                }
                 for value in &class.static_fields {
                     if let Some(id) = value.as_object() {
                         gray.push(id);
@@ -442,6 +445,13 @@ pub struct ObjClass {
     /// distinct method names pays for them in every class. Upstream has the
     /// same shape and the same cost.
     pub methods: Vec<Option<Method>>,
+    /// The class's attributes, or null when it has none the runtime can see.
+    ///
+    /// Built at compile time and attached when the class is created. Only
+    /// attributes written `#!` survive; a plain `#` is compiled out, which is
+    /// what makes attributes usable for tooling without costing a running
+    /// program anything.
+    pub attributes: Value,
     /// Values of the class's static fields, indexed as the compiler numbered
     /// them.
     ///
@@ -465,6 +475,7 @@ impl ObjClass {
             num_fields: 0,
             metaclass: None,
             methods: Vec::new(),
+            attributes: Value::NULL,
             static_fields: Vec::new(),
         }
     }

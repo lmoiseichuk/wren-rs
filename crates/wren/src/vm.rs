@@ -247,6 +247,8 @@ pub struct Vm {
     /// yielding one half of each entry.
     pub map_key_sequence_class: ObjectId,
     pub map_value_sequence_class: ObjectId,
+    /// What `Class.attributes` returns: a `self` map and a `methods` map.
+    pub class_attributes_class: ObjectId,
 
     /// The fiber currently running. Its stack and frames are the VM's own,
     /// and are swapped back into it when control moves elsewhere.
@@ -331,6 +333,7 @@ impl Vm {
         let skip_sequence_class = class_named(&mut heap, "SkipSequence", iterable);
         let map_key_sequence_class = class_named(&mut heap, "MapKeySequence", iterable);
         let map_value_sequence_class = class_named(&mut heap, "MapValueSequence", iterable);
+        let class_attributes_class = class_named(&mut heap, "ClassAttributes", root);
 
         let mut vm = Vm {
             heap,
@@ -361,6 +364,7 @@ impl Vm {
             skip_sequence_class,
             map_key_sequence_class,
             map_value_sequence_class,
+            class_attributes_class,
             current_fiber: None,
             root_fiber: None,
             pending_switch: None,
@@ -539,6 +543,15 @@ impl Vm {
     /// Allocate a string and return a value referring to it.
     pub fn new_string(&mut self, text: &str) -> Value {
         Value::object(self.heap.allocate(Object::String(ObjString::from_text(text))))
+    }
+
+    /// Build the `ClassAttributes` pair a class's attributes come back as.
+    pub fn new_class_attributes(&mut self, own: Value, methods: Value) -> Value {
+        let class = self.class_attributes_class;
+        Value::object(self.heap.allocate(Object::Instance(ObjInstance {
+            class,
+            fields: alloc::vec![own, methods],
+        })))
     }
 
     /// Allocate a string from raw bytes.
@@ -790,6 +803,7 @@ impl Vm {
             self.random_class, self.sequence_class, self.map_sequence_class,
             self.where_sequence_class, self.take_sequence_class, self.skip_sequence_class,
             self.map_key_sequence_class, self.map_value_sequence_class,
+            self.class_attributes_class,
         ] {
             roots.push(Value::object(class));
         }
@@ -1338,6 +1352,15 @@ impl Vm {
                     ip += 1;
                     let value = *self.stack.last().unwrap();
                     self.set_static_field(index, value)?;
+                }
+                Op::SetAttributes => {
+                    let attributes = self.stack.pop().unwrap_or(Value::NULL);
+                    let class = self.stack.pop().unwrap_or(Value::NULL);
+                    if let Some(Object::Class(class)) =
+                        class.as_object().and_then(|id| self.heap.get_mut(id))
+                    {
+                        class.attributes = attributes;
+                    }
                 }
                 Op::ImportModule => {
                     let index = chunk.read_short(ip) as usize;

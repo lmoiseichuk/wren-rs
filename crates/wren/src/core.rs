@@ -251,6 +251,27 @@ fn install_class(vm: &mut Vm) {
         let text = vm.to_string(receiver(vm, at));
         Ok(vm.new_string(&text))
     });
+
+    define(vm, class, "attributes", |vm, at| {
+        let Some(id) = receiver(vm, at).as_object() else {
+            return Err(RuntimeError::new("Receiver must be a class."));
+        };
+        match vm.heap.get(id) {
+            Some(Object::Class(class)) => Ok(class.attributes),
+            _ => Err(RuntimeError::new("Receiver must be a class.")),
+        }
+    });
+
+    // `ClassAttributes` is the pair a class's attributes come back as: the
+    // class's own, and its methods'. Two fields and two getters; upstream
+    // writes the same class in Wren.
+    let attributes_class = vm.class_attributes_class;
+    define(vm, attributes_class, "self", |vm, at| {
+        Ok(instance_field(vm, receiver(vm, at), 0))
+    });
+    define(vm, attributes_class, "methods", |vm, at| {
+        Ok(instance_field(vm, receiver(vm, at), 1))
+    });
 }
 
 fn install_fn(vm: &mut Vm) {
@@ -2449,6 +2470,7 @@ fn install_system(vm: &mut Vm) {
         ("MapEntry", vm.map_entry_class),
         ("MapKeySequence", vm.map_key_sequence_class),
         ("MapValueSequence", vm.map_value_sequence_class),
+        ("ClassAttributes", vm.class_attributes_class),
         ("String", vm.string_class),
     ] {
         vm.modules[0].define(name, Value::object(class));
@@ -2710,6 +2732,28 @@ fn default_seed() -> u32 {
     // there; a firmware that needs a varying stream should seed from something
     // it actually has, such as an ADC reading.
     0x1234_5678
+}
+
+/// A fresh empty map, for the compiler building an attribute table.
+pub fn new_map(vm: &mut Vm) -> Value {
+    Value::object(vm.heap.allocate(Object::Map(ObjMap::new())))
+}
+
+/// Put a key and value into a map, for the same.
+pub fn map_insert(vm: &mut Vm, map: Value, key: Value, value: Value) {
+    let _ = map_set(vm, map, key, value);
+}
+
+/// Read a key back out, so the compiler can accumulate into nested maps.
+pub fn map_lookup(vm: &Vm, map: Value, key: Value) -> Option<Value> {
+    map_get(vm, map, key)
+}
+
+/// Append to a list, for accumulating repeated attribute keys.
+pub fn list_push(vm: &mut Vm, list: Value, value: Value) {
+    if let Some(Object::List(list)) = list.as_object().and_then(|id| vm.heap.get_mut(id)) {
+        list.elements.push(value);
+    }
 }
 
 /// Build a list value from elements, for the compiler's list literals.
