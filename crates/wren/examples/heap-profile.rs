@@ -214,6 +214,8 @@ fn add(total: &mut wren::heap::Profile, one: &wren::heap::Profile) {
     total.collect_nanos += one.collect_nanos;
     total.slots_swept += one.slots_swept;
     total.freed_promptly += one.freed_promptly;
+    total.young_allocated += one.young_allocated;
+    total.young_survived += one.young_survived;
     total.flushes += one.flushes;
     total.peak_live = total.peak_live.max(one.peak_live);
     total.peak_bytes = total.peak_bytes.max(one.peak_bytes);
@@ -275,6 +277,23 @@ fn report(total: &wren::heap::Profile, ran: usize, natural: usize, wall: u64) {
     println!(
         "  marked per object freed {:>11.2}   -- tracing work per byte reclaimed",
         ratio(total.marked, total.swept)
+    );
+    println!();
+
+    println!("do objects die young");
+    println!("  allocated              {:>12}", total.young_allocated);
+    println!(
+        "  of those, still alive at the next collection: {:>10}  ({:.1}%)",
+        total.young_survived,
+        percent(total.young_survived, total.young_allocated)
+    );
+    // **The generational hypothesis, stated as a number.** A nursery is worth
+    // building when this is low: a minor collection then traces a small live
+    // set and reclaims nearly everything, and the long-lived objects it
+    // promotes stop being re-marked at every later collection.
+    println!(
+        "  a nursery would reclaim {:>11.1}%  of everything allocated, tracing only the rest",
+        100.0 - percent(total.young_survived, total.young_allocated)
     );
     println!();
 

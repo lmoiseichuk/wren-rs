@@ -116,6 +116,16 @@ struct Table<T> {
     free: Vec<u32>,
     /// One bit per slot. Cleared at the start of each mark phase.
     marks: Vec<u64>,
+    /// Which collection each object was born before.
+    ///
+    /// **Only to answer one question, and only under `profile`**: of the
+    /// objects allocated since the last collection, how many are dead at the
+    /// next one? That is the generational hypothesis stated as a measurement,
+    /// and it is not the same as the survival rate of the whole live set --
+    /// which is what was being measured before and conflates a thousand
+    /// long-lived nodes with the temporaries made while walking them.
+    #[cfg(feature = "profile")]
+    born: Vec<u32>,
 }
 
 impl<T> Table<T> {
@@ -125,7 +135,25 @@ impl<T> Table<T> {
             counts: Vec::new(),
             free: Vec::new(),
             marks: Vec::new(),
+            #[cfg(feature = "profile")]
+            born: Vec::new(),
         }
+    }
+
+    /// Record which collection an object was born before.
+    #[cfg(feature = "profile")]
+    fn note_birth(&mut self, index: u32, generation: u32) {
+        let index = index as usize;
+        if self.born.len() <= index {
+            self.born.resize(index + 1, generation);
+        }
+        self.born[index] = generation;
+    }
+
+    /// Was this object allocated since the last collection?
+    #[cfg(feature = "profile")]
+    fn is_young(&self, index: u32, generation: u32) -> bool {
+        self.born.get(index as usize).copied() == Some(generation)
     }
 
     fn allocate(&mut self, value: T) -> u32 {
@@ -363,6 +391,14 @@ pub struct Profile {
     pub slots_swept: u64,
     /// Objects freed by their reference count rather than by a trace.
     pub freed_promptly: u64,
+    /// Objects allocated, counted here so both halves of the generational
+    /// question come from the same place.
+    pub young_allocated: u64,
+    /// Of the objects allocated since the previous collection, how many were
+    /// still alive at the next one. **This is the generational hypothesis.**
+    /// If it is near zero, most objects die young and a nursery reclaims
+    /// almost everything for almost nothing.
+    pub young_survived: u64,
     /// How many times the candidate list was confirmed against the roots.
     pub flushes: u64,
 }
@@ -455,6 +491,26 @@ impl Heap {
                 Self::place(&mut self.upvalues, ObjectType::Upvalue, upvalue)
             }
         };
+
+        #[cfg(feature = "profile")]
+        {
+            let generation = self.collections as u32;
+            let index = id.index();
+            match ObjectType::from_tag(id.tag()) {
+                Some(ObjectType::Class) => self.classes.note_birth(index, generation),
+                Some(ObjectType::Closure) => self.closures.note_birth(index, generation),
+                Some(ObjectType::Fn) => self.functions.note_birth(index, generation),
+                Some(ObjectType::Fiber) => self.fibers.note_birth(index, generation),
+                Some(ObjectType::Instance) => self.instances.note_birth(index, generation),
+                Some(ObjectType::List) => self.lists.note_birth(index, generation),
+                Some(ObjectType::Map) => self.maps.note_birth(index, generation),
+                Some(ObjectType::Range) => self.ranges.note_birth(index, generation),
+                Some(ObjectType::String) => self.strings.note_birth(index, generation),
+                Some(ObjectType::Upvalue) => self.upvalues.note_birth(index, generation),
+                None => {}
+            }
+            self.profile.young_allocated += 1;
+        }
 
         self.bytes += cost;
         // **Indexed, not iterated.** `born` is the heap's own scratch
@@ -1243,6 +1299,10 @@ impl Heap {
         let mut live = 0usize;
         let mut slots_seen = 0usize;
         let mut dead: Vec<ObjectId> = Vec::new();
+        #[cfg(feature = "profile")]
+        let generation = self.collections as u32;
+        #[cfg(feature = "profile")]
+        let mut young_survived = 0u64;
         each_table!(&mut *self, table, kind, {
             let slot = table.slot_size();
             slots_seen += table.slots.len();
@@ -1252,6 +1312,10 @@ impl Heap {
                 }
                 if table.is_marked(index as u32) {
                     live += 1;
+                    #[cfg(feature = "profile")]
+                    if table.is_young(index as u32, generation) {
+                        young_survived += 1;
+                    }
                     if let Some(value) = table.slots[index].as_mut() {
                         shrink_settled(value);
                         bytes += slot + value.contents_size();
@@ -1290,6 +1354,7 @@ impl Heap {
             self.profile.live_before += before as u64;
             self.profile.survived += live as u64;
             self.profile.collect_nanos += started.elapsed().as_nanos() as u64;
+            self.profile.young_survived += young_survived;
         }
         #[cfg(not(feature = "profile"))]
         let _ = slots_seen;
