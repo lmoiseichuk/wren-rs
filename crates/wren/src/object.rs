@@ -121,6 +121,27 @@ impl Object {
                 if let Some(metaclass) = class.metaclass {
                     gray.push(metaclass);
                 }
+                // **And the methods themselves.** A method written in Wren is
+                // a closure the method table is the only reference to -- once
+                // the class definition has finished executing, the closure is
+                // gone from the stack. Omitting this compiled and ran and
+                // passed every small test, because nothing collected before
+                // the program was over; it appeared the moment a second class
+                // pushed the heap past its first collection, and presented as
+                // the *first* class's constructor silently doing nothing.
+                //
+                // This is the failure mode the note on `trace` describes, and
+                // it is worth having actually happened: the omission is
+                // invisible until a collection runs at exactly the wrong
+                // moment, which is the hardest kind of bug to go looking for.
+                for method in class.methods.iter().flatten() {
+                    match method {
+                        Method::Closure(closure) => gray.push(*closure),
+                        // A primitive is a Rust function pointer with no heap
+                        // object behind it, so there is nothing to keep alive.
+                        Method::Primitive(_) => {}
+                    }
+                }
             }
             Object::Fn(function) => {
                 // **A function's constants are references like any other.** A

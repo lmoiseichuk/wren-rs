@@ -382,3 +382,256 @@ System.print(total)
 fn deeply_nested_expressions() {
     assert_eq!(run("System.print(((((1 + 2) * 3) - 4) * 5) + 6)"), "31\n");
 }
+
+// --- functions and classes --------------------------------------------------
+
+#[test]
+fn a_function_literal_can_be_called() {
+    assert_eq!(run("var f = Fn.new { |a, b| a + b }\nSystem.print(f.call(1, 2))"), "3\n");
+}
+
+#[test]
+fn a_closure_sees_later_writes_to_what_it_captured() {
+    // Capturing takes the variable, not a copy of its value at the time.
+    assert_eq!(run("var n = 1\nvar f = Fn.new { n }\nn = 2\nSystem.print(f.call())"), "2\n");
+}
+
+#[test]
+fn two_closures_share_one_captured_variable() {
+    // The case that decides whether capture reuses an upvalue or makes a new
+    // one per closure: if each had its own, `read` would still say 0.
+    let source = "
+var n = 0
+var bump = Fn.new { n = n + 1 }
+var read = Fn.new { n }
+bump.call()
+bump.call()
+System.print(read.call())
+";
+    assert_eq!(run(source), "2\n");
+}
+
+#[test]
+fn a_class_method_survives_a_collection() {
+    // **Regression.** A class's method table was not traced by the collector,
+    // so every method written in Wren was freed at the first collection --
+    // the table is the only reference once the class body has finished
+    // executing. It showed up as the *first* class's constructor silently
+    // returning the class itself, and only once a second class pushed the
+    // heap past its first collection.
+    //
+    // The loop is there to guarantee a collection happens rather than to hope
+    // one does.
+    let source = "
+class Counter {
+  construct new() { _n = 0 }
+  bump { _n = _n + 1 }
+  n { _n }
+}
+var c = Counter.new()
+for (i in 1..500) {
+  var scratch = [i, \"padding %(i)\"]
+  c.bump
+}
+System.print(c.n)
+";
+    assert_eq!(run(source), "500\n");
+}
+
+#[test]
+fn several_classes_each_keep_their_own_methods() {
+    let source = "
+class A { construct new() {} v { \"a\" } }
+class B { construct new() {} v { \"b\" } }
+class C { construct new() {} v { \"c\" } }
+System.print(A.new().v + B.new().v + C.new().v)
+";
+    assert_eq!(run(source), "abc\n");
+}
+
+#[test]
+fn inheritance_and_super() {
+    let source = "
+class Animal {
+  construct new(name) { _name = name }
+  speak { \"%(_name) makes a sound\" }
+}
+class Dog is Animal {
+  construct new(name) { super(name) }
+  speak { super.speak + \" (woof)\" }
+}
+System.print(Dog.new(\"Rex\").speak)
+";
+    assert_eq!(run(source), "Rex makes a sound (woof)\n");
+}
+
+#[test]
+fn a_subclass_gets_its_own_fields_after_the_inherited_ones() {
+    // The field-offset fix: the compiler numbers a method's fields from zero
+    // because it cannot know the superclass, and the offset is applied when
+    // the method is bound. Without it, `_b` would alias `_a`.
+    let source = "
+class Base {
+  construct new() { _a = \"base\" }
+  a { _a }
+}
+class Derived is Base {
+  construct new() {
+    super()
+    _b = \"derived\"
+  }
+  b { _b }
+}
+var d = Derived.new()
+System.print(d.a + \" \" + d.b)
+";
+    assert_eq!(run(source), "base derived\n");
+}
+
+#[test]
+fn operator_overloading() {
+    let source = "
+class Vec {
+  construct new(x, y) {
+    _x = x
+    _y = y
+  }
+  x { _x }
+  y { _y }
+  +(o) { Vec.new(_x + o.x, _y + o.y) }
+  toString { \"(%(_x), %(_y))\" }
+}
+System.print(Vec.new(1, 2) + Vec.new(10, 20))
+";
+    assert_eq!(run(source), "(11, 22)\n");
+}
+
+#[test]
+fn a_bare_name_in_a_method_calls_it_on_this() {
+    // Which is what makes recursion inside a static method resolve.
+    let source = "
+class Fib {
+  static get(n) {
+    if (n < 2) return n
+    return get(n - 1) + get(n - 2)
+  }
+}
+System.print(Fib.get(20))
+";
+    assert_eq!(run(source), "6765\n");
+}
+
+#[test]
+fn break_inside_a_function_inside_a_loop_is_an_error() {
+    // A loop does not extend through a function boundary. This used to emit a
+    // jump with the enclosing function's offsets into the inner function's
+    // code, which corrupted the stack rather than reporting anything.
+    let source = "
+var done = false
+while (!done) {
+  Fn.new {
+    break
+  }
+  done = true
+}
+";
+    assert_eq!(error(source), "Cannot use 'break' outside of a loop.");
+}
+
+#[test]
+fn continue_before_a_local_declaration_keeps_the_stack_straight() {
+    // `continue` discards the locals the body added. Counting them by scope
+    // depth threw away the receiver as well, and the next iteration's slots
+    // were all off by one.
+    let source = "
+var i = 0
+while (i <= 2) {
+  i = i + 1
+  if (i == 2) continue
+  var j = i * 10
+  System.print(j)
+}
+";
+    assert_eq!(run(source), "10\n30\n");
+}
+
+// --- fibers -----------------------------------------------------------------
+
+#[test]
+fn a_fiber_runs_and_returns() {
+    assert_eq!(run("var f = Fiber.new { 7 }\nSystem.print(f.call())"), "7\n");
+}
+
+#[test]
+fn a_fiber_yields_and_resumes() {
+    // The point of a separate stack: the call that yielded is left half
+    // finished and picked up again.
+    let source = "
+var f = Fiber.new {
+  Fiber.yield(1)
+  Fiber.yield(2)
+  return 3
+}
+System.print(f.call())
+System.print(f.call())
+System.print(f.call())
+";
+    assert_eq!(run(source), "1\n2\n3\n");
+}
+
+#[test]
+fn a_fiber_reports_when_it_is_done() {
+    assert_eq!(run("var f = Fiber.new { 1 }\nf.call()\nSystem.print(f.isDone)"), "true\n");
+}
+
+#[test]
+fn try_catches_an_error_instead_of_propagating_it() {
+    // Wren has no try/catch: an error aborts its fiber, and `try` runs one and
+    // hands the error back.
+    let source = "
+var f = Fiber.new { 1.nope }
+var error = f.try()
+System.print(error)
+System.print(\"still running\")
+";
+    assert_eq!(run(source), "Num does not implement 'nope'.\nstill running\n");
+}
+
+#[test]
+fn abort_raises_a_catchable_error() {
+    let source = "
+var f = Fiber.new { Fiber.abort(\"deliberate\") }
+System.print(f.try())
+System.print(f.error)
+";
+    assert_eq!(run(source), "deliberate\ndeliberate\n");
+}
+
+// --- numbers print the way Wren prints them ---------------------------------
+
+#[test]
+fn numbers_use_fourteen_significant_digits() {
+    // %.14g, which is what makes `0.1 + 0.2` print as `0.3` rather than as
+    // `0.30000000000000004`.
+    assert_eq!(run("System.print(0.1 + 0.2)"), "0.3\n");
+    assert_eq!(run("System.print(2.sqrt)"), "1.4142135623731\n");
+}
+
+#[test]
+fn very_large_and_small_numbers_use_exponential_notation() {
+    assert_eq!(run("System.print(1e300)"), "1e+300\n");
+    assert_eq!(run("System.print(1e-300)"), "1e-300\n");
+}
+
+#[test]
+fn the_special_values_have_wren_spellings() {
+    assert_eq!(run("System.print(1/0)"), "infinity\n");
+    assert_eq!(run("System.print(-1/0)"), "-infinity\n");
+    assert_eq!(run("System.print(0/0)"), "nan\n");
+}
+
+#[test]
+fn negative_zero_keeps_its_sign() {
+    assert_eq!(run("System.print(-0.0)"), "-0\n");
+    assert_eq!(run("System.print((-0.5).truncate)"), "-0\n");
+}

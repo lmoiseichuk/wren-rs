@@ -12,9 +12,9 @@ paragraph of the spec rather than at a vague gap.
 | | |
 |---|---|
 | probes | 96 |
-| **works** | **87** |
+| **works** | **88** |
 | differs | 3 |
-| missing | 6 |
+| missing | 5 |
 
 ## By chapter
 
@@ -27,7 +27,7 @@ paragraph of the spec rather than at a vague gap.
 | [Method calls](#method-calls) | 8 | 0 | 0 |
 | [Control flow](#control-flow) | 11 | 0 | 0 |
 | [Variables](#variables) | 5 | 0 | 0 |
-| [Classes](#classes) | 12 | 0 | 3 |
+| [Classes](#classes) | 13 | 0 | 2 |
 | [Functions](#functions) | 7 | 0 | 0 |
 | [Concurrency](#concurrency) | 4 | 1 | 0 |
 | [Error handling](#error-handling) | 4 | 0 | 0 |
@@ -145,8 +145,8 @@ paragraph of the spec rather than at a vague gap.
 | Fields are private | works |  |
 | Static members | works |  |
 | Static fields | **missing** | Expected expression. |
-| Inheritance | **missing** | Not a closure. |
-| super | **missing** | Not a closure. |
+| Inheritance | works |  |
+| super | **missing** | B does not implement 'v()'. |
 | is operator | works |  |
 | type getter | works |  |
 

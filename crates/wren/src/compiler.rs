@@ -725,14 +725,12 @@ impl<'a> Compiler<'a> {
                 let value = token
                     .number(self.source)
                     .ok_or_else(|| self.error_at(token, "Invalid number literal."))?;
-                self.emit_constant(Value::num(value), line);
-                Ok(())
+                self.emit_constant(Value::num(value), line)
             }
             TokenKind::String => {
                 let text = unescape(token.text(self.source));
                 let value = self.vm.new_string(&text);
-                self.emit_constant(value, line);
-                Ok(())
+                self.emit_constant(value, line)
             }
             TokenKind::Interpolation => self.interpolation(),
             TokenKind::True => {
@@ -1109,23 +1107,30 @@ impl<'a> Compiler<'a> {
         if self.match_token(TokenKind::Dot)? {
             self.consume(TokenKind::Name, "Expect method name after 'super.'.")?;
             let name = self.previous.text(self.source).to_string();
-            let arity = if self.match_token(TokenKind::LeftParen)? {
-                self.argument_list()?
-            } else {
-                0
-            };
+            // Without parentheses this is a getter, and a getter's signature is
+            // the bare name -- `super.speak`, not `super.speak()`. The same
+            // distinction that `foo` and `foo()` have everywhere else applies
+            // here, and missing it looked for a method the class did not have.
+            if !self.check(TokenKind::LeftParen) {
+                return self.emit_super(&name, 0, line);
+            }
+            self.advance()?;
+            let arity = self.argument_list()?;
             return self.emit_super(&signature(&name, arity), arity, line);
         }
 
         // Bare `super(...)`: call the superclass's version of the method this
         // one is in. The name is the enclosing method's own.
         let name = self.state().name.clone();
+        // The enclosing method's own name. For a constructor body that is
+        // `init new(_)`, and the superclass's *constructor* is what a bare
+        // `super(...)` should reach -- which is the `init` form, not `new`.
         let base = name.split('(').next().unwrap_or("").to_string();
-        let arity = if self.match_token(TokenKind::LeftParen)? {
-            self.argument_list()?
-        } else {
-            0
-        };
+        if !self.check(TokenKind::LeftParen) {
+            return self.emit_super(&base, 0, line);
+        }
+        self.advance()?;
+        let arity = self.argument_list()?;
         self.emit_super(&signature(&base, arity), arity, line)
     }
 
@@ -1208,7 +1213,7 @@ impl<'a> Compiler<'a> {
         let line = clamp_line(self.previous.line);
         let head = unescape(self.previous.text(self.source));
         let value = self.vm.new_string(&head);
-        self.emit_constant(value, line);
+        self.emit_constant(value, line)?;
 
         loop {
             self.skip_newlines()?;
@@ -1223,7 +1228,7 @@ impl<'a> Compiler<'a> {
             if self.match_token(TokenKind::Interpolation)? {
                 let text = unescape(self.previous.text(self.source));
                 let value = self.vm.new_string(&text);
-                self.emit_constant(value, line);
+                self.emit_constant(value, line)?;
                 self.emit_call("+(_)", 1, line)?;
                 continue;
             }
@@ -1231,7 +1236,7 @@ impl<'a> Compiler<'a> {
             self.consume(TokenKind::String, "Expect end of string interpolation.")?;
             let text = unescape(self.previous.text(self.source));
             let value = self.vm.new_string(&text);
-            self.emit_constant(value, line);
+            self.emit_constant(value, line)?;
             self.emit_call("+(_)", 1, line)?;
             return Ok(());
         }
@@ -1260,7 +1265,12 @@ impl<'a> Compiler<'a> {
             super_class: None,
         })));
 
-        let index = self.chunk_mut().add_constant(Value::object(function));
+        let Some(index) = self.chunk_mut().add_constant(Value::object(function)) else {
+            return Err(self.error_at(
+                self.previous,
+                "A function may only contain 65536 unique constants.",
+            ));
+        };
         self.chunk_mut().emit_op(Op::Closure, line);
         self.chunk_mut().emit_short(index, line);
         self.chunk_mut().emit_byte(upvalues.len() as u8, line);
@@ -1367,7 +1377,7 @@ impl<'a> Compiler<'a> {
 
         // The class's own name, as a constant for the `Class` instruction.
         let name_value = self.vm.new_string(&name);
-        self.emit_constant(name_value, line);
+        self.emit_constant(name_value, line)?;
 
         // The superclass, or `Object` when none is named.
         if self.match_token(TokenKind::Is)? {
@@ -1593,10 +1603,16 @@ impl<'a> Compiler<'a> {
 
     // --- emitting -----------------------------------------------------------
 
-    fn emit_constant(&mut self, value: Value, line: u16) {
-        let index = self.chunk_mut().add_constant(value);
+    fn emit_constant(&mut self, value: Value, line: u16) -> Result<(), CompileError> {
+        let Some(index) = self.chunk_mut().add_constant(value) else {
+            return Err(self.error_at(
+                self.previous,
+                "A function may only contain 65536 unique constants.",
+            ));
+        };
         self.chunk_mut().emit_op(Op::Constant, line);
         self.chunk_mut().emit_short(index, line);
+        Ok(())
     }
 
     fn emit_load_local(&mut self, slot: usize, line: u16) {

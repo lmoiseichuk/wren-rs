@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::value::Value;
@@ -182,6 +183,20 @@ impl Op {
 pub struct Chunk {
     pub code: Vec<u8>,
     pub constants: Vec<Value>,
+    /// Bit pattern of each constant to its index, so adding one is a lookup
+    /// rather than a scan.
+    ///
+    /// **This is not a micro-optimisation.** Reuse is checked on every single
+    /// constant, so a linear scan makes compiling quadratic in the number of
+    /// them: upstream's own `limit/many_constants` test declares 65,540 and
+    /// took seventeen seconds to compile, against about two billion
+    /// comparisons. It is the kind of cost that never shows up on the small
+    /// programs one tests with and then makes a real file appear to hang.
+    ///
+    /// A `BTreeMap` rather than a hash map because `alloc` has one and does
+    /// not have the other, and this crate takes no dependencies. `log n` on a
+    /// table capped at 65,536 entries is sixteen comparisons at worst.
+    lookup: BTreeMap<u64, u16>,
     /// The source line each **byte** of `code` came from, for error messages.
     ///
     /// This is upstream's layout and it is frankly wasteful — a line number per
@@ -193,7 +208,12 @@ pub struct Chunk {
 
 impl Chunk {
     pub fn new() -> Chunk {
-        Chunk { code: Vec::new(), constants: Vec::new(), lines: Vec::new() }
+        Chunk {
+            code: Vec::new(),
+            constants: Vec::new(),
+            lookup: BTreeMap::new(),
+            lines: Vec::new(),
+        }
     }
 
     pub fn emit_op(&mut self, op: Op, line: u16) {
@@ -219,14 +239,24 @@ impl Chunk {
     /// The reuse matters more here than on a desktop: a loop body mentioning
     /// `1` twenty times should not put twenty copies of it in the constant
     /// table of a part with 8 KB of RAM.
-    pub fn add_constant(&mut self, value: Value) -> u16 {
-        for (index, existing) in self.constants.iter().enumerate() {
-            if existing.is_same(value) {
-                return index as u16;
-            }
+    ///
+    /// Returns `None` when the table is full. **The index is a `u16` in the
+    /// bytecode**, so 65,536 is a hard ceiling rather than a policy: past it
+    /// the operand wraps and the function silently loads the wrong constant.
+    /// Upstream has the same limit and the same test for it.
+    pub fn add_constant(&mut self, value: Value) -> Option<u16> {
+        let bits = value.to_bits();
+        if let Some(index) = self.lookup.get(&bits) {
+            return Some(*index);
         }
+        // Indices run 0..=u16::MAX, so the table is full at 65,536 entries.
+        if self.constants.len() > u16::MAX as usize {
+            return None;
+        }
+        let index = self.constants.len() as u16;
         self.constants.push(value);
-        (self.constants.len() - 1) as u16
+        self.lookup.insert(bits, index);
+        Some(index)
     }
 
     /// Emit a jump with a placeholder offset, returning where to patch it.

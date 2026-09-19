@@ -23,6 +23,18 @@ fn main() {
     collect(Path::new(&root), &mut files);
     files.sort();
 
+    // **Run the files across threads.** Each program gets a fresh `Vm` and
+    // shares nothing with any other, so this is embarrassingly parallel and was
+    // only serial because it started that way. On this bench it is the
+    // difference between 56 seconds and about four, which matters because this
+    // runs after every change.
+    //
+    // Results are collected with their paths and sorted afterwards, so the
+    // report is identical whatever order the threads happen to finish in -- a
+    // run whose output shuffles between invocations is useless for spotting
+    // what a change actually did.
+    let outcomes = run_in_parallel(&files, &root);
+
     let mut by_group: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     let mut passed = 0;
@@ -34,45 +46,24 @@ fn main() {
     let mut error_passed = 0;
     let mut error_total = 0;
 
-    for path in &files {
-        let Ok(source) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        // The benchmark and api directories are not correctness tests: the
-        // first are timings and the second need the C embedding harness.
-        let display = path.display().to_string();
-        if display.contains("/benchmark/") || display.contains("/api/") {
-            continue;
-        }
-
+    for outcome in &outcomes {
         total += 1;
-        let group = group_of(path, &root);
-        let entry = by_group.entry(group).or_insert((0, 0));
+        let entry = by_group.entry(outcome.group.clone()).or_insert((0, 0));
         entry.1 += 1;
-
-        let is_error_test = source.contains("// expect runtime error:")
-            || source.contains("Error at")
-            || source.contains("// expect error");
-        if is_error_test {
+        if outcome.is_error_test {
             error_total += 1;
         }
 
-        // **A panic in the VM is a failure, not the end of the run.** A bad
-        // program must not be able to take the harness down with it, and the
-        // file that did it is the thing worth knowing.
-        let outcome = std::panic::catch_unwind(|| check(&source))
-            .unwrap_or_else(|_| Err(format!("PANIC in {}", path.display())));
-
-        match outcome {
+        match &outcome.result {
             Ok(()) => {
                 passed += 1;
                 entry.0 += 1;
-                if is_error_test {
+                if outcome.is_error_test {
                     error_passed += 1;
                 }
             }
             Err(reason) => {
-                *reasons.entry(summarise(&reason)).or_insert(0) += 1;
+                *reasons.entry(summarise(reason)).or_insert(0) += 1;
             }
         }
     }
@@ -97,19 +88,22 @@ fn main() {
 
     // `--why <substring>` lists the files behind one reason, which is how the
     // histogram turns into something to act on.
+    if std::env::args().nth(2).as_deref() == Some("--slow") {
+        let mut ranked: Vec<&Outcome> = outcomes.iter().collect();
+        ranked.sort_by_key(|outcome| core::cmp::Reverse(outcome.elapsed));
+        println!("\nslowest files:");
+        for outcome in ranked.iter().take(15) {
+            println!("  {:>8.2}s  {}", outcome.elapsed.as_secs_f64(), outcome.path.display());
+        }
+        return;
+    }
+
     if let Some(wanted) = std::env::args().nth(2) {
         println!("\nfiles failing with {wanted:?}:");
-        for path in &files {
-            let Ok(source) = std::fs::read_to_string(path) else { continue };
-            let display = path.display().to_string();
-            if display.contains("/benchmark/") || display.contains("/api/") {
-                continue;
-            }
-            let outcome = std::panic::catch_unwind(|| check(&source))
-                .unwrap_or_else(|_| Err(format!("PANIC in {}", path.display())));
-            if let Err(reason) = outcome {
+        for outcome in &outcomes {
+            if let Err(reason) = &outcome.result {
                 if reason.contains(&wanted) {
-                    println!("  {}", path.display());
+                    println!("  {}", outcome.path.display());
                 }
             }
         }
@@ -122,6 +116,74 @@ fn main() {
     for (reason, count) in ranked.iter().take(15) {
         println!("  {count:>4}  {reason}");
     }
+}
+
+/// What one file did.
+struct Outcome {
+    path: PathBuf,
+    group: String,
+    is_error_test: bool,
+    result: Result<(), String>,
+    /// How long the program took. Worth recording because a slow test is
+    /// usually not a big test -- it is one running longer than it should,
+    /// which points at a loop that is not terminating the way it ought to.
+    elapsed: std::time::Duration,
+}
+
+/// Run every file, spread across the available cores.
+fn run_in_parallel(files: &[PathBuf], root: &str) -> Vec<Outcome> {
+    // A test program is *expected* to panic the VM sometimes -- that is one of
+    // the things being measured -- so the default hook's backtrace spam would
+    // bury the report. The panic is still caught and reported as a failure
+    // naming the file; only the message is suppressed.
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let workers = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let chunk = files.len().div_ceil(workers).max(1);
+
+    let outcomes: Vec<Outcome> = std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .chunks(chunk)
+            .map(|slice| scope.spawn(move || slice.iter().filter_map(|path| one(path, root)).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|handle| handle.join().unwrap_or_default()).collect()
+    });
+
+    let _ = std::panic::take_hook();
+    let mut outcomes = outcomes;
+    // Sorted so the report does not depend on which thread finished first.
+    outcomes.sort_by(|left, right| left.path.cmp(&right.path));
+    outcomes
+}
+
+fn one(path: &Path, root: &str) -> Option<Outcome> {
+    // The benchmark and api directories are not correctness tests: the first
+    // are timings and the second need the C embedding harness.
+    let display = path.display().to_string();
+    if display.contains("/benchmark/") || display.contains("/api/") {
+        return None;
+    }
+    let source = std::fs::read_to_string(path).ok()?;
+
+    let is_error_test = source.contains("// expect runtime error:")
+        || source.contains("Error at")
+        || source.contains("// expect error");
+
+    // **A panic in the VM is a failure, not the end of the run.** A bad
+    // program must not take the harness down with it, and the file that did it
+    // is the thing worth knowing.
+    let started = std::time::Instant::now();
+    let result = std::panic::catch_unwind(|| check(&source))
+        .unwrap_or_else(|_| Err(format!("PANIC in {}", path.display())));
+    let elapsed = started.elapsed();
+
+    Some(Outcome {
+        path: path.to_path_buf(),
+        group: group_of(path, root),
+        is_error_test,
+        result,
+        elapsed,
+    })
 }
 
 fn collect(directory: &Path, out: &mut Vec<PathBuf>) {
