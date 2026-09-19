@@ -756,12 +756,14 @@ impl Vm {
     fn capture_upvalue(&mut self, slot: usize) -> ObjectId {
         for existing in &self.open_upvalues {
             if let Some(Object::Upvalue(upvalue)) = self.heap.get(*existing) {
-                if upvalue.closed.is_none() && upvalue.slot == slot {
+                if upvalue.is_open() && upvalue.slot == slot {
                     return *existing;
                 }
             }
         }
-        let id = self.heap.allocate(Object::Upvalue(ObjUpvalue { slot, closed: None }));
+        let id = self
+            .heap
+            .allocate(Object::Upvalue(ObjUpvalue { slot, closed: Value::UNDEFINED }));
         self.open_upvalues.push(id);
         id
     }
@@ -775,7 +777,7 @@ impl Vm {
         let mut still_open = Vec::new();
         for id in ::core::mem::take(&mut self.open_upvalues) {
             let slot = match self.heap.get(id) {
-                Some(Object::Upvalue(upvalue)) if upvalue.closed.is_none() => upvalue.slot,
+                Some(Object::Upvalue(upvalue)) if upvalue.is_open() => upvalue.slot,
                 _ => continue,
             };
             if slot < from {
@@ -784,7 +786,7 @@ impl Vm {
             }
             let value = self.stack.get(slot).copied().unwrap_or(Value::NULL);
             if let Some(Object::Upvalue(upvalue)) = self.heap.get_mut(id) {
-                upvalue.closed = Some(value);
+                upvalue.closed = value;
             }
         }
         self.open_upvalues = still_open;
@@ -1663,10 +1665,13 @@ impl Vm {
             return Err(RuntimeError::new("No such upvalue."));
         };
         match self.heap.get(id) {
-            Some(Object::Upvalue(upvalue)) => match upvalue.closed {
-                Some(value) => Ok(value),
-                None => Ok(self.stack.get(upvalue.slot).copied().unwrap_or(Value::NULL)),
-            },
+            Some(Object::Upvalue(upvalue)) => {
+                if upvalue.is_open() {
+                    Ok(self.stack.get(upvalue.slot).copied().unwrap_or(Value::NULL))
+                } else {
+                    Ok(upvalue.closed)
+                }
+            }
             _ => Err(RuntimeError::new("Not an upvalue.")),
         }
     }
@@ -1682,7 +1687,7 @@ impl Vm {
             return Err(RuntimeError::new("No such upvalue."));
         };
         let target = match self.heap.get(id) {
-            Some(Object::Upvalue(upvalue)) => upvalue.closed.map(|_| None).unwrap_or(Some(upvalue.slot)),
+            Some(Object::Upvalue(upvalue)) => upvalue.is_open().then_some(upvalue.slot),
             _ => return Err(RuntimeError::new("Not an upvalue.")),
         };
         match target {
@@ -1693,7 +1698,7 @@ impl Vm {
             }
             None => {
                 if let Some(Object::Upvalue(upvalue)) = self.heap.get_mut(id) {
-                    upvalue.closed = Some(value);
+                    upvalue.closed = value;
                 }
             }
         }

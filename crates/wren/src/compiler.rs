@@ -387,7 +387,12 @@ impl<'a> Compiler<'a> {
 
     /// Require the end of a statement.
     fn consume_line(&mut self, message: &str) -> Result<(), CompileError> {
-        if self.check(TokenKind::Eof) || self.check(TokenKind::RightBrace) {
+        // **End of file ends a statement; a closing brace does not.** Once a
+        // body is a list of statements its `}` belongs on a line of its own,
+        // and accepting `stmt }` here made the one-expression form and the
+        // statement form ambiguous -- `Fn.new {\n  f() }` parsed where
+        // upstream rejects it.
+        if self.check(TokenKind::Eof) {
             return Ok(());
         }
         self.consume(TokenKind::Line, message)?;
@@ -816,7 +821,15 @@ impl<'a> Compiler<'a> {
     fn statement(&mut self) -> Result<(), CompileError> {
         if self.match_token(TokenKind::LeftBrace)? {
             self.begin_scope();
-            self.block()?;
+            // **One rule for every `{ }`.** A block with no newline after the
+            // brace is a single expression, here as in a function body -- so
+            // `if (c) { f() }` is legal and its value is simply discarded.
+            // Having a separate rule for statement blocks made that a syntax
+            // error on one line and fine on two.
+            if self.finish_block()? {
+                let line = self.line();
+                self.chunk_mut().emit_op(Op::Pop, line);
+            }
             self.end_scope();
             return Ok(());
         }
@@ -841,13 +854,38 @@ impl<'a> Compiler<'a> {
         self.expression_statement()
     }
 
-    fn block(&mut self) -> Result<(), CompileError> {
+    /// The body of a `{ }`, after the brace.
+    ///
+    /// Returns whether it was a single expression, which the caller needs
+    /// because an expression block leaves a value and a statement block does
+    /// not.
+    fn finish_block(&mut self) -> Result<bool, CompileError> {
+        if self.match_token(TokenKind::RightBrace)? {
+            return Ok(false);
+        }
+
+        // No newline after the brace: one expression, and its value is the
+        // block's.
+        if !self.check(TokenKind::Line) {
+            self.expression()?;
+            self.consume(TokenKind::RightBrace, "Expect '}' at end of block.")?;
+            return Ok(true);
+        }
+
         self.skip_newlines()?;
-        while !self.check(TokenKind::RightBrace) && !self.check(TokenKind::Eof) {
+        if self.match_token(TokenKind::RightBrace)? {
+            return Ok(false);
+        }
+
+        loop {
             self.declaration()?;
             self.skip_newlines()?;
+            if self.check(TokenKind::RightBrace) || self.check(TokenKind::Eof) {
+                break;
+            }
         }
-        self.consume(TokenKind::RightBrace, "Expect '}' after block.")
+        self.consume(TokenKind::RightBrace, "Expect '}' at end of block.")?;
+        Ok(false)
     }
 
     fn if_statement(&mut self) -> Result<(), CompileError> {
@@ -1049,7 +1087,11 @@ impl<'a> Compiler<'a> {
 
     fn parse_precedence(&mut self, precedence: Precedence) -> Result<(), CompileError> {
         self.advance()?;
-        let can_assign = precedence <= Precedence::Assignment;
+        // **Conditional, not Assignment.** Upstream derives it from
+        // `PREC_CONDITIONAL` (wren_compiler.c), and the then-branch of a
+        // conditional is parsed at exactly that level -- so `true ? a = 5 : 2`
+        // has to treat the branch as assignable or the `=` has nowhere to go.
+        let can_assign = precedence <= Precedence::Conditional;
         self.prefix(can_assign)?;
 
         loop {
@@ -1809,31 +1851,8 @@ impl<'a> Compiler<'a> {
     /// same place.
     fn finish_body(&mut self) -> Result<(), CompileError> {
         let line = self.line();
-
-        if self.match_token(TokenKind::RightBrace)? {
-            return self.finish_return(false, line);
-        }
-
-        if !self.check(TokenKind::Line) {
-            self.expression()?;
-            self.consume(TokenKind::RightBrace, "Expect '}' at end of block.")?;
-            return self.finish_return(true, line);
-        }
-
-        self.skip_newlines()?;
-        if self.match_token(TokenKind::RightBrace)? {
-            return self.finish_return(false, line);
-        }
-
-        loop {
-            self.declaration()?;
-            self.skip_newlines()?;
-            if self.check(TokenKind::RightBrace) || self.check(TokenKind::Eof) {
-                break;
-            }
-        }
-        self.consume(TokenKind::RightBrace, "Expect '}' at end of block.")?;
-        self.finish_return(false, line)
+        let is_expression = self.finish_block()?;
+        self.finish_return(is_expression, line)
     }
 
     fn finish_return(&mut self, is_expression_body: bool, line: u16) -> Result<(), CompileError> {

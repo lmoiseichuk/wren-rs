@@ -12,9 +12,9 @@ paragraph of the spec rather than at a vague gap.
 | | |
 |---|---|
 | probes | 96 |
-| **works** | **93** |
-| differs | 1 |
-| missing | 2 |
+| **works** | **96** |
+| differs | 0 |
+| missing | 0 |
 
 ## By chapter
 
@@ -27,11 +27,11 @@ paragraph of the spec rather than at a vague gap.
 | [Method calls](#method-calls) | 8 | 0 | 0 |
 | [Control flow](#control-flow) | 11 | 0 | 0 |
 | [Variables](#variables) | 5 | 0 | 0 |
-| [Classes](#classes) | 14 | 0 | 1 |
+| [Classes](#classes) | 15 | 0 | 0 |
 | [Functions](#functions) | 7 | 0 | 0 |
-| [Concurrency](#concurrency) | 4 | 1 | 0 |
+| [Concurrency](#concurrency) | 5 | 0 | 0 |
 | [Error handling](#error-handling) | 4 | 0 | 0 |
-| [Modularity](#modularity) | 2 | 0 | 1 |
+| [Modularity](#modularity) | 3 | 0 | 0 |
 
 ## Syntax
 
@@ -144,7 +144,7 @@ paragraph of the spec rather than at a vague gap.
 | Fields | works |  |
 | Fields are private | works |  |
 | Static members | works |  |
-| Static fields | **missing** | Expect '}' at end of block. |
+| Static fields | works |  |
 | Inheritance | works |  |
 | super | works |  |
 | is operator | works |  |
@@ -170,7 +170,7 @@ paragraph of the spec rather than at a vague gap.
 | Yielding | works |  |
 | Passing values | works |  |
 | isDone | works |  |
-| Transferring control | **differs** | printed "", spec says "1\n" |
+| Transferring control | works |  |
 
 ## Error handling
 
@@ -187,5 +187,5 @@ paragraph of the spec rather than at a vague gap.
 |---|---|---|
 | Importing | works |  |
 | Import with rename | works |  |
-| meta module | **missing** | Could not load module 'meta'. |
+| meta module | works |  |
 

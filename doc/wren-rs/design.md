@@ -71,7 +71,8 @@ back, not estimated:
 |---|---|---|
 | `ObjString` | 16 B + bytes | 24 B + bytes, inline |
 | `ObjList` | 12 B + elements | 28 B + elements |
-| `ObjMap` | 12 B + entries | 28 B + entries |
+| `ObjMap` | 16 B + entries | 28 B + entries |
+| `ObjUpvalue` | 16 B | 24 B |
 | `ObjRange` | **24 B** | 32 B |
 | `ObjClass` | 16 B | 40 B + method table |
 | `ObjInstance` | 16 B + fields | 16 B + fields, inline |
@@ -84,6 +85,14 @@ before its contents** — the size of the largest variant.
 would buy nothing: its two doubles force 8-byte alignment on the whole enum, the
 next largest variants are already 16 B, and a tag would round anything smaller
 back up to 24. **24 B is the floor for this layout**, not an oversight.
+
+It is a floor that has to be defended, though. `ObjUpvalue` originally stored
+`Option<Value>` for "closed, and here is the value" — the obvious spelling, and
+eight bytes larger than a `Value`, because a `Value` has no spare bit pattern
+for `None` and the discriminant needs a word of its own. That tied `Range` at 24
+and pushed the enum to 32, which is **eight bytes on every object in the heap**
+to express one bit about upvalues. It stores `undefined` instead, a value no
+Wren program can hold, which is what that singleton is for.
 
 ### The header upstream pays and this does not
 

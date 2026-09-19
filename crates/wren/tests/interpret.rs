@@ -1137,8 +1137,16 @@ System.print(total)
 
 #[test]
 fn an_invalid_map_iterator_is_an_error() {
+    // **Two different faults, two different messages.** Past the end of the
+    // table is a bad index; inside it but pointing at an empty slot is an
+    // iterator that has gone stale. A one-entry map has a table of eight, so
+    // slot 7 is in range and empty.
     assert_eq!(
         error("var m = {}\nm[1] = 1\nm.iteratorValue(500)"),
+        "Iterator out of bounds."
+    );
+    assert_eq!(
+        error("var m = {}\nm[1] = 1\nm.iteratorValue(7)"),
         "Invalid map iterator."
     );
 }

@@ -315,8 +315,16 @@ fn check(source: &str, directory: &Path, module_name: &str) -> Result<(), String
     match result {
         Err(error) => Err(error.message().to_string()),
         Ok(()) => {
-            let printed: Vec<String> =
-                vm.output_str().lines().map(|line| line.to_string()).collect();
+            // **The reference runner writes with `printf("%s")`**, which stops
+            // at the first NUL byte -- so `System.print("a\0b")` shows as `a`
+            // there. That truncation is the C host's, not the VM's, and it
+            // belongs here rather than in the VM: a program embedding this
+            // crate should get every byte it printed.
+            let printed: Vec<String> = vm
+                .output_str()
+                .lines()
+                .map(|line| line.split('\0').next().unwrap_or("").to_string())
+                .collect();
             if printed == expected {
                 Ok(())
             } else {

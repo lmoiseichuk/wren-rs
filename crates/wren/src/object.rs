@@ -169,10 +169,8 @@ impl Object {
                 }
             }
             Object::Upvalue(upvalue) => {
-                if let Some(value) = upvalue.closed {
-                    if let Some(id) = value.as_object() {
-                        gray.push(id);
-                    }
+                if let Some(id) = upvalue.closed.as_object() {
+                    gray.push(id);
                 }
             }
             Object::Fiber(fiber) => {
@@ -555,7 +553,12 @@ mod layout {
     const _: () = assert!(core::mem::size_of::<ObjRange>() == 24);
     const _: () = assert!(core::mem::size_of::<ObjString>() == 16);
     const _: () = assert!(core::mem::size_of::<ObjList>() == 12);
-    const _: () = assert!(core::mem::size_of::<ObjMap>() == 12);
+    // A map is a table plus its live count, which is not `entries.len()`.
+    const _: () = assert!(core::mem::size_of::<ObjMap>() == 16);
+    // Held to 16 by storing `undefined` for an open upvalue rather than an
+    // `Option<Value>`; at 24 it would tie `Range` and, with the discriminant,
+    // push every slot in the heap to 32.
+    const _: () = assert!(core::mem::size_of::<ObjUpvalue>() == 16);
     // `ObjClass` is boxed, so its size no longer sets the slot size -- only
     // the pointer to it does. Checked so that the reason for boxing stays
     // visible: it is well past `Range`'s 24 bytes.
@@ -623,8 +626,22 @@ pub struct ObjClosure {
 pub struct ObjUpvalue {
     /// The absolute stack slot, while open.
     pub slot: usize,
-    /// The captured value, once closed.
-    pub closed: Option<Value>,
+    /// The captured value once closed, and `undefined` while still open.
+    ///
+    /// **A sentinel rather than an `Option`.** `Option<Value>` costs sixteen
+    /// bytes where a `Value` costs eight -- there is no spare bit pattern for
+    /// `None` to occupy, so the discriminant needs a word of its own -- and
+    /// since `ObjUpvalue` is one of the largest variants of [`Object`], those
+    /// eight bytes were charged to *every* object in the heap. `undefined`
+    /// already exists for exactly this: a value no Wren program can hold.
+    pub closed: Value,
+}
+
+impl ObjUpvalue {
+    /// Still pointing at a live stack slot.
+    pub fn is_open(&self) -> bool {
+        self.closed.is_undefined()
+    }
 }
 
 /// A coroutine: its own value stack, its own call frames, and who to go back to.

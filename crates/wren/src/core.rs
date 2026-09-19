@@ -914,9 +914,9 @@ fn install_string_extras(vm: &mut Vm) {
         // does. Equal to the length is allowed -- searching an empty tail is a
         // sensible question with the answer -1.
         let resolved = if start < 0.0 { start + text.len() as f64 } else { start };
-        // Equal to the length is allowed -- searching an empty tail answers
-        // -1 -- but past it is an error.
-        if resolved < 0.0 || resolved > text.len() as f64 {
+        // The start must be a position *in* the string, so equal to the
+        // length is already past the end.
+        if resolved < 0.0 || resolved >= text.len() as f64 {
             return Err(RuntimeError::new("Start out of bounds."));
         }
         let start = resolved as usize;
@@ -1188,8 +1188,13 @@ fn install_string_views(vm: &mut Vm) {
         let next = if current.is_null() {
             0.0
         } else {
+            // A negative iterator simply has no next element; it is not an
+            // error, because iteration is meant to be driven blindly.
             integer_argument(vm, at, 1, "Iterator")? + 1.0
         };
+        if next < 1.0 && !current.is_null() {
+            return Ok(Value::FALSE);
+        }
         if next < 0.0 || next >= length as f64 {
             return Ok(Value::FALSE);
         }
@@ -1198,11 +1203,11 @@ fn install_string_views(vm: &mut Vm) {
     define(vm, class, "iteratorValue(_)", |vm, at| {
         let string = instance_field(vm, receiver(vm, at), 0);
         let bytes = string_bytes(vm, string);
+        // Negative counts from the end, as every other index does.
         let index = integer_argument(vm, at, 1, "Iterator")?;
-        if index < 0.0 || index as usize >= bytes.len() {
-            return Err(RuntimeError::new("Iterator out of bounds."));
-        }
-        Ok(Value::num(bytes[index as usize] as f64))
+        let index = resolve_index(index, bytes.len())
+            .map_err(|_| RuntimeError::new("Iterator out of bounds."))?;
+        Ok(Value::num(bytes[index] as f64))
     });
 
     let class = vm.string_code_point_sequence_class;
@@ -1248,10 +1253,9 @@ fn install_string_views(vm: &mut Vm) {
         let string = instance_field(vm, receiver(vm, at), 0);
         let bytes = string_bytes(vm, string);
         let index = integer_argument(vm, at, 1, "Iterator")?;
-        if index < 0.0 || index as usize >= bytes.len() {
-            return Err(RuntimeError::new("Iterator out of bounds."));
-        }
-        Ok(Value::num(code_point_at(&bytes, index as usize)
+        let index = resolve_index(index, bytes.len())
+            .map_err(|_| RuntimeError::new("Iterator out of bounds."))?;
+        Ok(Value::num(code_point_at(&bytes, index)
             .map_or(-1.0, |character| character as u32 as f64)))
     });
 }
@@ -1357,28 +1361,32 @@ fn install_sequence(vm: &mut Vm) {
         // **Returns the first falsy result, not `false`.** The value carries
         // more than the verdict does -- it says *which* element failed -- and
         // a program can still use it as a condition because it is falsy.
+        // The last result, not `true`: `[1,2,3].all {|x| x }` is 3. Only an
+        // empty sequence answers with the bare `true`, because nothing ran.
         let sequence = receiver(vm, at);
         let function = function_argument(vm, at, 1)?;
+        let mut result = Value::TRUE;
         for element in collect(vm, sequence)? {
-            let result = vm.call_function(function, &[element])?;
+            result = vm.call_function(function, &[element])?;
             if result.is_falsy() {
                 return Ok(result);
             }
         }
-        Ok(Value::TRUE)
+        Ok(result)
     });
 
     define(vm, class, "any(_)", |vm, at| {
         // The mirror of `all`: the first truthy result rather than `true`.
         let sequence = receiver(vm, at);
         let function = function_argument(vm, at, 1)?;
+        let mut result = Value::FALSE;
         for element in collect(vm, sequence)? {
-            let result = vm.call_function(function, &[element])?;
+            result = vm.call_function(function, &[element])?;
             if !result.is_falsy() {
                 return Ok(result);
             }
         }
-        Ok(Value::FALSE)
+        Ok(result)
     });
 
     define(vm, class, "reduce(_)", |vm, at| {
@@ -2134,11 +2142,20 @@ fn install_map(vm: &mut Vm) {
 
     define(vm, class, "iteratorValue(_)", |vm, at| {
         let map = receiver(vm, at);
-        let slot = integer_argument(vm, at, 1, "Iterator")? as usize;
+        let slot = integer_argument(vm, at, 1, "Iterator")?;
+        let capacity = match map.as_object().and_then(|id| vm.heap.get(id)) {
+            Some(Object::Map(map)) => map.entries.len(),
+            _ => return Err(RuntimeError::new("Receiver must be a map.")),
+        };
+        // **Out of the table's range and pointing at an empty slot are
+        // different faults.** The first is a bad index, the second an iterator
+        // that has gone stale, and upstream reports them differently.
+        if slot < 0.0 || slot as usize >= capacity {
+            return Err(RuntimeError::new("Iterator out of bounds."));
+        }
+        let slot = slot as usize;
         let entry = match map.as_object().and_then(|id| vm.heap.get(id)) {
             Some(Object::Map(map)) if map.is_live(slot) => map.entries[slot],
-            // Asking for a slot that holds nothing is a broken iterator rather
-            // than an out-of-range index, and upstream says so.
             _ => return Err(RuntimeError::new("Invalid map iterator.")),
         };
         let class = vm.map_entry_class;
@@ -2839,7 +2856,33 @@ pub fn install_random(vm: &mut Vm) -> usize {
         Ok(new_random(vm, class, seed))
     });
     define(vm, metaclass, "new(_)", |vm, at| {
-        let seed = number_argument(vm, at, 1)? as i64 as u32;
+        let argument = argument(vm, at, 1);
+        // **A sequence seeds from its elements**, so two generators built from
+        // equal sequences produce the same stream -- which is what the seed is
+        // for, and a sequence is a perfectly good way to spell one.
+        let seed = match argument.as_num() {
+            Some(number) => number as i64 as u32,
+            None => {
+                let elements = collect(vm, argument)?;
+                if elements.is_empty() {
+                    return Err(RuntimeError::new("Sequence cannot be empty."));
+                }
+                let mut seed: u32 = 0;
+                for element in elements {
+                    // **Numbers only.** A seed built from arbitrary objects
+                    // would depend on where they happen to sit in the heap,
+                    // so two equal sequences would seed differently -- which
+                    // defeats the point of seeding from one.
+                    let Some(number) = element.as_num() else {
+                        return Err(RuntimeError::new(
+                            "Sequence elements must all be numbers.",
+                        ));
+                    };
+                    seed = seed.wrapping_mul(31).wrapping_add(number as i64 as u32);
+                }
+                seed
+            }
+        };
         let class = vm.random_class;
         Ok(new_random(vm, class, seed))
     });

@@ -148,8 +148,8 @@ fn probes() -> Vec<Probe> {
         out("Control flow", "While statements", "var i = 0\nwhile (i < 2) {\n System.print(i)\n i = i + 1\n}", "0\n1\n"),
         out("Control flow", "For over a range", "for (i in 1..2) System.print(i)", "1\n2\n"),
         out("Control flow", "For over a list", "for (x in [1,2]) System.print(x)", "1\n2\n"),
-        out("Control flow", "Break statements", "for (i in 1..3) { if (i == 2) break\n System.print(i) }", "1\n"),
-        out("Control flow", "Continue statements", "for (i in 1..3) { if (i == 2) continue\n System.print(i) }", "1\n3\n"),
+        out("Control flow", "Break statements", "for (i in 1..3) {\n if (i == 2) break\n System.print(i)\n}", "1\n"),
+        out("Control flow", "Continue statements", "for (i in 1..3) {\n if (i == 2) continue\n System.print(i)\n}", "1\n3\n"),
         out(
             "Control flow",
             "The iterator protocol",
@@ -159,7 +159,7 @@ fn probes() -> Vec<Probe> {
 
         // --- variables ------------------------------------------------------
         out("Variables", "Module scope", "var a = 1\nSystem.print(a)", "1\n"),
-        out("Variables", "Block scope", "var a = 1\n{ var a = 2\n System.print(a) }\nSystem.print(a)", "2\n1\n"),
+        out("Variables", "Block scope", "var a = 1\n{\n var a = 2\n System.print(a)\n}\nSystem.print(a)", "2\n1\n"),
         out("Variables", "Assignment", "var a = 1\na = 2\nSystem.print(a)", "2\n"),
         out("Variables", "Default null", "var a\nSystem.print(a)", "null\n"),
         bad("Variables", "Undefined variable is an error", "System.print(nope)"),
@@ -222,7 +222,7 @@ fn probes() -> Vec<Probe> {
         out(
             "Classes",
             "Static fields",
-            "class A {\n static bump { __n = (__n == null) ? 1 : __n + 1\n return __n }\n}\nSystem.print(A.bump)\nSystem.print(A.bump)",
+            "class A {\n static bump {\n  __n = (__n == null) ? 1 : __n + 1\n  return __n\n }\n}\nSystem.print(A.bump)\nSystem.print(A.bump)",
             "1\n2\n",
         ),
         out(
@@ -302,7 +302,9 @@ fn probes() -> Vec<Probe> {
         out(
             "Concurrency",
             "Transferring control",
-            "var f = Fiber.new { 1 }\nSystem.print(f.transfer())",
+            // `transfer` does not come back -- that is the difference from
+            // `call` -- so the printing has to happen inside the fiber.
+            "var f = Fiber.new { System.print(1) }\nf.transfer()",
             "1\n",
         ),
 
