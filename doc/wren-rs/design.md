@@ -318,24 +318,62 @@ The `.wrenc` format is unchanged and stores a number as a double whatever the
 build is: bytecode is produced on a workstation and read on a part, and the two
 need not agree about the width.
 
-### The alternative that has not been built
+### One table per type — built, and what it measured
 
-One table per type, with the type in the handle's high bits. That removes the
-max-variant waste — a `List` would cost 12 B instead of 24 — and makes type
-checks free.
+The original note called this "the alternative that has not been built" and
+left it for want of evidence. The heap profile supplied the evidence and it is
+now built.
 
-**The measurement this section used to ask for has now been taken**, and it
-came out smaller than expected. Pricing every live object in `binary_trees` at
-its own size rather than at the largest variant saves 9,644 B of the 27,096 B
-of slots — 35% of the slots, but only **9% of the 104,575 B live heap**, because
-the slots were never where the memory was. The method tables alone were four
-times that, and the floating garbage four times again.
+Every object used to cost 24 bytes before its contents, because every slot was
+one `Object` and an enum is as large as its largest variant: a `List` needs
+twelve and was charged twenty-four, and a boxed `Class` was charged
+twenty-four for a four-byte pointer. There are now ten tables, one per type,
+each with its own free list and mark bits, and a slot costs what that type
+costs.
 
-So it is still not built, and now for a reason with a number attached rather
-than for want of one. Its better argument is no longer memory but dispatch:
-`class_of` is a heap lookup today, and a type in the handle's high bits would
-make it free for every built-in. That is the version worth building, and it
-should be judged on the benchmark clock rather than on the census.
+**The type moved into the handle** — four bits, and the *low* four, because a
+packed method table entry reserves the top bit and an `f32` build has only 21
+bits of payload to hold a whole handle in. Low bits leave both alone and simply
+shorten the index.
+
+Measured on an ESP32-C6FH4 at 160 MHz, against the commit before it:
+
+| | before | after |
+|---|---|---|
+| `binary_trees` peak heap | 158,124 B | **133,888 B** |
+| VM resident | 24,680 B | **22,920 B** |
+| `binary_trees` | 8.268 s | **8.169 s** |
+| `fib` | 16.601 s | **16.573 s** |
+| `list_build` | 0.568 s | **0.562 s** |
+| `method_call` | 2.356 s | **2.348 s** |
+
+**It pays twice, which was not the expectation.** The memory was the point;
+the speed came from `class_of`, where seven of ten answers are now the
+handle's four bits and no heap access at all. That is on the dispatch path, so
+it runs on every method call.
+
+Getting that second half needed one distinction worth recording. `type_of`
+answers "what is this, if it is still there", which means reading the type's
+table to see whether the slot is occupied. The first cut used it in `class_of`
+and measured **2–4% slower** — the heap read it was supposed to remove was
+still happening, plus a tag check. Splitting off `kind_of`, which reads the
+handle and nothing else, turned that into 1% faster. The dispatch path does
+not need to know whether an object is live; it is holding a reference to it.
+
+The fixed cost is about 400 bytes of `Vec` headers for ten tables instead of
+one, which is why `fib` and `method_call` gained a few hundred bytes each while
+`binary_trees` saved twenty-four kilobytes.
+
+Two smaller things fell out of the same work:
+
+- **A closure lives in its slot now.** `ObjClosure` is a handle and a vector,
+  16 bytes, which fits inside the 24 that `ObjRange` already forces — so
+  boxing it cost an allocation, a header and an indirection for nothing, on
+  19.7% of everything the VM allocates. `Class`, `Fn` and `Fiber` are 48 to 56
+  bytes and stay boxed.
+- **`Object` survives only as the argument to `allocate`.** Nothing stores one.
+  Its size assertions still pin the enum, but the enum is now a constructor's
+  parameter rather than the shape of the heap.
 
 ## Why the collector is replaceable, and what replacing it would involve
 
@@ -401,7 +439,9 @@ first principles. Two of the arguments were wrong.
 Per-type tables would save **50.3% of the slot bytes** on allocation volume,
 against 35% on the live snapshot measured earlier — because `Closure`, `Class`,
 `Fn` and `Fiber` are four bytes of payload sitting in a 24-byte slot, and
-together they are 27% of what gets allocated.
+together they are 27% of what gets allocated. That is now built; see **One
+table per type** above for what it measured on the board, which was less than
+this number and came with a speed gain the number did not predict.
 
 **Mark-sweep is expensive in exactly one place.**
 

@@ -158,10 +158,10 @@ caveats: **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
 
 | benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython |
 |---|---|---|---|---|---|
-| `binary_trees` depth 9 | 8.268 | 15.371 | **2.160** | 2.440 | 4.729 |
-| `fib(24)` x5 | 16.601 | 33.669 | **3.250** | 3.710 | 7.109 |
-| `list_build` 10,000 | 0.568 | 1.028 | **0.130** | 0.150 | 0.154 |
-| `method_call` | 2.356 | 4.326 | **0.350** | 0.420 | 1.748 |
+| `binary_trees` depth 9 | 8.169 | 15.371 | **2.160** | 2.440 | 4.729 |
+| `fib(24)` x5 | 16.573 | 33.669 | **3.250** | 3.710 | 7.109 |
+| `list_build` 10,000 | 0.562 | 1.028 | **0.130** | 0.150 | 0.154 |
+| `method_call` | 2.348 | 4.326 | **0.350** | 0.420 | 1.748 |
 
 The first run on hardware was slower than this — `binary_trees` 8.616,
 `fib` 18.176, `list_build` 0.574, `method_call` 2.766 at `speed`. What moved
@@ -174,12 +174,12 @@ both):
 
 | | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| **VM resident** | **24,680 B** | 83,036 B | — |
-| free to a program | ~303,000 B | ~227,000 B | 333,344 B |
-| `binary_trees` | 158,124 B | 78,812 B | 76,512 B |
-| `fib` | **3,888 B** | 6,612 B | 800 B |
+| **VM resident** | **22,920 B** | 83,036 B | — |
+| free to a program | ~305,000 B | ~227,000 B | 333,344 B |
+| `binary_trees` | 133,888 B | 78,812 B | 76,512 B |
+| `fib` | **4,172 B** | 6,612 B | 800 B |
 | `list_build` | 132,460 B | 134,712 B | 65,440 B |
-| `method_call` | **7,948 B** | 15,080 B | 1,616 B |
+| `method_call` | **8,316 B** | 15,080 B | 1,616 B |
 
 **Footprint** — and these do *not* compare across implementations, because the
 platforms differ: the C port is an ESP-IDF application carrying FreeRTOS and
@@ -196,11 +196,11 @@ build with networking and TLS in it.
 
 #### What these say
 
-**The VM is 70% smaller resident and three to seven times slower.** Both halves
+**The VM is 72% smaller resident and three to seven times slower.** Both halves
 are the same design, and only one of them was predicted.
 
 The memory result is what compiling no core library at start-up buys: upstream
-builds `wren_core.wren` every time a VM is created, and this does not. 24,680 B
+builds `wren_core.wren` every time a VM is created, and this does not. 22,920 B
 against 83,036 B is the figure that decides whether a part is usable at all.
 
 The speed result contradicts this repository's own design note, which put the
@@ -225,12 +225,12 @@ contradicts the design is worth more than a flattering one. Acting on it since:
 
 | | first run | now |
 |---|---|---|
-| VM resident | 45,676 B | **24,680 B** |
-| `method_call` | 2.766 s | **2.356 s** |
-| `fib` | 18.176 s | **16.601 s** |
-| `binary_trees` | 8.616 s | **8.268 s** |
-| `binary_trees` heap | 160,244 B | 158,124 B |
-| `method_call` heap | 9,800 B | **7,948 B** |
+| VM resident | 45,676 B | **22,920 B** |
+| `method_call` | 2.766 s | **2.348 s** |
+| `fib` | 18.176 s | **16.573 s** |
+| `binary_trees` | 8.616 s | **8.169 s** |
+| `binary_trees` heap | 160,244 B | **133,888 B** |
+| `method_call` heap | 9,800 B | **8,316 B** |
 
 Three changes, each measured on the board:
 
@@ -248,15 +248,23 @@ highest symbol that class answers to and almost all of it is empty. Handing back
 the `Vec` slack and packing an entry from 8 bytes to 4 took VM resident from
 49,004 B to 24,680 B.
 
+**Every object was charged for the largest one.** A slot held an `Object`, and
+an enum is as large as its largest variant, so a `List` that needs twelve bytes
+was charged twenty-four. One table per type charges each what it costs, and it
+made the benchmarks marginally *faster* as well: the type now lives in the
+handle, so seven of `class_of`'s ten answers touch no memory at all.
+
 **The host measured none of the speed work.** Every one of those changes was
 inside the noise on a workstation, because an out-of-order core hides a
 dependent load that an in-order RISC-V pays for in full. The board is the only
 place a change like this can be judged.
 
-What is left is the two levers with numbers but no implementation:
-`binary_trees` peaks at 158 KB against 77 KB live, so **half of peak is still
-floating garbage** — which is what refcounting in front of the tracing collector
-would recover, and what `Heap::set_growth` trades for time today.
+What is left is the lever with a number but no implementation: `binary_trees`
+peaks at 134 KB against a live set well under half that, so **most of peak is
+still floating garbage** — which is what refcounting in front of the tracing
+collector would recover, and what `Heap::set_growth` trades for time today.
+The heap profiler says 100% of the garbage 873 programs produce is acyclic, so
+a reference count would reclaim all of it.
 [`doc/wren-rs/design.md`](doc/wren-rs/design.md) carries the measurements and
 what each would cost.
 

@@ -14,10 +14,10 @@ because the first one is what the second is owed to.
 
 | benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython | wren-rs vs C `-O2` |
 |---|---|---|---|---|---|---|
-| `binary_trees` | **8.268 s** | 15.371 s | 2.160 s | 2.440 s | 4.729 s | 3.8x slower |
-| `fib` | **16.601 s** | 33.669 s | 3.250 s | 3.710 s | 7.109 s | 5.1x slower |
-| `list_build` | **0.568 s** | 1.028 s | 0.130 s | 0.150 s | 0.154 s | 4.4x slower |
-| `method_call` | **2.356 s** | 4.326 s | 0.350 s | 0.420 s | 1.748 s | 6.7x slower |
+| `binary_trees` | **8.169 s** | 15.371 s | 2.160 s | 2.440 s | 4.729 s | 3.8x slower |
+| `fib` | **16.573 s** | 33.669 s | 3.250 s | 3.710 s | 7.109 s | 5.1x slower |
+| `list_build` | **0.562 s** | 1.028 s | 0.130 s | 0.150 s | 0.154 s | 4.3x slower |
+| `method_call` | **2.348 s** | 4.326 s | 0.350 s | 0.420 s | 1.748 s | 6.7x slower |
 
 **wren-rs is four to seven times slower than upstream Wren on this part**, and
 one and a half to five times slower than MicroPython. `method_call` is the
@@ -92,9 +92,9 @@ The one clear win, and it is a large one:
 
 | | wren-rs | C Wren |
 |---|---|---|
-| **VM resident after construction** | **24,680 B** | 83,036 B |
+| **VM resident after construction** | **22,920 B** | 83,036 B |
 
-**The VM is 70% smaller than upstream's before a line of user code runs.** That
+**The VM is 72% smaller than upstream's before a line of user code runs.** That
 is the figure that decides whether a part is usable at all. Two things produce
 it. The first is compiling no core library at start-up: upstream builds
 `wren_core.wren` every time a VM is created, and this does not. The second was
@@ -102,21 +102,23 @@ found by counting rather than by reasoning — the method tables were the larges
 thing on the heap, because a class's table is indexed by global method symbol
 and is therefore as long as the highest symbol it answers to and almost all
 empty. Handing back the `Vec` slack and packing an entry from eight bytes to
-four took resident from 45,676 B through 49,004 B to 24,680 B.
+four took resident from 45,676 B through 49,004 B to 24,680 B, and giving
+each type its own table -- so a `List` slot costs the twelve bytes a list needs
+rather than the twenty-four a `Range` needs -- took it to 22,920 B.
 
 Per-benchmark, measured the same way on both — free before minus free after,
 no forced collection:
 
 | benchmark | wren-rs | C Wren `-O2` | |
 |---|---|---|---|
-| `binary_trees` | **158,124 B** | 78,784 B | *2.0x more* |
-| `fib` | **3,888 B** | 6,616 B | *1.7x less* |
+| `binary_trees` | **133,888 B** | 78,784 B | *1.7x more* |
+| `fib` | **4,172 B** | 6,616 B | *1.6x less* |
 | `list_build` | **132,460 B** | 134,712 B | *1.0x less* |
-| `method_call` | **7,948 B** | 15,096 B | *1.9x less* |
+| `method_call` | **8,316 B** | 15,096 B | *1.8x less* |
 
 **These are peaks, not live sets, and the difference is most of the number.**
 Measured with the heap census (`bench --census`), `binary_trees` holds 76,727 B
-live where the device peaks at 158,124 B — so **half of what it uses is
+live where the device peaks at 133,888 B — so **half of what it uses is
 floating garbage** the growth threshold has not collected yet. That is a dial
 rather than a fact: 1.25x instead of the default 1.5x took the peak to
 160,628 B from 185,156 B at the time it was measured, for 4.6% more time.
