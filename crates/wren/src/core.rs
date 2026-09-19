@@ -27,11 +27,11 @@ use alloc::vec::Vec;
 use crate::handle::ObjectId;
 use crate::math;
 use crate::object::{
-    MapEntry, Method, ObjClass, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object,
-    Primitive,
+    MapEntry, Method, ObjClass, ObjFiber, ObjInstance, ObjList, ObjMap, ObjRange, ObjString,
+    Object, Primitive,
 };
 use crate::value::Value;
-use crate::vm::{RuntimeError, Vm};
+use crate::vm::{RuntimeError, Switch, Vm};
 
 /// Bind a primitive to a signature on a class.
 fn define(vm: &mut Vm, class: ObjectId, signature: &str, function: Primitive) {
@@ -72,6 +72,7 @@ macro_rules! arithmetic {
 pub fn install(vm: &mut Vm) {
     install_object(vm);
     install_fn(vm);
+    install_fiber(vm);
     install_num(vm);
     install_bool(vm);
     install_null(vm);
@@ -183,18 +184,151 @@ fn install_fn(vm: &mut Vm) {
 
 /// `call`, `call(_)`, `call(_,_)`, ...
 fn signature_for(name: &str, arity: usize) -> alloc::string::String {
+    // Parenthesised even at arity zero: `call` and `call()` are different
+    // methods in Wren.
     let mut out = alloc::string::String::from(name);
-    if arity > 0 {
-        out.push('(');
-        for index in 0..arity {
-            if index > 0 {
-                out.push(',');
-            }
-            out.push('_');
+    out.push('(');
+    for index in 0..arity {
+        if index > 0 {
+            out.push(',');
         }
-        out.push(')');
+        out.push('_');
     }
+    out.push(')');
     out
+}
+
+/// `Fiber`: coroutines, and the error handling built on them.
+///
+/// **Wren has no `try`/`catch`.** A runtime error aborts the fiber it happened
+/// in, and `fiber.try()` runs one and hands back the error rather than letting
+/// it propagate. So this class is both chapters at once.
+fn install_fiber(vm: &mut Vm) {
+    let class = vm.fiber_class;
+
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Fiber metaclass")));
+    let metaclass = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+    if let Some(Object::Class(fiber)) = vm.heap.get_mut(class) {
+        fiber.metaclass = Some(metaclass);
+    }
+
+    define(vm, metaclass, "new(_)", |vm, at| {
+        let function = argument(vm, at, 1);
+        let Some(closure) = function.as_object() else {
+            return Err(RuntimeError::new("Argument must be a function."));
+        };
+        if !matches!(vm.heap.get(closure), Some(Object::Closure(_))) {
+            return Err(RuntimeError::new("Argument must be a function."));
+        }
+        let id = vm.heap.allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
+        Ok(Value::object(id))
+    });
+
+    define(vm, metaclass, "current", |vm, _| match vm.current_fiber {
+        Some(id) => Ok(Value::object(id)),
+        None => Ok(Value::NULL),
+    });
+
+    // `Fiber.abort(message)` raises a runtime error the way a failing
+    // primitive does, so `try` catches it like any other.
+    define(vm, metaclass, "abort(_)", |vm, at| {
+        let message = argument(vm, at, 1);
+        if message.is_null() {
+            // Upstream treats aborting with null as "do not actually abort".
+            return Ok(Value::NULL);
+        }
+        let text = vm.to_string(message);
+        Err(RuntimeError::new(text))
+    });
+
+    define(vm, metaclass, "yield()", |vm, _| yield_to_caller(vm, Value::NULL));
+    define(vm, metaclass, "yield(_)", |vm, at| {
+        let value = argument(vm, at, 1);
+        yield_to_caller(vm, value)
+    });
+
+    define(vm, class, "call()", |vm, at| switch_into(vm, at, Value::NULL, true, false));
+    define(vm, class, "call(_)", |vm, at| {
+        let value = argument(vm, at, 1);
+        switch_into(vm, at, value, true, false)
+    });
+    define(vm, class, "try()", |vm, at| switch_into(vm, at, Value::NULL, true, true));
+    define(vm, class, "try(_)", |vm, at| {
+        let value = argument(vm, at, 1);
+        switch_into(vm, at, value, true, true)
+    });
+    // `transfer` does not record a caller, so the fiber it leaves is not
+    // resumed when the target finishes -- a jump rather than a call.
+    define(vm, class, "transfer()", |vm, at| switch_into(vm, at, Value::NULL, false, false));
+    define(vm, class, "transfer(_)", |vm, at| {
+        let value = argument(vm, at, 1);
+        switch_into(vm, at, value, false, false)
+    });
+
+    define(vm, class, "isDone", |vm, at| {
+        match receiver(vm, at).as_object().and_then(|id| vm.heap.get(id)) {
+            Some(Object::Fiber(fiber)) => Ok(Value::bool(fiber.done)),
+            _ => Err(RuntimeError::new("Receiver must be a fiber.")),
+        }
+    });
+
+    define(vm, class, "error", |vm, at| {
+        match receiver(vm, at).as_object().and_then(|id| vm.heap.get(id)) {
+            Some(Object::Fiber(fiber)) => Ok(fiber.error),
+            _ => Err(RuntimeError::new("Receiver must be a fiber.")),
+        }
+    });
+}
+
+/// Ask the interpreter to continue in `fiber`.
+fn switch_into(
+    vm: &mut Vm,
+    at: usize,
+    value: Value,
+    set_caller: bool,
+    catching: bool,
+) -> Result<Value, RuntimeError> {
+    let Some(target) = receiver(vm, at).as_object() else {
+        return Err(RuntimeError::new("Receiver must be a fiber."));
+    };
+    match vm.heap.get(target) {
+        Some(Object::Fiber(fiber)) if fiber.done => {
+            return Err(RuntimeError::new("Cannot call a finished fiber."));
+        }
+        Some(Object::Fiber(_)) => {}
+        _ => return Err(RuntimeError::new("Receiver must be a fiber.")),
+    }
+    vm.pending_switch = Some(Switch {
+        target,
+        value,
+        set_caller,
+        catching,
+        finishing: false,
+    });
+    Ok(Value::NULL)
+}
+
+/// Suspend the running fiber and hand `value` back to whoever resumed it.
+fn yield_to_caller(vm: &mut Vm, value: Value) -> Result<Value, RuntimeError> {
+    let caller = vm
+        .current_fiber
+        .and_then(|id| match vm.heap.get(id) {
+            Some(Object::Fiber(fiber)) => fiber.caller,
+            _ => None,
+        });
+    let Some(caller) = caller else {
+        return Err(RuntimeError::new("No fiber to yield to."));
+    };
+    vm.pending_switch = Some(Switch {
+        target: caller,
+        value,
+        set_caller: false,
+        catching: false,
+        finishing: false,
+    });
+    Ok(Value::NULL)
 }
 
 fn install_num(vm: &mut Vm) {
@@ -705,7 +839,7 @@ fn install_list(vm: &mut Vm) {
     if let Some(Object::Class(list)) = vm.heap.get_mut(class) {
         list.metaclass = Some(metaclass);
     }
-    define(vm, metaclass, "new", |vm, _| {
+    define(vm, metaclass, "new()", |vm, _| {
         Ok(new_list(vm, Vec::new()))
     });
     vm.module.define("List", Value::object(class));
@@ -1044,7 +1178,7 @@ fn install_map(vm: &mut Vm) {
     if let Some(Object::Class(map)) = vm.heap.get_mut(class) {
         map.metaclass = Some(metaclass);
     }
-    define(vm, metaclass, "new", |vm, _| {
+    define(vm, metaclass, "new()", |vm, _| {
         let id = vm.heap.allocate(Object::Map(ObjMap::new()));
         Ok(Value::object(id))
     });
@@ -1398,6 +1532,7 @@ fn install_system(vm: &mut Vm) {
         ("Map", vm.map_class),
         ("Null", vm.null_class),
         ("Num", vm.num_class),
+        ("Fiber", vm.fiber_class),
         ("Range", vm.range_class),
         ("String", vm.string_class),
     ] {

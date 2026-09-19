@@ -1105,7 +1105,7 @@ impl<'a> Compiler<'a> {
         let index = self.module_variable("Map")?;
         self.chunk_mut().emit_op(Op::LoadModuleVar, line);
         self.chunk_mut().emit_short(index as u16, line);
-        self.emit_call("new", 0, line)?;
+        self.emit_call("new()", 0, line)?;
 
         self.skip_newlines()?;
         if !self.check(TokenKind::RightBrace) {
@@ -1141,7 +1141,7 @@ impl<'a> Compiler<'a> {
         };
         self.chunk_mut().emit_op(Op::LoadModuleVar, line);
         self.chunk_mut().emit_short(index as u16, line);
-        self.emit_call("new", 0, line)?;
+        self.emit_call("new()", 0, line)?;
 
         self.skip_newlines()?;
         if !self.check(TokenKind::RightBracket) {
@@ -1592,9 +1592,11 @@ impl<'a> Compiler<'a> {
 /// `foo(1, 2)` are different methods and neither is an overload of the other.
 /// Building the signature here is what makes that true in the bytecode.
 fn signature(name: &str, arity: usize) -> String {
-    if arity == 0 {
-        return name.to_string();
-    }
+    // **Always parenthesised, even at arity zero.** In Wren `foo` and `foo()`
+    // are different signatures -- a getter and a method that takes nothing --
+    // and collapsing them meant `fiber.call()` looked for the getter `call`
+    // and did not find it. A getter is emitted by passing the bare name, not
+    // by calling this.
     let mut out = String::from(name);
     out.push('(');
     for index in 0..arity {

@@ -12,9 +12,9 @@ paragraph of the spec rather than at a vague gap.
 | | |
 |---|---|
 | probes | 96 |
-| **works** | **80** |
-| differs | 2 |
-| missing | 14 |
+| **works** | **87** |
+| differs | 3 |
+| missing | 6 |
 
 ## By chapter
 
@@ -22,15 +22,15 @@ paragraph of the spec rather than at a vague gap.
 |---|---|---|---|
 | [Syntax](#syntax) | 8 | 0 | 0 |
 | [Values](#values) | 10 | 2 | 0 |
-| [Lists](#lists) | 9 | 0 | 1 |
+| [Lists](#lists) | 10 | 0 | 0 |
 | [Maps](#maps) | 8 | 0 | 0 |
 | [Method calls](#method-calls) | 8 | 0 | 0 |
 | [Control flow](#control-flow) | 11 | 0 | 0 |
 | [Variables](#variables) | 5 | 0 | 0 |
-| [Classes](#classes) | 13 | 0 | 2 |
+| [Classes](#classes) | 12 | 0 | 3 |
 | [Functions](#functions) | 7 | 0 | 0 |
-| [Concurrency](#concurrency) | 0 | 0 | 5 |
-| [Error handling](#error-handling) | 1 | 0 | 3 |
+| [Concurrency](#concurrency) | 4 | 1 | 0 |
+| [Error handling](#error-handling) | 4 | 0 | 0 |
 | [Modularity](#modularity) | 0 | 0 | 3 |
 
 ## Syntax
@@ -75,7 +75,7 @@ paragraph of the spec rather than at a vague gap.
 | Insert | works |  |
 | Adding lists together | works |  |
 | Removing elements | works |  |
-| Clear | **missing** | List does not implement 'clear'. |
+| Clear | works |  |
 | Count | works |  |
 
 ## Maps
@@ -145,7 +145,7 @@ paragraph of the spec rather than at a vague gap.
 | Fields are private | works |  |
 | Static members | works |  |
 | Static fields | **missing** | Expected expression. |
-| Inheritance | works |  |
+| Inheritance | **missing** | Not a closure. |
 | super | **missing** | Not a closure. |
 | is operator | works |  |
 | type getter | works |  |
@@ -166,20 +166,20 @@ paragraph of the spec rather than at a vague gap.
 
 | feature | status | note |
 |---|---|---|
-| Creating fibers | **missing** | Null does not implement 'new(_)'. |
-| Yielding | **missing** | Null does not implement 'new(_)'. |
-| Passing values | **missing** | Null does not implement 'new(_)'. |
-| isDone | **missing** | Null does not implement 'new(_)'. |
-| Transferring control | **missing** | Null does not implement 'new(_)'. |
+| Creating fibers | works |  |
+| Yielding | works |  |
+| Passing values | works |  |
+| isDone | works |  |
+| Transferring control | **differs** | printed "", spec says "1\n" |
 
 ## Error handling
 
 | feature | status | note |
 |---|---|---|
-| Creating runtime errors | **missing** | Null does not implement 'new(_)'. |
-| Handling runtime errors | **missing** | Null does not implement 'new(_)'. |
+| Creating runtime errors | works |  |
+| Handling runtime errors | works |  |
 | Runtime errors abort | works |  |
-| error getter | **missing** | Null does not implement 'new(_)'. |
+| error getter | works |  |
 
 ## Modularity
 

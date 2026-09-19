@@ -24,9 +24,8 @@ use crate::compiler;
 use crate::core;
 use crate::handle::ObjectId;
 use crate::heap::Heap;
-use crate::math;
 use crate::object::{
-    Method, ObjClass, ObjClosure, ObjFn, ObjInstance, ObjString, ObjUpvalue, Object,
+    Method, ObjClass, ObjClosure, ObjFiber, ObjFn, ObjInstance, ObjString, ObjUpvalue, Object,
 };
 use crate::symbol::SymbolTable;
 use crate::value::Value;
@@ -81,6 +80,7 @@ impl WrenError {
 const MAX_FRAMES: usize = 256;
 
 /// One call in progress.
+#[derive(Debug, Clone, Copy)]
 pub struct Frame {
     pub closure: ObjectId,
     /// Where to resume. Only written when this frame stops being the running
@@ -89,6 +89,22 @@ pub struct Frame {
     /// The stack slot holding the receiver. Local slot *n* is `base + n`, and
     /// slot 0 is `this`.
     pub base: usize,
+}
+
+/// A request from a primitive to continue in a different fiber.
+pub struct Switch {
+    /// Where to go.
+    pub target: ObjectId,
+    /// The value the target receives: the argument to `call`, or what `yield`
+    /// hands back to whoever resumed this fiber.
+    pub value: Value,
+    /// Whether the target should record this fiber as its caller. `transfer`
+    /// does not, which is what makes it a jump rather than a call.
+    pub set_caller: bool,
+    /// Whether the resumer wants an error handed back rather than propagated.
+    pub catching: bool,
+    /// Set when the switch is a fiber finishing rather than yielding.
+    pub finishing: bool,
 }
 
 /// A module's variables: names and values, in parallel.
@@ -140,6 +156,25 @@ pub struct Vm {
     pub fn_class: ObjectId,
     /// What iterating a map yields: a `key`/`value` pair.
     pub map_entry_class: ObjectId,
+    /// The class of a coroutine.
+    pub fiber_class: ObjectId,
+
+    /// The fiber currently running. Its stack and frames are the VM's own,
+    /// and are swapped back into it when control moves elsewhere.
+    pub current_fiber: Option<ObjectId>,
+    /// Set by a primitive that wants the interpreter to resume somewhere else.
+    ///
+    /// A primitive returns a `Value`, which cannot express "do not push a
+    /// result, run a different fiber instead". Rather than change every
+    /// primitive's signature for the handful that switch, the switching ones
+    /// leave the request here and the call site checks for it.
+    pub pending_switch: Option<Switch>,
+    /// How deep the frames were when Rust last re-entered the interpreter.
+    ///
+    /// A yield may not cross that boundary: there is a Rust stack frame in the
+    /// way that cannot be suspended. `list.each { Fiber.yield }` is the shape
+    /// that hits it, and an error is better than corrupting the stack.
+    rust_floor: usize,
 
     /// Calls in progress, innermost last.
     pub frames: Vec<Frame>,
@@ -187,6 +222,7 @@ impl Vm {
         let class_class = class_named(&mut heap, "Class", root);
         let fn_class = class_named(&mut heap, "Fn", root);
         let map_entry_class = class_named(&mut heap, "MapEntry", root);
+        let fiber_class = class_named(&mut heap, "Fiber", root);
 
         let mut vm = Vm {
             heap,
@@ -204,6 +240,10 @@ impl Vm {
             object_class,
             fn_class,
             map_entry_class,
+            fiber_class,
+            current_fiber: None,
+            pending_switch: None,
+            rust_floor: 0,
             frames: Vec::new(),
             open_upvalues: Vec::new(),
             output: Vec::new(),
@@ -250,6 +290,7 @@ impl Vm {
             Object::Class(class) => Some(class.metaclass.unwrap_or(self.class_class)),
             Object::Instance(instance) => Some(instance.class),
             Object::Fn(_) | Object::Closure(_) => Some(self.fn_class),
+            Object::Fiber(_) => Some(self.fiber_class),
             // An upvalue is never a value a program can hold; it exists only
             // inside a closure.
             Object::Upvalue(_) => None,
@@ -291,10 +332,7 @@ impl Vm {
     /// rule in the language.
     pub fn to_string(&self, value: Value) -> String {
         if let Some(number) = value.as_num() {
-            if number == math::trunc(number) && number.is_finite() && math::abs(number) < 1e21 {
-                return format!("{}", number as i64);
-            }
-            return format!("{number}");
+            return format_number(number);
         }
         if value.is_null() {
             return "null".to_string();
@@ -339,6 +377,7 @@ impl Vm {
                 format!("instance of {}", self.class_name(instance.class))
             }
             Some(Object::Fn(_)) | Some(Object::Closure(_)) => "<fn>".to_string(),
+            Some(Object::Fiber(_)) => "<fiber>".to_string(),
             Some(Object::Upvalue(_)) => "<upvalue>".to_string(),
             None => "<collected>".to_string(),
         }
@@ -438,7 +477,7 @@ impl Vm {
         for class in [
             self.num_class, self.bool_class, self.null_class, self.string_class,
             self.list_class, self.map_class, self.range_class, self.class_class,
-            self.object_class, self.fn_class, self.map_entry_class,
+            self.object_class, self.fn_class, self.map_entry_class, self.fiber_class,
         ] {
             roots.push(Value::object(class));
         }
@@ -480,6 +519,94 @@ impl Vm {
         result
     }
 
+    /// Make the running fiber's stack and frames its own again.
+    fn park_current(&mut self, ip: usize) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.ip = ip;
+        }
+        let Some(id) = self.current_fiber else { return };
+        let stack = ::core::mem::take(&mut self.stack);
+        let frames = ::core::mem::take(&mut self.frames);
+        if let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) {
+            fiber.stack = stack;
+            fiber.frames = frames;
+        }
+    }
+
+    /// Take a fiber's stack and frames as the VM's own, and run it.
+    fn resume(&mut self, target: ObjectId, value: Value) -> Result<(), RuntimeError> {
+        let (mut stack, mut frames, entry, done) = match self.heap.get_mut(target) {
+            Some(Object::Fiber(fiber)) => (
+                ::core::mem::take(&mut fiber.stack),
+                ::core::mem::take(&mut fiber.frames),
+                fiber.entry,
+                fiber.done,
+            ),
+            _ => return Err(RuntimeError::new("Not a fiber.")),
+        };
+        if done {
+            return Err(RuntimeError::new("Cannot call a finished fiber."));
+        }
+
+        if frames.is_empty() {
+            // Starting it: the closure is the receiver, and the value resumed
+            // with is its argument when it takes one.
+            let Some(entry) = entry else {
+                return Err(RuntimeError::new("Fiber has no function."));
+            };
+            let arity = self.arity_of(entry).unwrap_or(0);
+            stack.push(Value::object(entry));
+            if arity > 0 {
+                stack.push(value);
+            }
+            frames.push(Frame { closure: entry, ip: 0, base: 0 });
+        } else {
+            // Resuming it: the value is the result of the `yield` that
+            // suspended it, and the call that yielded is waiting for exactly
+            // one value at the top of its stack.
+            stack.push(value);
+        }
+
+        self.stack = stack;
+        self.frames = frames;
+        self.current_fiber = Some(target);
+        Ok(())
+    }
+
+    /// Carry out a [`Switch`] requested by a primitive.
+    fn perform_switch(&mut self, switch: Switch, ip: usize) -> Result<(), RuntimeError> {
+        let from = self.current_fiber;
+        self.park_current(ip);
+
+        if switch.set_caller {
+            if let Some(Object::Fiber(fiber)) = self.heap.get_mut(switch.target) {
+                fiber.caller = from;
+                fiber.catching = switch.catching;
+            }
+        }
+        if switch.finishing {
+            if let Some(from) = from {
+                if let Some(Object::Fiber(fiber)) = self.heap.get_mut(from) {
+                    fiber.done = true;
+                }
+            }
+        }
+        self.resume(switch.target, switch.value)
+    }
+
+    /// The fiber to deliver an error to, if any is willing to catch it.
+    fn catcher(&self) -> Option<ObjectId> {
+        let mut current = self.current_fiber;
+        while let Some(id) = current {
+            let Some(Object::Fiber(fiber)) = self.heap.get(id) else { return None };
+            if fiber.catching {
+                return fiber.caller;
+            }
+            current = fiber.caller;
+        }
+        None
+    }
+
     /// Call a Wren function with arguments, from Rust.
     ///
     /// This is what a core method written in Rust needs in order to take a
@@ -510,8 +637,12 @@ impl Vm {
     /// be on the stack at `base`.
     pub fn call_closure(&mut self, closure: ObjectId, base: usize) -> Result<Value, RuntimeError> {
         let depth = self.frames.len();
+        let was = self.rust_floor;
+        self.rust_floor = depth;
         let chunk = self.push_frame(closure, base)?;
-        self.run_frames(chunk, depth)
+        let result = self.run_frames(chunk, depth);
+        self.rust_floor = was;
+        result
     }
 
     /// Run a compiled chunk as a fresh top-level frame.
@@ -530,6 +661,14 @@ impl Vm {
         let closure = self
             .heap
             .allocate(Object::Closure(Box::new(ObjClosure { function, upvalues: Vec::new() })));
+
+        // The module runs in a root fiber, so that `Fiber.yield` at the top
+        // level has something to complain about and `Fiber.current` has an
+        // answer.
+        if self.current_fiber.is_none() {
+            let root = self.heap.allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
+            self.current_fiber = Some(root);
+        }
 
         let base = self.stack.len();
         self.stack.push(Value::NULL);
@@ -703,28 +842,64 @@ impl Vm {
                     };
 
                     let receiver_at = self.stack.len() - arity - 1;
-                    let Some(method) = self.find_method(start_from, symbol) else {
+                    let found = self.find_method(start_from, symbol);
+                    let Some(method) = found else {
                         let name = self.method_names.name(symbol).unwrap_or("?").to_string();
                         let receiver = self.stack[receiver_at];
                         let class_name = self
                             .class_of(receiver)
                             .map(|class| self.class_name(class))
                             .unwrap_or_else(|| "null".to_string());
-                        return Err(RuntimeError {
+                        let error = RuntimeError {
                             message: format!("{class_name} does not implement '{name}'."),
                             line,
-                        });
+                        };
+                        match self.deliver_error(error, ip)? {
+                            Some((next_chunk, next_ip, next_base)) => {
+                                chunk = next_chunk;
+                                ip = next_ip;
+                                base = next_base;
+                                continue;
+                            }
+                            None => unreachable!("deliver_error returns or switches"),
+                        }
                     };
 
                     match method {
                         Method::Primitive(function) => {
-                            let value = function(self, receiver_at).map_err(|mut error| {
+                            let outcome = function(self, receiver_at).map_err(|mut error| {
                                 if error.line == 0 {
                                     error.line = line;
                                 }
                                 error
-                            })?;
+                            });
+
+                            let value = match outcome {
+                                Ok(value) => value,
+                                Err(error) => match self.deliver_error(error, ip)? {
+                                    Some((next_chunk, next_ip, next_base)) => {
+                                        chunk = next_chunk;
+                                        ip = next_ip;
+                                        base = next_base;
+                                        continue;
+                                    }
+                                    None => unreachable!("deliver_error returns or switches"),
+                                },
+                            };
+
+                            // **A primitive may have asked to continue
+                            // somewhere else.** The result slot is cleared
+                            // either way; a switch leaves the target to push
+                            // its own value there when it comes back.
                             self.stack.truncate(receiver_at);
+                            if let Some(switch) = self.pending_switch.take() {
+                                self.perform_switch(switch, ip)?;
+                                let frame = *self.frames.last().expect("a frame to resume");
+                                ip = frame.ip;
+                                base = frame.base;
+                                chunk = self.chunk_of(frame.closure)?;
+                                continue;
+                            }
                             self.stack.push(value);
                         }
                         Method::Closure(closure) => {
@@ -761,6 +936,36 @@ impl Vm {
                     self.frames.pop();
 
                     if self.frames.len() <= floor {
+                        // **A fiber running out of frames is finished**, and
+                        // control goes back to whoever resumed it rather than
+                        // out of the interpreter -- unless nobody did, in which
+                        // case this is the root and the program is over.
+                        let caller = self.current_fiber.and_then(|id| match self.heap.get(id) {
+                            Some(Object::Fiber(fiber)) => fiber.caller,
+                            _ => None,
+                        });
+                        if let (Some(caller), true) = (caller, floor <= self.rust_floor) {
+                            self.perform_switch(
+                                Switch {
+                                    target: caller,
+                                    value: result,
+                                    set_caller: false,
+                                    catching: false,
+                                    finishing: true,
+                                },
+                                ip,
+                            )?;
+                            let frame = *self.frames.last().expect("a frame to resume");
+                            ip = frame.ip;
+                            base = frame.base;
+                            chunk = self.chunk_of(frame.closure)?;
+                            continue;
+                        }
+                        if let Some(id) = self.current_fiber {
+                            if let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) {
+                                fiber.done = true;
+                            }
+                        }
                         return Ok(result);
                     }
 
@@ -819,6 +1024,43 @@ impl Vm {
                 self.heap.collect(roots);
             }
         }
+    }
+
+    /// Hand a runtime error to the nearest fiber that asked to catch one.
+    ///
+    /// Returns where to resume, or propagates the error when nothing is
+    /// catching -- which is what makes an uncaught error end the program.
+    #[allow(clippy::type_complexity)]
+    fn deliver_error(
+        &mut self,
+        error: RuntimeError,
+        ip: usize,
+    ) -> Result<Option<(Rc<Chunk>, usize, usize)>, RuntimeError> {
+        let Some(catcher) = self.catcher() else {
+            return Err(error);
+        };
+
+        let message = self.new_string(&error.message);
+        if let Some(id) = self.current_fiber {
+            if let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) {
+                fiber.error = message;
+                fiber.done = true;
+            }
+        }
+
+        self.perform_switch(
+            Switch {
+                target: catcher,
+                value: message,
+                set_caller: false,
+                catching: false,
+                finishing: false,
+            },
+            ip,
+        )?;
+        let frame = *self.frames.last().expect("a frame to resume");
+        let chunk = self.chunk_of(frame.closure)?;
+        Ok(Some((chunk, frame.ip, frame.base)))
     }
 
     fn read_upvalue(&self, base: usize, slot: usize) -> Result<Value, RuntimeError> {
@@ -1092,4 +1334,69 @@ impl Default for Vm {
     fn default() -> Vm {
         Vm::new()
     }
+}
+
+/// Format a number the way Wren does.
+///
+/// **This is `printf("%.14g")` plus three special cases**, and matching it
+/// matters more than it looks: number formatting is in the output of a large
+/// share of the test suite, so a formatter that is merely reasonable fails
+/// dozens of tests that are not about formatting at all.
+///
+/// Why fourteen significant digits rather than seventeen, which is what it
+/// takes to round-trip an `f64`? Because the point is readability, not
+/// round-tripping. `0.1 + 0.2` is `0.30000000000000004` at full precision and
+/// `0.3` at fourteen digits, and the second is what a person writing a script
+/// means. The cost is that two distinct doubles can print identically; Wren
+/// accepts that trade and so must anything compatible with it.
+///
+/// `%g` itself is the rule that picks between decimal and exponential: use
+/// exponential when the exponent is below -4 or at least the precision, and
+/// decimal otherwise, then strip trailing zeros either way. That is why `1e300`
+/// prints as `1e+300` while `1000` prints as `1000`.
+fn format_number(value: f64) -> String {
+    // Wren spells these out rather than using C's "inf"/"-inf"/"nan", so a
+    // program's output is the same on every platform -- C leaves the spelling
+    // implementation-defined, which is exactly the sort of thing that makes a
+    // test suite portable or not.
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "infinity" } else { "-infinity" }.to_string();
+    }
+    if value == 0.0 {
+        // `-0.0` is a real value a program can produce -- `0 * -1`, or
+        // `(-0.5).truncate` -- and Wren prints its sign.
+        return if value.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+
+    // Rust has no `%g`, so it is built from `%e`: format with 13 digits after
+    // the point (14 significant), then read back the exponent to decide which
+    // shape to print. Doing it in this order means the rounding happens once,
+    // before the decision, which is what C does.
+    let exponential = format!("{value:.13e}");
+    let (mantissa, exponent) = exponential
+        .split_once('e')
+        .expect("Rust's {:e} always writes an exponent");
+    let exponent: i32 = exponent.parse().expect("and it is always an integer");
+
+    if exponent < -4 || exponent >= 14 {
+        let mantissa = trim_trailing_zeros(mantissa);
+        let sign = if exponent < 0 { '-' } else { '+' };
+        // C pads the exponent to at least two digits: `1e+05`, not `1e+5`.
+        return format!("{mantissa}e{sign}{:02}", exponent.abs());
+    }
+
+    // Decimal: 14 significant digits means 13 - exponent after the point.
+    let decimals = (13 - exponent).max(0) as usize;
+    trim_trailing_zeros(&format!("{value:.decimals$}"))
+}
+
+/// Strip the trailing zeros `%g` removes, and the point if nothing follows it.
+fn trim_trailing_zeros(text: &str) -> String {
+    if !text.contains('.') {
+        return text.to_string();
+    }
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }

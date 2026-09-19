@@ -34,6 +34,7 @@ pub enum ObjectType {
     Range,
     String,
     Upvalue,
+    Fiber,
 }
 
 /// A heap object.
@@ -75,6 +76,8 @@ pub enum Object {
     Closure(Box<ObjClosure>),
     /// One captured variable. See [`ObjUpvalue`].
     Upvalue(ObjUpvalue),
+    /// A coroutine with its own stack and call frames. See [`ObjFiber`].
+    Fiber(Box<ObjFiber>),
     Instance(ObjInstance),
     List(ObjList),
     Map(ObjMap),
@@ -89,6 +92,7 @@ impl Object {
             Object::Closure(_) => ObjectType::Closure,
             Object::Fn(_) => ObjectType::Fn,
             Object::Upvalue(_) => ObjectType::Upvalue,
+            Object::Fiber(_) => ObjectType::Fiber,
             Object::Instance(_) => ObjectType::Instance,
             Object::List(_) => ObjectType::List,
             Object::Map(_) => ObjectType::Map,
@@ -140,6 +144,28 @@ impl Object {
                     if let Some(id) = value.as_object() {
                         gray.push(id);
                     }
+                }
+            }
+            Object::Fiber(fiber) => {
+                // A suspended fiber's stack is live even though nothing is
+                // running on it; its frames hold the only reference to the
+                // closures half way through executing.
+                for value in &fiber.stack {
+                    if let Some(id) = value.as_object() {
+                        gray.push(id);
+                    }
+                }
+                for frame in &fiber.frames {
+                    gray.push(frame.closure);
+                }
+                if let Some(caller) = fiber.caller {
+                    gray.push(caller);
+                }
+                if let Some(id) = fiber.error.as_object() {
+                    gray.push(id);
+                }
+                if let Some(entry) = fiber.entry {
+                    gray.push(entry);
                 }
             }
             Object::Instance(instance) => {
@@ -202,6 +228,10 @@ impl Object {
                     + closure.upvalues.capacity() * core::mem::size_of::<ObjectId>()
             }
             Object::Upvalue(_) => 0,
+            Object::Fiber(fiber) => {
+                core::mem::size_of::<ObjFiber>()
+                    + fiber.stack.capacity() * core::mem::size_of::<Value>()
+            }
         };
         slot + inner
     }
@@ -504,4 +534,45 @@ pub struct ObjUpvalue {
     pub slot: usize,
     /// The captured value, once closed.
     pub closed: Option<Value>,
+}
+
+/// A coroutine: its own value stack, its own call frames, and who to go back to.
+///
+/// **A fiber is a separate stack, which is the whole point.** `Fiber.yield`
+/// leaves a call half-finished and returns to whoever resumed it; that is only
+/// possible if the frames below the yield stay put rather than being unwound.
+///
+/// The running fiber's stack and frames are kept on the VM rather than in here,
+/// because the interpreter touches them on every instruction and reaching
+/// through the heap for each access would cost a lookup per push. They are
+/// swapped back into the fiber when control moves elsewhere.
+#[derive(Debug)]
+pub struct ObjFiber {
+    pub stack: Vec<Value>,
+    pub frames: Vec<crate::vm::Frame>,
+    /// The function this fiber runs, until it has been started.
+    pub entry: Option<ObjectId>,
+    /// Who resumed this fiber, and so where `yield` returns to.
+    pub caller: Option<ObjectId>,
+    /// Set when the fiber aborted, and readable through `fiber.error`.
+    pub error: Value,
+    /// A fiber that has run to completion. Calling one again is an error.
+    pub done: bool,
+    /// Whether the resumer used `try`, and so wants an error handed back
+    /// rather than propagated.
+    pub catching: bool,
+}
+
+impl ObjFiber {
+    pub fn new(entry: ObjectId) -> ObjFiber {
+        ObjFiber {
+            stack: Vec::new(),
+            frames: Vec::new(),
+            entry: Some(entry),
+            caller: None,
+            error: Value::NULL,
+            done: false,
+            catching: false,
+        }
+    }
 }
