@@ -1459,14 +1459,20 @@ impl Vm {
             .map_or(0, |function| function.module);
 
         loop {
-            let byte = chunk.code[ip];
-            let line = chunk.line_at(ip);
+            // **The offset, not the line.** `line_at` is a lookup into a table
+            // as long as the code, and the line is wanted only when something
+            // fails -- which is never, in the overwhelming majority of
+            // instructions. Keeping the offset costs a register; looking the
+            // line up cost a bounds check and a load on every instruction
+            // executed.
+            let at = ip;
+            let byte = chunk.code[at];
             ip += 1;
 
             let Some(op) = Op::from_byte(byte) else {
                 return Err(RuntimeError {
                     message: format!("bad opcode {byte}"),
-                    line,
+                    line: chunk.line_at(at),
                 });
             };
 
@@ -1630,7 +1636,7 @@ impl Vm {
                             .unwrap_or_else(|| "null".to_string());
                         let error = RuntimeError {
                             message: format!("{class_name} does not implement '{name}'."),
-                            line,
+                            line: chunk.line_at(at),
                         };
                         match self.deliver_error(error, ip)? {
                             Some((next_chunk, next_ip, next_base)) => {
@@ -1648,7 +1654,7 @@ impl Vm {
                         Method::Primitive(function) => {
                             let outcome = function(self, receiver_at).map_err(|mut error| {
                                 if error.line == 0 {
-                                    error.line = line;
+                                    error.line = chunk.line_at(at);
                                 }
                                 error
                             });
@@ -1684,7 +1690,10 @@ impl Vm {
                                     // which is what makes `transferError`
                                     // different from `transfer`.
                                     let message = self.to_string(value);
-                                    let error = RuntimeError { message, line };
+                                    let error = RuntimeError {
+                                        message,
+                                        line: chunk.line_at(at),
+                                    };
                                     match self.deliver_error(error, 0)? {
                                         Some((next_chunk, next_ip, next_base)) => {
                                             chunk = next_chunk;
@@ -1717,13 +1726,13 @@ impl Vm {
                                         "Function expects {} argument(s) but got {arity}.",
                                         target.arity
                                     ),
-                                    line,
+                                    line: chunk.line_at(at),
                                 });
                             }
                             if self.frames.len() >= MAX_FRAMES {
                                 return Err(RuntimeError {
                                     message: "Stack overflow.".into(),
-                                    line,
+                                    line: chunk.line_at(at),
                                 });
                             }
                             if let Some(frame) = self.frames.last_mut() {
@@ -1827,7 +1836,7 @@ impl Vm {
                     let Some(from) = self.module_index.get(&module_name).copied() else {
                         return Err(RuntimeError {
                             message: format!("Could not load module '{module_name}'."),
-                            line,
+                            line: chunk.line_at(at),
                         });
                     };
                     let Some(value) = self.modules[from].get(&variable) else {
@@ -1835,7 +1844,7 @@ impl Vm {
                             message: format!(
                                 "Could not find a variable named '{variable}' in module '{module_name}'."
                             ),
-                            line,
+                            line: chunk.line_at(at),
                         });
                     };
                     self.stack.push(value);
