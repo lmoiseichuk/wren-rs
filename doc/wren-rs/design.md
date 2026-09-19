@@ -111,6 +111,66 @@ The padding is cheap at four bytes and saturates there: 8 B and 16 B are within
 source change to the interpreter competes with instruction placement rather
 than adding to it, and neither can be judged without the other.*
 
+### The instrument that settles it: counting work instead of time
+
+**The part has a performance counter, and it is not the RISC-V standard one.**
+Reading `minstret` raises an illegal-instruction exception here -- the
+privileged spec's machine counters are not implemented. What is implemented is
+Espressif's own, three custom CSRs that ESP-IDF declares for this chip with
+`SOC_CPU_HAS_CSR_PC` and saves across a sleep:
+
+| CSR | name | holds |
+|---|---|---|
+| `0x7e0` | `mpcer` | which events to count, one bit each |
+| `0x7e1` | `mpcmr` | bit 0 enables counting |
+| `0x7e2` | `mpccr` | the count |
+
+ESP-IDF names exactly one event, `PCER_CYCLES = 1 << 0`; the rest are in the
+chip's manual and in no header on this bench. So they were found by
+experiment. `ports/esp32c6-wren-rs/src/bin/counters.rs` runs five workloads
+that differ from a baseline loop by one known operation each, and reports which
+event moves. Counts per iteration:
+
+| event | base | +arith | +load | +store | +branch | what it is |
+|---|---|---|---|---|---|---|
+| 0 | 7.05 | 8.03 | 9.01 | 8.04 | 14.04 | **cycles** (ESP-IDF's one name) |
+| 1 | 7.00 | 7.00 | 9.00 | 8.00 | 11.00 | **instructions retired** |
+| 5 | 1.00 | 1.00 | **2.00** | 1.00 | 1.00 | loads |
+| 6 | 1.00 | 1.00 | 1.00 | **2.00** | 2.00 | stores |
+| 4, 7, 8, 9, 10, 12 | | | | | | move, unidentified |
+
+*The `+arith` column does not move event 1, which it should: the optimiser
+folds that add into the loop's induction variable. Events 4 and 7-12 respond to
+the workloads but not in a way that names them from these five alone -- an
+instruction-cache-miss event is very likely among them, and finding it would
+turn the fetch-bound conclusion below from an inference into a reading.*
+
+**The proof that it measures work and not placement.** The same source, built
+twice, differing only in branch-target padding:
+
+| `binary_trees` | no padding | 4 B padding | difference |
+|---|---|---|---|
+| time | 9.007332 s | 8.731564 s | **−3.06%** |
+| instructions retired | 541,532,864 | 541,532,863 | **1 in 541 million** |
+
+| `fib` | no padding | 4 B padding | difference |
+|---|---|---|---|
+| time | 16.774597 s | 16.127337 s | **−3.86%** |
+| instructions retired | 970,748,140 | 970,747,973 | 1 in 5.8 million |
+
+Three per cent of time, and the work is the same to a part in a million. That
+is the whole argument for the instrument: it cannot be fooled by where the code
+landed, so a change that claims to do less work has somewhere to prove it.
+
+**And it says what the bottleneck is.** At 160 MHz, `binary_trees` unpadded is
+1.441 billion cycles for 541.5 million instructions -- **2.66 cycles per
+instruction**, on an in-order core whose common instructions are one cycle.
+Padding takes it to 2.58. Nearly two of every three cycles are spent not
+retiring anything, and the thing that moves the number is where the branch
+targets sit. That is a fetch-bound interpreter, which is why a source change
+that removes work can still measure slower, and why the two fixes in the table
+above were substitutes rather than additions.
+
 ## Value: NaN tagging, as upstream, in safe Rust
 
 A `Value` is 8 bytes: an `f64` whose NaN payload carries everything that is not

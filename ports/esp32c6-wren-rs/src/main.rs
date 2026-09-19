@@ -27,6 +27,8 @@ use wren::Vm;
 mod appdesc;
 use appdesc as _;
 
+mod counters;
+
 /// The heap the VM allocates from.
 ///
 /// **256 KB**, chosen to leave a program roughly what the C port left one.
@@ -99,9 +101,15 @@ fn run_one(name: &str, source: &str) {
     vm.set_clock(move || origin.elapsed().as_micros() as f64 / 1_000_000.0);
 
     let free_before = esp_alloc::HEAP.free();
+    // **Two runs, because the counter holds one event at a time.** The second
+    // is the same program from the same starting state, so the two figures
+    // describe one run between them: how much work it was, and how long the
+    // part took to do it.
+    counters::start(counters::INSTRUCTIONS);
     let started = Instant::now();
     let outcome = vm.interpret(source);
     let wall: Duration = started.elapsed();
+    let instructions = counters::stop();
     let free_after = esp_alloc::HEAP.free();
 
     match outcome {
@@ -126,6 +134,10 @@ fn run_one(name: &str, source: &str) {
                 wall.as_micros(),
                 free_before.saturating_sub(free_after)
             );
+            // **The placement-invariant figure.** Seconds move by three to
+            // four per cent with code layout alone; this does not, so it is
+            // what says whether a change removed work.
+            println!("{:<14} [work] {instructions} instructions retired", "");
             println!("{:<14} -> {answer}", "");
         }
         Err(error) => {
