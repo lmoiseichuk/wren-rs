@@ -10,6 +10,10 @@ argued rather than asserted. Two constraints drive all of them:
    with a 33,552 B compiler stack, measured on the C6. That does not fit on a
    CH32V006 and no amount of tuning will make it.
 
+This one is **24,680 B resident** on the same part, measured the same way — 70%
+under upstream. Most of that gap is two decisions argued below: compiling no
+core library at start-up, and an object that carries no header.
+
 ## Value: NaN tagging, as upstream, in safe Rust
 
 A `Value` is 8 bytes: an `f64` whose NaN payload carries everything that is not
@@ -75,6 +79,7 @@ back, not estimated:
 | `ObjUpvalue` | 16 B | 24 B |
 | `ObjRange` | **24 B** | 32 B |
 | `ObjClass` | 16 B | 40 B + method table |
+| method table entry | **4 B** | 8 B |
 | `ObjInstance` | 16 B + fields | 16 B + fields, inline |
 | `MapEntry` | 16 B | 16 B |
 
@@ -86,6 +91,17 @@ would buy nothing: its two doubles force 8-byte alignment on the whole enum, the
 next largest variants are already 16 B, and a tag would round anything smaller
 back up to 24. **24 B is the floor for this layout**, not an oversight.
 
+That was a prediction, so it was tested rather than left standing: `Range` was
+boxed, which takes the largest payload down to 16 B, and `Object` was still
+24 B. The remaining 16-byte variants each hold a `Value`, which is 8-byte
+aligned, so the tag rounds back up exactly as the paragraph above says. The
+experiment was reverted -- it cost an allocation and an indirection per range
+for nothing.
+
+Getting below 24 needs the alignment gone, and that means `Value` no longer
+being 8-byte aligned. The only route to that is a 32-bit `Value`, which means
+32-bit floats -- see **Numbers as `f32`** below.
+
 It is a floor that has to be defended, though. `ObjUpvalue` originally stored
 `Option<Value>` for "closed, and here is the value" — the obvious spelling, and
 eight bytes larger than a `Value`, because a `Value` has no spare bit pattern
@@ -93,6 +109,44 @@ for `None` and the discriminant needs a word of its own. That tied `Range` at 24
 and pushed the enum to 32, which is **eight bytes on every object in the heap**
 to express one bit about upvalues. It stores `undefined` instead, a value no
 Wren program can hold, which is what that singleton is for.
+
+### Where the memory actually goes
+
+Predicting this was wrong twice, so it is now counted. `cargo run --release
+--example bench -- --census` reports live objects by type, what their own `Vec`s
+hold, and what the allocator charges in headers. For `binary_trees` on the host,
+whose object graph is the same shape as the device's:
+
+| | at first measurement | now |
+|---|---|---|
+| slots | 27,096 B | 27,096 B |
+| contents | 68,167 B | 40,311 B |
+| allocator headers | 9,312 B | 9,320 B |
+| **live heap** | **104,575 B** | **76,727 B** |
+
+Two findings came out of it, neither of which was where the argument had been
+looking:
+
+**The method tables were the largest single item, not the instances.** A class's
+table is indexed by *global* method symbol, so it is as long as the highest
+symbol that class answers to and almost all of it is empty. Across 42 live
+classes that was 42,832 B against 24,552 B for a thousand instances. Two changes
+halved it and then halved it again:
+
+- The tables are built by repeated `resize`, and a `Vec` that grows by doubling
+  ends up holding about half as much again as it uses. That slack -- 14,560 B,
+  invisible to `len` and visible only in `capacity` -- is now handed back by
+  `shrink_to_fit`, in the sweep and once after the core library is installed. A
+  class is settled by then: Wren cannot add a method after the body has run.
+- An entry was an `Option<Method>` at 8 B, of which 4 B was a tag and its
+  padding. It is now a packed `u32`. Paging the symbol space was measured
+  against this and saved slightly more -- 45% against 50% -- but would have put
+  a second dependent load on every call, so it was not taken.
+
+**Most of the peak is not in the live set at all.** The device peaked at
+185,156 B against 104,575 B live, so **43% of peak was floating garbage** held
+by the growth threshold rather than anything an object representation could fix.
+See the collector section below.
 
 ### The header upstream pays and this does not
 
@@ -174,21 +228,80 @@ class to method table, method to closure, closure to function, function to
 chunk. Upstream follows a pointer at each of those. Counting one of them and
 calling it representative is the mistake.
 
+**Counting them turned out to be worth doing, because several were redundant.**
+Entering a call asked the heap for the same two objects three separate times —
+`function_of` for the arity, `chunk_of` for the code, `module_of` for the
+namespace — six lookups to read three fields that sit beside each other in one
+`ObjFn`. Returning did the same walk again to find the caller's chunk and
+module. Field access fetched its offset through closure and function on *every*
+read and *every* write. And method lookup walked the superclass chain, where
+upstream copies a parent's methods into the child when the class is created.
+
+What is left after fixing those is four lookups per call where there were ten,
+and the measured result on an ESP32-C6 at 160 MHz was `method_call` 2.766 →
+2.356 s, `fib` 18.176 → 16.601, `binary_trees` 8.616 → 8.268, `list_build`
+0.574 → 0.568.
+
+**The host said none of it.** Measured on a workstation, every one of those
+changes was inside the noise: an out-of-order core hides a dependent load that
+an in-order RISC-V pays for in full. Anyone repeating this work should not trust
+a laptop to tell them whether an indirection matters.
+
 The decision may still be right for a crate that forbids `unsafe`. But it has
-to be argued against 5x, not against 10%, and the honest form of that argument
-is a measurement of each indirection rather than a prediction about them.
+to be argued against what is left of the gap, not against the first number, and
+the honest form of that argument is a measurement of each indirection rather
+than a prediction about them.
+
+### Numbers as `f32`
+
+Wren's `Num` is a double, and that is a language guarantee rather than an
+implementation choice — but on a part with no FPU it is an expensive one, and
+the question of a 32-bit build is open.
+
+What it would buy, from the census numbers above:
+
+- **`Value` becomes 4 bytes**, halving every instance field, list element, map
+  entry and stack slot. `list_build`'s single list goes from 131,072 B to
+  65,536 B.
+- **`ObjRange` becomes 12 B and the enum's alignment drops to 4**, so a heap
+  slot is 20 B instead of 24 — the only route past the floor described above.
+- Software `f32` arithmetic is cheaper than software `f64`, and on
+  `riscv32imac` both are software: the part has neither the `F` nor the `D`
+  extension.
+
+What it costs, and why it can only ever be a feature that is off by default:
+
+- **NaN tagging has to be redesigned, not retyped.** The layout depends on a
+  double's 52-bit mantissa. An `f32` quiet NaN leaves the sign bit and 22
+  mantissa bits, which is enough — 22 bits addresses four million objects where
+  a 320 KB heap holds about sixteen thousand — but it is a different encoding
+  with different constants, not a `type Num = f32`.
+- **It changes answers.** An `f32` represents integers exactly only to
+  2^24 = 16,777,216. `list_build` sums to 49,995,000 and would print something
+  else. A good part of upstream's 829 tests assert double-precision output, so
+  conformance runs and every published benchmark have to stay on `f64`.
+
+That is a legitimate feature for a part that cannot afford doubles, clearly
+labelled as not being Wren. It is not a default.
 
 ### The alternative that has not been built
 
 One table per type, with the type in the handle's high bits. That removes the
 max-variant waste — a `List` would cost 12 B instead of 24 — and makes type
-checks free. It costs six free lists instead of one, six sweep loops, and a
-handle encoding that constrains how many objects of each type can exist.
+checks free.
 
-**It is not being built yet because the waste has not been shown to matter.**
-On an 8 KB part with, say, 200 live objects, the difference is about 2.4 KB —
-which on that part is not nothing. That is the measurement that would justify
-it, and it needs the VM to exist before it can be taken.
+**The measurement this section used to ask for has now been taken**, and it
+came out smaller than expected. Pricing every live object in `binary_trees` at
+its own size rather than at the largest variant saves 9,644 B of the 27,096 B
+of slots — 35% of the slots, but only **9% of the 104,575 B live heap**, because
+the slots were never where the memory was. The method tables alone were four
+times that, and the floating garbage four times again.
+
+So it is still not built, and now for a reason with a number attached rather
+than for want of one. Its better argument is no longer memory but dispatch:
+`class_of` is a heap lookup today, and a type in the handle's high bits would
+make it free for every built-in. That is the version worth building, and it
+should be judged on the benchmark clock rather than on the census.
 
 ## Why the collector is replaceable, and what replacing it would involve
 
@@ -221,6 +334,49 @@ module, a module refers to the class. A pure refcount leaks all of that, so a
 cycle collector comes back anyway, and the comparison to run is against
 mark-sweep-with-a-nursery rather than against nothing.
 
+### What refcounting would actually be worth here
+
+The census gives the prize a number for the first time. `binary_trees` is
+104,575 B live and peaked at 185,156 B on the device, so **43% of peak is
+garbage the threshold is holding rather than anything the representation
+wastes**. That is larger than every object-layout saving in this document put
+together, and it is what prompt reclamation would recover.
+
+Two things make it more tractable than the table above suggests:
+
+**Deferred counting keeps `Value` `Copy`.** Count only references held *by heap
+objects* — an instance's fields, a list's elements, a map's entries, a closed
+upvalue — and never those on the stack or in locals. Then the interpreter's
+hottest path is untouched and only `StoreField` and the container mutations
+adjust a count. An object reaching zero becomes a *candidate* rather than
+provably dead, because the stack may still hold it, and candidates are confirmed
+by a scan of the roots that are already enumerated for the collector.
+
+**The counters cost nothing per object.** They go in a side array parallel to
+the slots, exactly as the mark bits already do — which is what preserves the
+zero-byte object header this design is built around. A `u8` is 1 B per slot,
+about 1.1 KB at the live counts measured here. A count that saturates at 255
+sticks there and is never decremented again, so such an object can only be
+freed by tracing.
+
+That saturation is the second reason mark-sweep stays underneath, alongside
+cycles. The end state is not "refcounting instead" but **refcounting in front,
+tracing behind** — and the tracing half is then run rarely rather than on a
+growth threshold.
+
+### The dial that is already there
+
+Until then, the same 43% has a one-line lever: how far the live set may grow
+before collecting again. Upstream's default is 1.5x and this matches it, for
+comparability rather than because it is right on a part with 320 KB.
+
+Measured on an ESP32-C6, 1.25x instead took `binary_trees` peak from 185,156 B
+to 160,628 B — **13% less memory for 4.6% more time** — and did not move the
+other three benchmarks at all, because they do not collect often enough for the
+threshold to matter. `Heap::set_growth` exists so a firmware can make that
+trade; the default is left alone so the published numbers stay comparable with
+the C port.
+
 ## The memory targets these have to meet
 
 | part | RAM | flash | what is plausible |
@@ -237,7 +393,11 @@ parts are reachable at all.**
 
 ## What is built so far
 
-`value.rs`, `object.rs` and `heap.rs`: the representation, the object types the
-collector can meaningfully trace, and mark-sweep over them. The function, closure,
-fiber and module types arrive with the compiler rather than as stubs now — a
-half-populated struct that pretends to be a type is worse than an absent one.
+All of it: the representation, the object types, mark-sweep over them, the
+lexer, the compiler, the interpreter and the core library. `crates/wren` passes
+all 829 of upstream's own tests, from source and through a bytecode round-trip.
+
+What this document is now for is the record of which representation decisions
+were tested and what they measured — the object cost table, the census, the
+indirection count, and the two levers that have numbers but no implementation
+yet (per-type tables, and refcounting in front of the tracing collector).
