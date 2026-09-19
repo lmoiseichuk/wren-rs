@@ -636,17 +636,71 @@ eight percent more time, and at a number a firmware can budget against.
 Of everything tried against the collector, this is the only one that stayed
 useful, and it is four lines.
 
+### Instance fields in chunks
+
+The census priced the allocator's own overhead at 9,312 B across
+`binary_trees`, and almost all of it was instances: a `Vec` per object means a
+call to the allocator per object, with a header and a rounding to match --
+a thousand instances, a thousand blocks, eight kilobytes of headers for
+twenty-four kilobytes of fields.
+
+They are in chunks the heap owns now, and an instance records where.
+`Option<ObjInstance>` falls from 16 bytes to 12 on the way, because the start
+index is biased by one and that gives `Option` a niche.
+
+**Three things about the shape, each of which was learned by getting it
+wrong:**
+
+- **Chunks, not one arena.** The first attempt was a single `Vec`, and a `Vec`
+  doubles: it asked the allocator for a 128 KB block while still holding the
+  64 KB one and ran out of memory on a 320 KB part, holding a hundred
+  kilobytes of fields. Growth is one chunk at a time and a run never straddles
+  two.
+- **The size adapts** -- 32 values, then 128, 256, 512. Four kilobytes is a
+  good block for a program holding thousands of instances and absurd for
+  `method_call`, which allocates two in its life and paid a whole chunk for
+  them. The offset lives in the low sixteen bits of the start index, which is
+  what leaves the sizes free to differ.
+- **One spare chunk is kept, not one per chunk in use.** Keeping a spare for
+  every live chunk simply doubled the arena, which is worse than the
+  fragmentation it was avoiding.
+
+Compaction closes the holes a sweep leaves, **in place and in source order**: a
+run only ever moves to an address at or below where it was, so copying them in
+increasing order of where they are cannot overwrite one that has not been
+copied yet. Building a fresh set of chunks would hold two copies of the arena
+at once, which is the spike the whole structure exists to avoid.
+
+Measured on the board, `binary_trees` peak heap 133,880 → **117,384 B**. It
+costs 7.7% of that benchmark: one extra bounds check per field access, chunk
+then offset, where there used to be one index into a vector the instance
+owned.
+
+### Where the memory went, end to end
+
+`binary_trees` on an ESP32-C6FH4 at 160 MHz, from the first run on hardware:
+
+| | peak heap | VM resident |
+|---|---|---|
+| first hardware run | 160,244 B | 45,676 B |
+| packed method tables, `Vec` slack returned | 158,124 B | 24,680 B |
+| one table per type | 133,888 B | 22,920 B |
+| instance fields in chunks | **117,384 B** | 22,920 B |
+| …and a 16 KB ceiling on garbage | **109,004 B** | 22,920 B |
+
+**A third off the peak and a half off resident**, and every step of it was
+chosen by the profiler rather than guessed at. The two that were guessed at --
+refcounting and a nursery -- are the two that are switched off.
+
 ### What is left worth building
 
 Not another liveness policy: three have been measured and the collector wins.
 What the numbers still point at is **where objects live, not when they die**:
 
-- **Chunked slot tables.** A table's `Vec` holds its high-water mark for ever;
-  a program with a spike never gives the memory back. Slots in chunks -- a
-  few kilobytes each, sized to the type, returned to a pool when a chunk
-  empties -- would let it. This is an allocator change with no collector risk,
-  and it is the one thing on this page that reduces memory without costing
-  time.
+- **Chunked slot tables.** The *fields* are chunked; the slots themselves are
+  not. A table's `Vec` still holds its high-water mark for ever, so a program
+  that spikes never gives that back. The same structure applies, and the field
+  arena is the worked example of what it costs and what it is worth.
 
   **A chunk could be an object itself** -- a hidden type the language never
   sees, holding a block of slots and addressed by a handle like anything else.
@@ -657,11 +711,11 @@ What the numbers still point at is **where objects live, not when they die**:
   the one thing this design has spent the most effort removing. Worth
   measuring before it is assumed either way; a plain `Vec` of boxed blocks per
   type needs no bootstrap and no extra hop.
-- **`Option<ObjUpvalue>` is 24 bytes where the payload is 16**, because a
-  `usize` and a `Value` leave no spare bit pattern for `Option` to use, and
-  upvalues are 19.2% of everything allocated. An occupancy bitmap beside each
-  table instead of an `Option` in every slot fixes that for one bit a slot,
-  and fixes it for anything added later with no niche.
+- **An occupancy bitmap instead of `Option` in every slot**, for anything
+  added later whose payload has no spare bit pattern. `ObjUpvalue` was that
+  case -- 24 bytes for a 16-byte payload, on 19.2% of all allocations -- and
+  biasing its stack slot by one gave it a `NonZeroU32` and the niche. The next
+  type without one will not necessarily have a field to bias.
 
 ## The memory targets these have to meet
 

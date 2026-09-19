@@ -158,10 +158,10 @@ caveats: **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
 
 | benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython |
 |---|---|---|---|---|---|
-| `binary_trees` depth 9 | 8.455 | 15.371 | **2.160** | 2.440 | 4.729 |
-| `fib(24)` x5 | 17.253 | 33.669 | **3.250** | 3.710 | 7.109 |
-| `list_build` 10,000 | 0.577 | 1.028 | **0.130** | 0.150 | 0.154 |
-| `method_call` | 2.411 | 4.326 | **0.350** | 0.420 | 1.748 |
+| `binary_trees` depth 9 | 9.104 | 15.371 | **2.160** | 2.440 | 4.729 |
+| `fib(24)` x5 | 16.966 | 33.669 | **3.250** | 3.710 | 7.109 |
+| `list_build` 10,000 | 0.579 | 1.028 | **0.130** | 0.150 | 0.154 |
+| `method_call` | 2.519 | 4.326 | **0.350** | 0.420 | 1.748 |
 
 The first run on hardware was slower than this — `binary_trees` 8.616,
 `fib` 18.176, `list_build` 0.574, `method_call` 2.766 at `speed`. What moved
@@ -176,10 +176,10 @@ both):
 |---|---|---|---|
 | **VM resident** | **22,920 B** | 83,036 B | — |
 | free to a program | ~305,000 B | ~227,000 B | 333,344 B |
-| `binary_trees` | 133,880 B | 78,812 B | 76,512 B |
+| `binary_trees` | 117,384 B | 78,812 B | 76,512 B |
 | `fib` | **4,172 B** | 6,612 B | 800 B |
 | `list_build` | 132,460 B | 134,712 B | 65,440 B |
-| `method_call` | **8,316 B** | 15,080 B | 1,616 B |
+| `method_call` | **8,572 B** | 15,080 B | 1,616 B |
 
 **Footprint** — and these do *not* compare across implementations, because the
 platforms differ: the C port is an ESP-IDF application carrying FreeRTOS and
@@ -226,11 +226,11 @@ contradicts the design is worth more than a flattering one. Acting on it since:
 | | first run | now |
 |---|---|---|
 | VM resident | 45,676 B | **22,920 B** |
-| `method_call` | 2.766 s | **2.411 s** |
-| `fib` | 18.176 s | **17.253 s** |
-| `binary_trees` | 8.616 s | **8.455 s** |
-| `binary_trees` heap | 160,244 B | **133,880 B** |
-| `method_call` heap | 9,800 B | **8,316 B** |
+| `method_call` | 2.766 s | **2.519 s** |
+| `fib` | 18.176 s | **16.966 s** |
+| `binary_trees` | 8.616 s | **9.104 s** |
+| `binary_trees` heap | 160,244 B | **117,384 B** |
+| `method_call` heap | 9,800 B | **8,572 B** |
 
 Three changes, each measured on the board:
 

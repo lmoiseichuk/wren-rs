@@ -39,8 +39,8 @@ const HEAP_BYTES: usize = 320 * 1024;
 ///
 /// `None` uses the growth ratio, which is what the C port is measured against
 /// and therefore what the published numbers use. `Some(16 * 1024)` measured
-/// `binary_trees` at 121,624 B peak instead of 133,888 -- 9% less memory for
-/// 8% more time, and a peak that is the live set plus a constant rather than
+/// `binary_trees` at 109,004 B peak instead of 117,384 -- 7% less memory for
+/// 11% more time, and a peak that is the live set plus a constant rather than
 /// half as much again as the live set.
 const HEADROOM: Option<usize> = None;
 
