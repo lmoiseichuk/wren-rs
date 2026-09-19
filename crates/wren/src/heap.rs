@@ -1278,6 +1278,41 @@ impl Heap {
         }
     }
 
+    /// Per table: how many slots it holds, how many are live, and what one
+    /// slot costs.
+    ///
+    /// **What a chunked slot table would be reclaiming.** A table's `Vec` only
+    /// ever grows -- freeing a slot returns it to a free list, not to the
+    /// allocator -- so a program that spikes keeps the high-water mark for
+    /// ever. Whether that is worth a second level of indirection depends on
+    /// how far apart these two columns actually are, which is a question about
+    /// real programs. See "What is left worth building" in memory.md.
+    #[cfg(feature = "profile")]
+    pub fn slot_census(&self) -> alloc::vec::Vec<(&'static str, usize, usize, usize)> {
+        alloc::vec![
+            ("Class", self.classes.slots.len(), self.classes.free.len(),
+             core::mem::size_of::<Option<alloc::boxed::Box<ObjClass>>>()),
+            ("Closure", self.closures.slots.len(), self.closures.free.len(),
+             core::mem::size_of::<Option<ObjClosure>>()),
+            ("Fn", self.functions.slots.len(), self.functions.free.len(),
+             core::mem::size_of::<Option<alloc::boxed::Box<ObjFn>>>()),
+            ("Fiber", self.fibers.slots.len(), self.fibers.free.len(),
+             core::mem::size_of::<Option<alloc::boxed::Box<ObjFiber>>>()),
+            ("Instance", self.instances.slots.len(), self.instances.free.len(),
+             core::mem::size_of::<Option<ObjInstance>>()),
+            ("List", self.lists.slots.len(), self.lists.free.len(),
+             core::mem::size_of::<Option<ObjList>>()),
+            ("Map", self.maps.slots.len(), self.maps.free.len(),
+             core::mem::size_of::<Option<ObjMap>>()),
+            ("Range", self.ranges.slots.len(), self.ranges.free.len(),
+             core::mem::size_of::<Option<ObjRange>>()),
+            ("String", self.strings.slots.len(), self.strings.free.len(),
+             core::mem::size_of::<Option<ObjString>>()),
+            ("Upvalue", self.upvalues.slots.len(), self.upvalues.free.len(),
+             core::mem::size_of::<Option<ObjUpvalue>>()),
+        ]
+    }
+
     /// How many slots are occupied, across every table.
     #[cfg(feature = "profile")]
     fn occupancy(&self) -> usize {

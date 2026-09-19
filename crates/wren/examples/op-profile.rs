@@ -49,6 +49,33 @@ fn main() {
             continue;
         }
 
+        let census = vm.heap.slot_census();
+        let held: usize = census.iter().map(|(_, slots, _, size)| slots * size).sum();
+        let live: usize = census
+            .iter()
+            .map(|(_, slots, free, size)| (slots - free) * size)
+            .sum();
+        println!();
+        println!("slot tables at the end of the run");
+        println!("{:<10} {:>8} {:>8} {:>10} {:>10}", "type", "slots", "live", "held B", "live B");
+        println!("{}", "-".repeat(50));
+        for (name, slots, free, size) in census.iter() {
+            if *slots == 0 {
+                continue;
+            }
+            println!(
+                "{name:<10} {slots:>8} {:>8} {:>10} {:>10}",
+                slots - free,
+                slots * size,
+                (slots - free) * size
+            );
+        }
+        println!(
+            "{:<10} {:>8} {:>8} {held:>10} {live:>10}   ({:.1}% of the slots held are free)",
+            "total", "", "",
+            (held - live) as f64 * 100.0 / held.max(1) as f64
+        );
+
         let total: u64 = vm.op_counts.iter().sum();
         println!();
         println!("{name}: {total} instructions executed");
