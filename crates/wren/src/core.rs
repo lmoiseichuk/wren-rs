@@ -23,6 +23,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::handle::ObjectId;
+use crate::math;
 use crate::object::{Method, ObjClass, ObjList, ObjRange, ObjString, Object, Primitive};
 use crate::value::Value;
 use crate::vm::{RuntimeError, Vm};
@@ -156,16 +157,16 @@ fn install_num(vm: &mut Vm) {
         Ok(Value::num(-receiver(vm, at).as_num().unwrap_or(f64::NAN)))
     });
     define(vm, class, "abs", |vm, at| {
-        Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).abs()))
+        Ok(Value::num(math::abs(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
     });
     define(vm, class, "floor", |vm, at| {
-        Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).floor()))
+        Ok(Value::num(math::floor(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
     });
     define(vm, class, "ceil", |vm, at| {
-        Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).ceil()))
+        Ok(Value::num(math::ceil(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
     });
     define(vm, class, "sqrt", |vm, at| {
-        Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).sqrt()))
+        Ok(Value::num(math::sqrt(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
     });
     define(vm, class, "toString", |vm, at| {
         let text = vm.to_string(receiver(vm, at));
@@ -375,7 +376,7 @@ fn list_length(vm: &Vm, list: Value) -> usize {
 /// `list[-1]` is the last element. Upstream's message for an out-of-range index
 /// is exactly this, and the suite checks it.
 fn resolve_index(index: f64, length: usize) -> Result<usize, RuntimeError> {
-    if index != index.trunc() {
+    if index != math::trunc(index) {
         return Err(RuntimeError::new("Index must be an integer."));
     }
     let resolved = if index < 0.0 { index + length as f64 } else { index };

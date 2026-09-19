@@ -22,6 +22,7 @@ use crate::compiler;
 use crate::core;
 use crate::handle::ObjectId;
 use crate::heap::Heap;
+use crate::math;
 use crate::object::{Method, ObjString, Object};
 use crate::symbol::SymbolTable;
 use crate::value::Value;
@@ -247,7 +248,7 @@ impl Vm {
     /// rule in the language.
     pub fn to_string(&self, value: Value) -> String {
         if let Some(number) = value.as_num() {
-            if number == number.trunc() && number.is_finite() && number.abs() < 1e21 {
+            if number == math::trunc(number) && number.is_finite() && math::abs(number) < 1e21 {
                 return format!("{}", number as i64);
             }
             return format!("{number}");

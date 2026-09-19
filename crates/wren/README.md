@@ -114,6 +114,17 @@ cycle cases, reachable and unreachable, for when somebody tries.
 
 A firmware build is `default-features = false`, usually with `alloc`.
 
+**`std` is the build being developed against right now**, and the `no_std`
+variant is something to finish later rather than a constraint on every step. It
+does still compile, and `math.rs` shows the shape the split takes where one is
+needed: `std`'s own `sqrt` and `floor` when they are there, hand-written
+fallbacks when they are not, and a test that checks the fallbacks against
+`std`'s so the path a firmware would take is not the untested one.
+
+The memory limits in this README are about that firmware build. A host running
+the compiler has no such budget, and nothing here should be made worse to
+respect a limit that does not apply to it.
+
 ## Measured against
 
 Upstream Wren 0.4.0 and MicroPython 1.29, both on an ESP32-C6, same programs and
