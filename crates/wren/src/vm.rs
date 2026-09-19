@@ -137,6 +137,12 @@ pub struct Module {
     pub values: Vec<Value>,
 }
 
+impl Default for Module {
+    fn default() -> Module {
+        Module::new()
+    }
+}
+
 impl Module {
     pub fn new() -> Module {
         Module { names: SymbolTable::new(), values: Vec::new() }
@@ -217,6 +223,9 @@ pub struct Vm {
     /// The fiber currently running. Its stack and frames are the VM's own,
     /// and are swapped back into it when control moves elsewhere.
     pub current_fiber: Option<ObjectId>,
+    /// The fiber the program started in. Calling it is an error: it is the one
+    /// doing the calling, so resuming it would re-enter a live stack.
+    pub root_fiber: Option<ObjectId>,
     /// Set by a primitive that wants the interpreter to resume somewhere else.
     ///
     /// A primitive returns a `Value`, which cannot express "do not push a
@@ -301,6 +310,7 @@ impl Vm {
             fiber_class,
             random_class: object_class,
             current_fiber: None,
+            root_fiber: None,
             pending_switch: None,
             rust_floor: 0,
             frames: Vec::new(),
@@ -498,7 +508,22 @@ impl Vm {
                 out.push(']');
                 out
             }
-            Some(Object::Map(map)) => format!("<map {}>", map.entries.len()),
+            // The dispatching version lives on `Map.toString`; this is the
+            // fallback for a value printed without going through a method, and
+            // it uses the same shape so the two cannot look different.
+            Some(Object::Map(map)) => {
+                let mut out = String::from("{");
+                for (index, entry) in map.entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&self.to_string(entry.key));
+                    out.push_str(": ");
+                    out.push_str(&self.to_string(entry.value));
+                }
+                out.push('}');
+                out
+            }
             Some(Object::Class(class)) => match self.heap.get(class.name) {
                 Some(Object::String(name)) => name.as_str().unwrap_or("<class>").to_string(),
                 _ => "<class>".to_string(),
@@ -850,6 +875,7 @@ impl Vm {
         if self.current_fiber.is_none() {
             let root = self.heap.allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
             self.current_fiber = Some(root);
+            self.root_fiber = Some(root);
         }
 
         let base = self.stack.len();

@@ -70,6 +70,64 @@ fn argument(vm: &Vm, at: usize, index: usize) -> Value {
     vm.stack[at + index]
 }
 
+/// An argument that must be a whole number, with upstream's wording.
+///
+/// **Wren distinguishes "not a number" from "not an integer"** and the suite
+/// checks both messages, so this cannot collapse into one check. `noun` is the
+/// word the message starts with -- "Index", "Iterator", "Count".
+fn integer_argument(
+    vm: &Vm,
+    at: usize,
+    index: usize,
+    noun: &str,
+) -> Result<f64, RuntimeError> {
+    let value = argument(vm, at, index)
+        .as_num()
+        .ok_or_else(|| RuntimeError::new(alloc::format!("{noun} must be a number.")))?;
+    if value != math::trunc(value) {
+        return Err(RuntimeError::new(alloc::format!("{noun} must be an integer.")));
+    }
+    Ok(value)
+}
+
+/// Can this value be a map key?
+///
+/// **Only the value types**: booleans, classes, null, numbers, ranges and
+/// strings. A list or an instance is excluded because Wren hashes a key by its
+/// contents, and a mutable object's contents can change after it is inserted --
+/// which would lose the entry rather than fail loudly.
+fn is_value_type(vm: &Vm, value: Value) -> bool {
+    if value.is_num() || value.is_bool() || value.is_null() {
+        return true;
+    }
+    match value.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::String(_)) | Some(Object::Range(_)) | Some(Object::Class(_)) => true,
+        _ => false,
+    }
+}
+
+fn value_type_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeError> {
+    let value = argument(vm, at, index);
+    if is_value_type(vm, value) {
+        return Ok(value);
+    }
+    Err(RuntimeError::new("Key must be a value type."))
+}
+
+/// Check that a function takes exactly the arguments a core method will pass.
+fn expect_arity(vm: &Vm, function: Value, wanted: usize) -> Result<(), RuntimeError> {
+    let Some(closure) = function.as_object() else {
+        return Err(RuntimeError::new("Argument must be a function."));
+    };
+    let Some(arity) = vm.arity_of(closure) else {
+        return Err(RuntimeError::new("Argument must be a function."));
+    };
+    if arity > wanted {
+        return Err(RuntimeError::new("Function expects more arguments."));
+    }
+    Ok(())
+}
+
 fn number_argument(vm: &Vm, at: usize, index: usize) -> Result<f64, RuntimeError> {
     argument(vm, at, index)
         .as_num()
@@ -241,6 +299,11 @@ fn install_fiber(vm: &mut Vm) {
         if !matches!(vm.heap.get(closure), Some(Object::Closure(_))) {
             return Err(RuntimeError::new("Argument must be a function."));
         }
+        // A fiber's function receives at most the one value it was resumed
+        // with, so anything taking more could never be called.
+        if vm.arity_of(closure).unwrap_or(0) > 1 {
+            return Err(RuntimeError::new("Function cannot take more than one parameter."));
+        }
         let id = vm.heap.allocate(Object::Fiber(Box::new(ObjFiber::new(closure))));
         Ok(Value::object(id))
     });
@@ -315,6 +378,13 @@ fn switch_into(
     match vm.heap.get(target) {
         Some(Object::Fiber(fiber)) if fiber.done => {
             return Err(RuntimeError::new("Cannot call a finished fiber."));
+        }
+        // The root fiber is already running -- it is the one doing the
+        // calling -- so resuming it would be re-entering a live stack.
+        Some(Object::Fiber(fiber)) if fiber.caller.is_none() && Some(target) != vm.current_fiber => {
+            if vm.root_fiber == Some(target) {
+                return Err(RuntimeError::new("Cannot call root fiber."));
+            }
         }
         Some(Object::Fiber(_)) => {}
         _ => return Err(RuntimeError::new("Receiver must be a fiber.")),
@@ -939,9 +1009,7 @@ fn install_list(vm: &mut Vm) {
         if current.is_null() {
             return Ok(Value::num(0.0));
         }
-        let index = current
-            .as_num()
-            .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?;
+        let index = integer_argument(vm, at, 1, "Iterator")?;
         if index < 0.0 || index >= (length - 1) as f64 {
             return Ok(Value::FALSE);
         }
@@ -960,8 +1028,18 @@ fn install_list(vm: &mut Vm) {
     });
 
     define(vm, class, "toString", |vm, at| {
-        let text = vm.to_string(receiver(vm, at));
-        Ok(vm.new_string(&text))
+        // **Each element through its own `toString`**, not through the VM's
+        // formatter: a class defining `toString` should have it used inside a
+        // list too, which is what upstream's core/list/to_string checks.
+        let mut out = alloc::string::String::from("[");
+        for (index, element) in list_elements(vm, receiver(vm, at)).into_iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&vm.stringify(element)?);
+        }
+        out.push(']');
+        Ok(vm.new_string(&out))
     });
 }
 
@@ -979,7 +1057,7 @@ fn install_list_extras(vm: &mut Vm) {
 
     define(vm, class, "insert(_,_)", |vm, at| {
         let list = receiver(vm, at);
-        let index = number_argument(vm, at, 1)?;
+        let index = integer_argument(vm, at, 1, "Index")?;
         let value = argument(vm, at, 2);
         let length = list_length(vm, list);
         // `insert` accepts one past the end, where the other index-taking
@@ -1097,6 +1175,7 @@ fn install_list_extras(vm: &mut Vm) {
 
     define(vm, class, "reduce(_)", |vm, at| {
         let function = argument(vm, at, 1);
+        expect_arity(vm, function, 2)?;
         let elements = list_elements(vm, receiver(vm, at));
         let mut iterator = elements.into_iter();
         let Some(mut total) = iterator.next() else {
@@ -1111,6 +1190,7 @@ fn install_list_extras(vm: &mut Vm) {
     define(vm, class, "reduce(_,_)", |vm, at| {
         let mut total = argument(vm, at, 1);
         let function = argument(vm, at, 2);
+        expect_arity(vm, function, 2)?;
         for element in list_elements(vm, receiver(vm, at)) {
             total = vm.call_function(function, &[total, element])?;
         }
@@ -1124,6 +1204,9 @@ fn install_list_extras(vm: &mut Vm) {
 
     define(vm, class, "join(_)", |vm, at| {
         let separator = argument(vm, at, 1);
+        if vm.string_at(separator).is_none() {
+            return Err(RuntimeError::new("Right operand must be a string."));
+        }
         let separator = vm.to_string(separator);
         let joined = join_elements(vm, receiver(vm, at), &separator)?;
         Ok(vm.new_string(&joined))
@@ -1214,7 +1297,7 @@ fn install_map(vm: &mut Vm) {
 
     define(vm, class, "[_]", |vm, at| {
         let map = receiver(vm, at);
-        let key = argument(vm, at, 1);
+        let key = value_type_argument(vm, at, 1)?;
         // **A missing key is null, not an error.** That is Wren's rule and it
         // is what makes `map[k] ?: default` idiomatic.
         Ok(map_get(vm, map, key).unwrap_or(Value::NULL))
@@ -1222,7 +1305,7 @@ fn install_map(vm: &mut Vm) {
 
     define(vm, class, "[_]=(_)", |vm, at| {
         let map = receiver(vm, at);
-        let key = argument(vm, at, 1);
+        let key = value_type_argument(vm, at, 1)?;
         let value = argument(vm, at, 2);
         map_set(vm, map, key, value)?;
         Ok(value)
@@ -1234,13 +1317,13 @@ fn install_map(vm: &mut Vm) {
 
     define(vm, class, "containsKey(_)", |vm, at| {
         let map = receiver(vm, at);
-        let key = argument(vm, at, 1);
+        let key = value_type_argument(vm, at, 1)?;
         Ok(Value::bool(map_get(vm, map, key).is_some()))
     });
 
     define(vm, class, "remove(_)", |vm, at| {
         let map = receiver(vm, at);
-        let key = argument(vm, at, 1);
+        let key = value_type_argument(vm, at, 1)?;
         let Some(id) = map.as_object() else {
             return Err(RuntimeError::new("Receiver must be a map."));
         };
@@ -1257,6 +1340,23 @@ fn install_map(vm: &mut Vm) {
             map.entries.clear();
         }
         Ok(Value::NULL)
+    });
+
+    define(vm, class, "toString", |vm, at| {
+        // `{}` when empty, `{key: value, ...}` otherwise -- the literal syntax,
+        // so what a map prints can be pasted back into a program.
+        let entries = map_entries(vm, receiver(vm, at));
+        let mut out = alloc::string::String::from("{");
+        for (index, entry) in entries.into_iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&vm.stringify(entry.key)?);
+            out.push_str(": ");
+            out.push_str(&vm.stringify(entry.value)?);
+        }
+        out.push('}');
+        Ok(vm.new_string(&out))
     });
 
     define(vm, class, "keys", |vm, at| {
@@ -1279,9 +1379,7 @@ fn install_map(vm: &mut Vm) {
         if current.is_null() {
             return Ok(Value::num(0.0));
         }
-        let index = current
-            .as_num()
-            .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?;
+        let index = integer_argument(vm, at, 1, "Iterator")?;
         if index < 0.0 || index >= (count - 1) as f64 {
             return Ok(Value::FALSE);
         }
@@ -1375,6 +1473,12 @@ pub fn values_equal(vm: &Vm, left: Value, right: Value) -> bool {
     if let (Some(a), Some(b)) = (left.as_num(), right.as_num()) {
         return a == b;
     }
+    // **Ranges compare by value.** Two separately built `1..3` are the same
+    // range, and since a range is a legal map key, comparing them by identity
+    // meant `map[1..3]` could never find what `map[1..3] = x` had put there.
+    if let (Some(a), Some(b)) = (range_of(vm, left), range_of(vm, right)) {
+        return a.from == b.from && a.to == b.to && a.is_inclusive == b.is_inclusive;
+    }
     strings_equal(vm, left, right)
 }
 
@@ -1412,9 +1516,7 @@ fn install_range(vm: &mut Vm) {
         if current.is_null() {
             return Ok(Value::num(range.from));
         }
-        let mut iterator = current
-            .as_num()
-            .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?;
+        let mut iterator = integer_argument(vm, at, 1, "Iterator")?;
 
         if range.from < range.to {
             iterator += 1.0;
