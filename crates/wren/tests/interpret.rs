@@ -1302,3 +1302,110 @@ fn block_comments_nest() {
 fn a_subscript_must_take_a_parameter() {
     assert_eq!(error("class A { [] { 1 } }"), "Expect subscript parameters.");
 }
+
+// --- fibers and closures over the same variable -----------------------------
+
+#[test]
+fn a_fiber_and_a_closure_share_a_captured_variable() {
+    // **The hardest capture case.** A fiber and a closure both close over `a`,
+    // the fiber writes to it between yields, and the closure must see each
+    // write. It also caught a real bug: returning from a nested Rust call --
+    // `closure.call()` re-enters the interpreter -- was marking the fiber that
+    // merely *contained* the call as finished.
+    let source = "
+var fiber
+var closure
+{
+  var a = \"before\"
+  fiber = Fiber.new {
+    Fiber.yield()
+    a = \"after\"
+    Fiber.yield()
+    a = \"final\"
+  }
+  closure = Fn.new { a }
+}
+fiber.call()
+System.print(closure.call())
+fiber.call()
+System.print(closure.call())
+fiber.call()
+System.print(closure.call())
+";
+    assert_eq!(run(source), "before\nafter\nfinal\n");
+}
+
+#[test]
+fn calling_a_function_does_not_finish_the_fiber_around_it() {
+    let source = "
+var f = Fiber.new {
+  Fiber.yield(1)
+  return 2
+}
+System.print(f.call())
+System.print(Fn.new { \"between\" }.call())
+System.print(f.isDone)
+System.print(f.call())
+";
+    assert_eq!(run(source), "1\nbetween\nfalse\n2\n");
+}
+
+// --- the conditional operator's precedence ----------------------------------
+
+#[test]
+fn a_conditional_may_not_nest_in_its_own_then_branch() {
+    // `?` binds at assignment precedence and the then-branch is parsed one
+    // level tighter, so this is an error rather than quietly grouping one of
+    // the two possible ways.
+    assert_eq!(
+        error("1 ? 2 ? 3 : 4 : 5"),
+        "Expect ':' after then branch of conditional operator."
+    );
+    // Parenthesised, it is fine.
+    assert_eq!(run("System.print(1 ? (2 ? 3 : 4) : 5)"), "3\n");
+}
+
+#[test]
+fn a_conditional_binds_looser_than_everything_but_assignment() {
+    assert_eq!(run("System.print(3 + 4 ? 1 : 2)"), "1\n");
+    assert_eq!(run("System.print(3 is Num ? 1 : 2)"), "1\n");
+    assert_eq!(run("var a = 0\nSystem.print(a = 3 ? 1 : 2)"), "1\n");
+}
+
+#[test]
+fn a_call_chain_may_break_after_the_dot_as_well_as_before_it() {
+    let source = "
+class Chain {
+  construct new() {}
+  a { this }
+  done { \"chained\" }
+}
+System.print(Chain.new().
+  a.
+  done)
+";
+    assert_eq!(run(source), "chained\n");
+}
+
+#[test]
+fn a_superclass_constructor_needs_an_argument_list() {
+    assert_eq!(
+        error("class A {\n construct new() {}\n}\nclass B is A {\n construct new() {\n  super\n }\n}"),
+        "A superclass constructor must have an argument list."
+    );
+}
+
+#[test]
+fn gc_can_be_forced() {
+    // Provoking a collection beats allocating until one happens by luck.
+    let source = "
+class Holder {
+  construct new(v) { _v = v }
+  v { _v }
+}
+var kept = Holder.new(\"kept\")
+System.gc()
+System.print(kept.v)
+";
+    assert_eq!(run(source), "kept\n");
+}

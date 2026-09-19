@@ -2264,6 +2264,17 @@ fn install_system(vm: &mut Vm) {
         Ok(Value::NULL)
     });
 
+    define(vm, metaclass, "gc()", |vm, _| {
+        vm.collect_garbage();
+        Ok(Value::NULL)
+    });
+
+    // `System.clock` is what every benchmark times itself with.
+    define(vm, metaclass, "clock", |vm, _| match vm.clock.as_ref() {
+        Some(clock) => Ok(Value::num(clock())),
+        None => Err(RuntimeError::new("This host provides no clock.")),
+    });
+
     define(vm, metaclass, "printAll(_)", |vm, at| {
         let sequence = argument(vm, at, 1);
         for element in collect(vm, sequence)? {

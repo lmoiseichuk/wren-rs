@@ -971,6 +971,10 @@ impl<'a> Compiler<'a> {
 
     /// `receiver.name`, `receiver.name(a, b)` or `receiver.name = value`.
     fn method_call(&mut self) -> Result<(), CompileError> {
+        // A newline after the `.` is insignificant, which is what lets a call
+        // chain be written with the dot at the end of each line as well as at
+        // the start of the next.
+        self.skip_newlines()?;
         self.consume(TokenKind::Name, "Expect method name after '.'.")?;
         let name = self.previous.text(self.source).to_string();
         let line = self.line();
@@ -1331,6 +1335,15 @@ impl<'a> Compiler<'a> {
         // `super(...)` should reach -- which is the `init` form, not `new`.
         let base = name.split('(').next().unwrap_or("").to_string();
         if !self.check(TokenKind::LeftParen) {
+            // A bare `super` in a constructor is ambiguous: it looks like a
+            // getter but means "call the superclass constructor", which always
+            // takes an argument list even when it is empty.
+            if self.state().is_initializer {
+                return Err(self.error_at(
+                    self.current,
+                    "A superclass constructor must have an argument list.",
+                ));
+            }
             return self.emit_super(&base, 0, line);
         }
         self.advance()?;
@@ -1925,7 +1938,11 @@ fn signature(name: &str, arity: usize) -> String {
 
 fn infix_precedence(kind: TokenKind) -> Precedence {
     match kind {
-        TokenKind::Question => Precedence::Conditional,
+        // **Assignment, not Conditional**, which is upstream's table. The
+        // then-branch is parsed one level tighter, so a nested `?` there is
+        // *not* consumed and `1 ? 2 ? 3 : 4 : 5` is the error it should be
+        // rather than quietly grouping one of the two possible ways.
+        TokenKind::Question => Precedence::Assignment,
         TokenKind::PipePipe => Precedence::LogicalOr,
         TokenKind::AmpAmp => Precedence::LogicalAnd,
         TokenKind::EqEq | TokenKind::BangEq => Precedence::Equality,

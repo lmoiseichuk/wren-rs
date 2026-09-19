@@ -191,6 +191,15 @@ pub struct Vm {
     /// filesystem. The host sets one; see `Vm::set_module_loader`.
     #[allow(clippy::type_complexity)]
     pub module_loader: Option<Box<dyn Fn(&str) -> Option<String>>>,
+    /// What `System.clock` reads: seconds, monotonic, origin unspecified.
+    ///
+    /// **A host hook rather than a call into `std`.** A firmware has no clock
+    /// this crate could know about -- on an ESP32 it is `esp_timer_get_time`,
+    /// on a CH32 a timer peripheral -- and a benchmark that cannot time itself
+    /// is not much of a benchmark. With `std` it defaults to the process
+    /// clock, so the host needs no setup.
+    #[allow(clippy::type_complexity)]
+    pub clock: Option<Box<dyn Fn() -> f64>>,
     /// How many of the main module's variables are the core library.
     ///
     /// Every module implicitly gets the core classes -- `Num`, `List`,
@@ -330,6 +339,7 @@ impl Vm {
             modules: alloc::vec![Module::new()],
             module_index: BTreeMap::new(),
             module_loader: None,
+            clock: None,
             core_variables: 0,
             num_class,
             bool_class,
@@ -369,6 +379,15 @@ impl Vm {
 
         core::install(&mut vm);
         vm.core_variables = vm.modules[0].values.len();
+
+        // On a host there is an obvious clock and no reason to make every
+        // caller wire one up.
+        #[cfg(feature = "std")]
+        {
+            let origin = std::time::Instant::now();
+            vm.set_clock(move || origin.elapsed().as_secs_f64());
+        }
+
         vm
     }
 
@@ -377,6 +396,21 @@ impl Vm {
         let chunk = compiler::compile(self, source)
             .map_err(|error| WrenError::Compile { message: error.message, line: error.line })?;
         self.run(Rc::new(chunk)).map_err(WrenError::Runtime)
+    }
+
+    /// Collect now, from whatever the current roots are.
+    ///
+    /// Exposed because `System.gc()` exists and because a test that wants to
+    /// prove something about the collector needs to be able to provoke it
+    /// rather than allocate until one happens by luck.
+    pub fn collect_garbage(&mut self) {
+        let roots = self.roots();
+        self.heap.collect(roots);
+    }
+
+    /// Tell the VM how to read a clock, for `System.clock`.
+    pub fn set_clock(&mut self, clock: impl Fn() -> f64 + 'static) {
+        self.clock = Some(Box::new(clock));
     }
 
     /// Tell the VM how to find a module's source.
@@ -1363,11 +1397,20 @@ impl Vm {
                         // control goes back to whoever resumed it rather than
                         // out of the interpreter -- unless nobody did, in which
                         // case this is the root and the program is over.
+                        // **A fiber is finished when it has no frames left**,
+                        // not when this particular `run_frames` returns. A
+                        // primitive that re-enters the interpreter -- `Fn.call`,
+                        // or any Sequence method taking a block -- returns
+                        // through here too, and marking the fiber done then
+                        // ended the fiber that merely *contained* the call.
+                        // The symptom was a second `fiber.call()` reporting the
+                        // fiber already finished after it had only yielded.
+                        let finished = self.frames.is_empty();
                         let caller = self.current_fiber.and_then(|id| match self.heap.get(id) {
                             Some(Object::Fiber(fiber)) => fiber.caller,
                             _ => None,
                         });
-                        if let (Some(caller), true) = (caller, floor <= self.rust_floor) {
+                        if let (Some(caller), true) = (caller, finished) {
                             self.perform_switch(
                                 Switch {
                                     target: caller,
@@ -1386,9 +1429,11 @@ impl Vm {
                             module = self.module_of(frame.closure);
                             continue;
                         }
-                        if let Some(id) = self.current_fiber {
-                            if let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) {
-                                fiber.done = true;
+                        if finished {
+                            if let Some(id) = self.current_fiber {
+                                if let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) {
+                                    fiber.done = true;
+                                }
                             }
                         }
                         return Ok(result);
