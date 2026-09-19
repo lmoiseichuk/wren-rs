@@ -1236,3 +1236,69 @@ System.print(foo.bar)
 ";
     assert_eq!(run(source), "static method\n");
 }
+
+// --- more of what the language refuses --------------------------------------
+
+#[test]
+fn string_methods_reject_a_non_string_argument() {
+    assert_eq!(error("\"abc\".contains(1)"), "Argument must be a string.");
+    assert_eq!(error("\"abc\".startsWith(1)"), "Argument must be a string.");
+    assert_eq!(error("\"abc\".indexOf(1)"), "Argument must be a string.");
+}
+
+#[test]
+fn from_code_point_checks_its_range() {
+    assert_eq!(error("String.fromCodePoint(-1)"), "Code point cannot be negative.");
+    assert_eq!(
+        error("String.fromCodePoint(1114112)"),
+        "Code point cannot be greater than 0x10ffff."
+    );
+    assert_eq!(error("String.fromCodePoint(1.5)"), "Code point must be an integer.");
+}
+
+#[test]
+fn a_constructor_cannot_return_a_value() {
+    // Its body always yields the instance, so the value would be discarded --
+    // which makes writing one a mistake rather than a choice.
+    assert_eq!(
+        error("class A {\n construct new() {\n  return 1\n }\n}"),
+        "A constructor cannot return a value."
+    );
+    // A bare `return` is fine: it just ends the body early.
+    assert_eq!(
+        run("class A {\n construct new() {\n  return\n }\n}\nSystem.print(A.new() is A)"),
+        "true\n"
+    );
+}
+
+#[test]
+fn a_class_cannot_define_the_same_method_twice() {
+    // Silently replacing the first would look like it simply never ran.
+    assert_eq!(
+        error("class A {\n v { 1 }\n v { 2 }\n}"),
+        "Class A already defines a method 'v'."
+    );
+    // A static and an instance method may share a name; they are different
+    // tables.
+    assert_eq!(
+        run("class A {\n construct new() {}\n static v { 1 }\n v { 2 }\n}\nSystem.print(A.v)\nSystem.print(A.new().v)"),
+        "1\n2\n"
+    );
+}
+
+#[test]
+fn an_unterminated_block_comment_is_an_error() {
+    // It used to swallow the rest of the file quietly, so a missing two
+    // characters compiled to an empty program.
+    assert_eq!(error("/* never closed\nSystem.print(1)"), "Invalid token.");
+}
+
+#[test]
+fn block_comments_nest() {
+    assert_eq!(run("/* a /* b */ c */\nSystem.print(1)"), "1\n");
+}
+
+#[test]
+fn a_subscript_must_take_a_parameter() {
+    assert_eq!(error("class A { [] { 1 } }"), "Expect subscript parameters.");
+}

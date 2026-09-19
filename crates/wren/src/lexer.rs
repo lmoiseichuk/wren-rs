@@ -212,7 +212,12 @@ impl<'a> Lexer<'a> {
     /// out, rather than an `Option`, because every caller would immediately
     /// turn `None` into exactly that.
     pub fn next_token(&mut self) -> Token {
-        self.skip_whitespace_and_comments();
+        if !self.skip_whitespace_and_comments() {
+            // The span covers what there was, so the parser can point at where
+            // the comment began.
+            self.start = self.current.min(self.bytes.len());
+            return self.make(TokenKind::Error);
+        }
 
         self.start = self.current;
         let Some(c) = self.advance() else {
@@ -352,7 +357,8 @@ impl<'a> Lexer<'a> {
     /// Newlines are *not* skipped — they are tokens. A newline inside a block
     /// comment is skipped but still counted, or every error message after a
     /// multi-line comment would point at the wrong line.
-    fn skip_whitespace_and_comments(&mut self) {
+    /// Returns `false` if a block comment ran off the end of the file.
+    fn skip_whitespace_and_comments(&mut self) -> bool {
         loop {
             match self.peek() {
                 b' ' | b'\r' | b'\t' => {
@@ -364,9 +370,11 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'/' if self.peek_next() == b'*' => {
-                    self.skip_block_comment();
+                    if !self.skip_block_comment() {
+                        return false;
+                    }
                 }
-                _ => return,
+                _ => return true,
             }
         }
     }
@@ -377,12 +385,18 @@ impl<'a> Lexer<'a> {
     /// search for `*/`: commenting out a region that already contains a comment
     /// has to work, which is the whole point of block comments in the first
     /// place.
-    fn skip_block_comment(&mut self) {
+    /// Returns `false` for an unterminated comment.
+    ///
+    /// **Running quietly to end of file was wrong.** A `/*` with no close
+    /// swallows the whole rest of the program, and reporting nothing means the
+    /// file compiles to an empty one -- the most confusing possible outcome
+    /// for a missing two characters.
+    fn skip_block_comment(&mut self) -> bool {
         self.current += 2; // the opening `/*`
         let mut depth = 1;
         while depth > 0 {
             match self.peek() {
-                0 if self.current >= self.bytes.len() => return, // unterminated
+                0 if self.current >= self.bytes.len() => return false,
                 b'/' if self.peek_next() == b'*' => {
                     self.current += 2;
                     depth += 1;
@@ -398,6 +412,7 @@ impl<'a> Lexer<'a> {
                 _ => self.current += 1,
             }
         }
+        true
     }
 
     // --- literals -----------------------------------------------------------

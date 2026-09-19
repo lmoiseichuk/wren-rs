@@ -801,22 +801,22 @@ fn install_string_extras(vm: &mut Vm) {
 
     define(vm, class, "contains(_)", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
-        let needle = string_text(vm, argument(vm, at, 1));
+        let needle = string_argument(vm, at, 1)?;
         Ok(Value::bool(text.contains(&needle)))
     });
     define(vm, class, "startsWith(_)", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
-        let needle = string_text(vm, argument(vm, at, 1));
+        let needle = string_argument(vm, at, 1)?;
         Ok(Value::bool(text.starts_with(&needle)))
     });
     define(vm, class, "endsWith(_)", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
-        let needle = string_text(vm, argument(vm, at, 1));
+        let needle = string_argument(vm, at, 1)?;
         Ok(Value::bool(text.ends_with(&needle)))
     });
     define(vm, class, "indexOf(_)", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
-        let needle = string_text(vm, argument(vm, at, 1));
+        let needle = string_argument(vm, at, 1)?;
         Ok(Value::num(text.find(&needle).map_or(-1.0, |index| index as f64)))
     });
 
@@ -885,10 +885,11 @@ fn install_string_extras(vm: &mut Vm) {
         let start = if current.is_null() {
             0
         } else {
-            let index = current
-                .as_num()
-                .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?
-                as usize;
+            let index = integer_argument(vm, at, 1, "Iterator")?;
+            if index < 0.0 || index as usize >= text.len() {
+                return Ok(Value::FALSE);
+            }
+            let index = index as usize;
             // Step past the character that starts at this byte.
             match text[index..].chars().next() {
                 Some(character) => index + character.len_utf8(),
@@ -902,8 +903,11 @@ fn install_string_extras(vm: &mut Vm) {
     });
     define(vm, class, "iteratorValue(_)", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
-        let index = number_argument(vm, at, 1)? as usize;
-        let character: alloc::string::String = text[index..].chars().take(1).collect();
+        let index = integer_argument(vm, at, 1, "Iterator")?;
+        if index < 0.0 || index as usize >= text.len() {
+            return Err(RuntimeError::new("Iterator out of bounds."));
+        }
+        let character: alloc::string::String = text[index as usize..].chars().take(1).collect();
         Ok(vm.new_string(&character))
     });
 
@@ -920,7 +924,13 @@ fn install_string_extras(vm: &mut Vm) {
         string.metaclass = Some(metaclass);
     }
     define(vm, metaclass, "fromCodePoint(_)", |vm, at| {
-        let point = number_argument(vm, at, 1)?;
+        let point = integer_argument(vm, at, 1, "Code point")?;
+        if point < 0.0 {
+            return Err(RuntimeError::new("Code point cannot be negative."));
+        }
+        if point > 0x10ffff as f64 {
+            return Err(RuntimeError::new("Code point cannot be greater than 0x10ffff."));
+        }
         let Some(character) = char::from_u32(point as u32) else {
             return Err(RuntimeError::new("Code point cannot be greater than 0x10ffff."));
         };
@@ -955,6 +965,15 @@ fn compare_strings(
         core::cmp::Ordering::Greater => 1,
     };
     Ok(Value::bool(accept(ordering)))
+}
+
+/// An argument that must be a string, with upstream's wording.
+fn string_argument(vm: &Vm, at: usize, index: usize) -> Result<alloc::string::String, RuntimeError> {
+    let value = argument(vm, at, index);
+    if vm.string_at(value).is_none() {
+        return Err(RuntimeError::new("Argument must be a string."));
+    }
+    Ok(string_text(vm, value))
 }
 
 fn string_bytes(vm: &Vm, value: Value) -> Vec<u8> {

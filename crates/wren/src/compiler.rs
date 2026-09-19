@@ -158,6 +158,12 @@ impl FnState {
 
 /// The class whose body is being compiled.
 struct ClassState {
+    /// The class's own name, for its error messages.
+    name: String,
+    /// Signatures already defined, so a duplicate is caught rather than
+    /// silently replacing the first one -- which would look like the earlier
+    /// definition simply never ran.
+    defined: Vec<String>,
     /// Field names in declaration order; the index is the field's slot.
     fields: Vec<String>,
     /// Static field names, numbered the same way. Separate from `fields`
@@ -1538,8 +1544,23 @@ impl<'a> Compiler<'a> {
     fn return_statement(&mut self) -> Result<(), CompileError> {
         let line = self.line();
         if self.check(TokenKind::Line) || self.check(TokenKind::RightBrace) || self.check(TokenKind::Eof) {
-            self.chunk_mut().emit_op(Op::Null, line);
+            // **A bare `return` in a constructor still yields the instance.**
+            // An ordinary method returns null; a constructor has no other
+            // answer to give, and returning null from one would hand back
+            // something that was never constructed.
+            if self.state().is_initializer {
+                self.chunk_mut().emit_op(Op::LoadLocal, line);
+                self.chunk_mut().emit_byte(0, line);
+            } else {
+                self.chunk_mut().emit_op(Op::Null, line);
+            }
         } else {
+            // A constructor always yields the instance, so returning something
+            // else is a mistake rather than a choice -- the value would be
+            // discarded and the instance returned anyway.
+            if self.state().is_initializer {
+                return Err(self.error_at(self.current, "A constructor cannot return a value."));
+            }
             self.expression()?;
         }
         self.chunk_mut().emit_op(Op::Return, line);
@@ -1595,6 +1616,8 @@ impl<'a> Compiler<'a> {
         let variable = self.define_variable(&name, line)?;
 
         self.classes.push(ClassState {
+            name: name.clone(),
+            defined: Vec::new(),
             fields: Vec::new(),
             static_fields: Vec::new(),
             in_static: false,
@@ -1671,6 +1694,18 @@ impl<'a> Compiler<'a> {
         // A constructor's body is an instance method under a name no program
         // can write, and `new` on the metaclass is generated to call it.
         let body_signature = if is_constructor { format!("init {full}") } else { full.clone() };
+
+        let marker = if is_static { format!("static {body_signature}") } else { body_signature.clone() };
+        if self.class_state().defined.contains(&marker) {
+            return Err(self.error_at(
+                self.previous,
+                &format!(
+                    "Class {} already defines a method '{full}'.",
+                    self.class_state().name
+                ),
+            ));
+        }
+        self.classes.last_mut().expect("a class").defined.push(marker);
 
         self.push_function(
             body_signature.clone(),
@@ -1749,6 +1784,9 @@ impl<'a> Compiler<'a> {
         if token.kind == TokenKind::LeftBracket {
             let parameters = self.parameter_list(TokenKind::RightBracket)?;
             let count = parameters.len();
+            if count == 0 {
+                return Err(self.error_at(self.previous, "Expect subscript parameters."));
+            }
             self.pending_parameters = parameters;
             if self.match_token(TokenKind::Eq)? {
                 let mut setter = self.parameter_list_parenthesised()?;
