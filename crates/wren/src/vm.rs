@@ -451,6 +451,11 @@ impl Vm {
         // **Only now.** The classes above were created empty and populated by
         // `install`, so flattening any earlier would have copied nothing.
         vm.flatten_class_hierarchy();
+        // The core library is built by batch: metaclasses attached after the
+        // fact, four classes reparented onto `Sequence`, several hundred
+        // methods bound. Rather than a barrier at each, the counts are settled
+        // once here, from the object graph that resulted.
+        vm.heap.rebuild_counts();
         vm.core_variables = vm.modules[0].values.len();
 
         // On a host there is an obvious clock and no reason to make every
@@ -530,11 +535,13 @@ impl Vm {
             // `random` brings a class and a metaclass with it, neither of
             // which existed when the hierarchy was last flattened.
             self.flatten_class_hierarchy();
+            self.heap.rebuild_counts();
             return Ok((index, None));
         }
         if name == "meta" {
             let index = core::install_meta(self);
             self.flatten_class_hierarchy();
+            self.heap.rebuild_counts();
             return Ok((index, None));
         }
 
@@ -707,10 +714,19 @@ impl Vm {
                 .methods
                 .resize(inherited.len(), crate::object::NO_METHOD);
         }
+        let mut copied: Vec<ObjectId> = Vec::new();
         for (symbol, entry) in inherited.iter().enumerate() {
             if child.methods[symbol] == crate::object::NO_METHOD {
                 child.methods[symbol] = *entry;
+                // Copying an entry down makes a second reference to the same
+                // closure, which the child now holds as well as the parent.
+                if let Some(closure) = crate::object::entry_closure(*entry) {
+                    copied.push(closure);
+                }
             }
+        }
+        for closure in copied {
+            self.heap.retain_id(closure);
         }
     }
 
@@ -1037,6 +1053,11 @@ impl Vm {
                 continue;
             }
             let value = self.stack.get(slot).copied().unwrap_or(Value::NULL);
+            // **Closing an upvalue turns a stack reference into a heap one**,
+            // which is exactly the transition the counts exist to notice. The
+            // old contents are `undefined` while it is open, so there is
+            // nothing to release.
+            self.heap.retain(value);
             if let Some(upvalue) = self.heap.upvalue_mut(id) {
                 upvalue.closed = value;
             }
@@ -1717,8 +1738,15 @@ impl Vm {
                 Op::SetAttributes => {
                     let attributes = self.stack.pop().unwrap_or(Value::NULL);
                     let class = self.stack.pop().unwrap_or(Value::NULL);
-                    if let Some(class) = class.as_object().and_then(|id| self.heap.class_mut(id)) {
-                        class.attributes = attributes;
+                    if let Some(id) = class.as_object() {
+                        let old = self.heap.class(id).map(|class| class.attributes);
+                        self.heap.retain(attributes);
+                        if let Some(class) = self.heap.class_mut(id) {
+                            class.attributes = attributes;
+                        }
+                        if let Some(old) = old {
+                            self.heap.release(old);
+                        }
                     }
                 }
                 Op::ImportModule => {
@@ -2019,8 +2047,13 @@ impl Vm {
                 }
             }
             None => {
+                let old = self.heap.upvalue(id).map(|upvalue| upvalue.closed);
+                self.heap.retain(value);
                 if let Some(upvalue) = self.heap.upvalue_mut(id) {
                     upvalue.closed = value;
+                }
+                if let Some(old) = old {
+                    self.heap.release(old);
                 }
             }
         }
@@ -2084,13 +2117,23 @@ impl Vm {
                 "Cannot access a field outside of a class.",
             ));
         };
+        // The barrier, in the order every one of them takes: read what is
+        // being overwritten, retain the new reference, store, release the old.
+        let at = offset + index;
+        let old = self
+            .heap
+            .instance(id)
+            .and_then(|it| it.fields.get(at).copied());
+        self.heap.retain(value);
         match self.heap.instance_mut(id) {
             Some(instance) => {
-                let at = offset + index;
                 if instance.fields.len() <= at {
                     instance.fields.resize(at + 1, Value::NULL);
                 }
                 instance.fields[at] = value;
+                if let Some(old) = old {
+                    self.heap.release(old);
+                }
                 Ok(())
             }
             _ => Err(RuntimeError::new(
@@ -2130,11 +2173,19 @@ impl Vm {
                 "Cannot use a static field outside of a class definition.",
             ));
         };
+        let old = self
+            .heap
+            .class(owner)
+            .and_then(|c| c.static_fields.get(index).copied());
+        self.heap.retain(value);
         if let Some(class) = self.heap.class_mut(owner) {
             if class.static_fields.len() <= index {
                 class.static_fields.resize(index + 1, Value::NULL);
             }
             class.static_fields[index] = value;
+        }
+        if let Some(old) = old {
+            self.heap.release(old);
         }
         Ok(())
     }
@@ -2276,8 +2327,19 @@ impl Vm {
         };
         self.set_field_offset(closure, inherited, superclass, class_id);
 
+        // A method table entry is a heap reference like any other, and
+        // binding over an existing one drops whatever was there.
+        let replaced = self
+            .heap
+            .class(target)
+            .map(|class| class.method_entry(symbol))
+            .and_then(crate::object::entry_closure);
+        self.heap.retain_id(closure);
         if let Some(class) = self.heap.class_mut(target) {
             class.define(symbol, crate::object::closure_entry(closure));
+        }
+        if let Some(replaced) = replaced {
+            self.heap.release_id(replaced);
         }
         Ok(())
     }

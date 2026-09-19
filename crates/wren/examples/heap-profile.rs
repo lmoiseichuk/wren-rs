@@ -83,6 +83,9 @@ fn main() {
     let mut ran = 0usize;
     let mut collected_naturally = 0usize;
     let mut per_program: Vec<(u64, String)> = Vec::new();
+    // type -> (disagreements, too low, too high)
+    let mut mismatches: std::collections::BTreeMap<&str, (usize, usize, usize, String)> =
+        std::collections::BTreeMap::new();
     let started = Instant::now();
 
     for path in &files {
@@ -95,6 +98,25 @@ fn main() {
         // allocated everything it allocated on the way to failing, and error
         // tests are a third of the suite.
         let _ = vm.interpret(&source);
+
+        // **Before anything is collected**, check every reference count
+        // against the references that actually exist. A missing write barrier
+        // shows up here as a count that is too low, which is the one that
+        // would be a use-after-free once prompt freeing is on.
+        for (id, counted, real) in vm.heap.verify_counts() {
+            let kind = vm.heap.kind_of(id).map_or("?", |kind| TYPES[kind as usize]);
+            let entry = mismatches
+                .entry(kind)
+                .or_insert((0usize, 0usize, 0usize, String::new()));
+            entry.0 += 1;
+            match counted as u32 <= real {
+                true => entry.1 += 1,
+                false => entry.2 += 1,
+            }
+            if entry.3.is_empty() {
+                entry.3 = format!("{} (counted {counted}, actual {real})", path.display());
+            }
+        }
 
         let natural = vm.heap.profile().collections;
         // **One forced collection at the end**, so a program too small to
@@ -114,6 +136,22 @@ fn main() {
 
     let wall = started.elapsed();
     report(&total, ran, collected_naturally, wall.as_nanos() as u64);
+
+    println!();
+    println!("write barriers");
+    match mismatches.is_empty() {
+        true => println!("  every reference count agrees with the references that exist"),
+        false => {
+            println!(
+                "  {:<10} {:>10} {:>9} {:>9}  first seen in",
+                "type", "disagree", "too low", "too high"
+            );
+            for (kind, (total, low, high, where_)) in &mismatches {
+                println!("  {kind:<10} {total:>10} {low:>9} {high:>9}  {where_}");
+            }
+            println!("  too low is the dangerous one: a missing retain frees something in use");
+        }
+    }
 
     println!();
     println!("where the allocations came from");

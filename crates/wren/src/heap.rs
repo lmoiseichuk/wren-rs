@@ -89,6 +89,21 @@ impl Collection {
 /// discriminant that has to be fetched.
 struct Table<T> {
     slots: Vec<Option<T>>,
+    /// How many *heap objects* refer to each slot.
+    ///
+    /// **One byte, beside the slots rather than inside them**, exactly as the
+    /// mark bits are -- which is what keeps an object's header at zero bytes.
+    /// A count that reaches 255 sticks there and is never decremented again,
+    /// so such an object can only ever be freed by tracing. That is the
+    /// classic sticky-count trade: a byte instead of a word, and a handful of
+    /// popular objects that the backstop has to clean up.
+    ///
+    /// **References from the stack, from locals and from module variables are
+    /// not counted.** Observing those would mean making `Value` non-`Copy`,
+    /// which is the change this design exists to avoid. They are roots
+    /// instead, and an object whose count falls to zero is therefore only a
+    /// *candidate* for freeing -- see `Heap::flush_candidates`.
+    counts: Vec<u8>,
     /// Indices of free slots, newest first. A separate stack rather than a
     /// linked list threaded through the slots themselves: the same asymptotics,
     /// none of the aliasing that a threaded list needs `unsafe` to express.
@@ -101,6 +116,7 @@ impl<T> Table<T> {
     fn new() -> Table<T> {
         Table {
             slots: Vec::new(),
+            counts: Vec::new(),
             free: Vec::new(),
             marks: Vec::new(),
         }
@@ -110,17 +126,45 @@ impl<T> Table<T> {
         match self.free.pop() {
             Some(index) => {
                 self.slots[index as usize] = Some(value);
+                self.counts[index as usize] = 0;
                 index
             }
             None => {
                 let index = self.slots.len();
                 self.slots.push(Some(value));
+                self.counts.push(0);
                 if index / 64 >= self.marks.len() {
                     self.marks.push(0);
                 }
                 index as u32
             }
         }
+    }
+
+    /// Note one more heap reference to a slot. Saturates rather than wraps.
+    fn retain(&mut self, index: u32) {
+        if let Some(count) = self.counts.get_mut(index as usize) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// Note one fewer, and say whether that was the last one.
+    ///
+    /// A stuck count never comes back down, so this answers `false` for one --
+    /// the object stays until a trace proves it dead.
+    fn release(&mut self, index: u32) -> bool {
+        match self.counts.get_mut(index as usize) {
+            Some(count) if *count == u8::MAX => false,
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                *count == 0
+            }
+            _ => false,
+        }
+    }
+
+    fn count(&self, index: u32) -> u8 {
+        self.counts.get(index as usize).copied().unwrap_or(0)
     }
 
     fn get(&self, index: u32) -> Option<&T> {
@@ -246,6 +290,12 @@ pub struct Heap {
     /// whose intermediate results are not yet reachable from any root.
     paused: bool,
     collections: usize,
+    /// Handles whose count has reached zero.
+    ///
+    /// **Zero means "nothing on the heap refers to this", not "dead"** -- the
+    /// stack is not counted, so a candidate may still be in use. They are
+    /// confirmed against the roots before anything is freed.
+    candidates: Vec<ObjectId>,
     #[cfg(feature = "profile")]
     profile: Profile,
 }
@@ -313,6 +363,7 @@ impl Heap {
             growth: (GROWTH_NUMERATOR, GROWTH_DENOMINATOR),
             paused: false,
             collections: 0,
+            candidates: Vec::new(),
             #[cfg(feature = "profile")]
             profile: Profile::default(),
         }
@@ -339,6 +390,20 @@ impl Heap {
         }
         self.live += 1;
 
+        // **Creation is a barrier, and it is complete by construction.** A new
+        // object usually arrives holding references already -- an instance
+        // knows its class, a closure knows its function -- and rather than
+        // listing them at each of the dozens of construction sites, they are
+        // read off the same `trace` the collector uses. A type that traces
+        // correctly counts correctly.
+        //
+        // Fibers are the exception, here and everywhere: their references are
+        // roots rather than heap references, so they are not counted.
+        let mut born: Vec<ObjectId> = Vec::new();
+        if object.object_type() != ObjectType::Fiber {
+            object.trace(&mut born);
+        }
+
         // **The cost is the slot this type actually uses**, not the largest
         // slot any type uses. Charging a flat size here and a per-type size at
         // the sweep would make the running total disagree with the collector's,
@@ -364,6 +429,9 @@ impl Heap {
         };
 
         self.bytes += cost;
+        for referent in born {
+            self.retain_id(referent);
+        }
 
         #[cfg(feature = "profile")]
         {
@@ -528,6 +596,175 @@ impl Heap {
         }
     }
 
+    /// Note that **a heap object** now refers to `value`.
+    ///
+    /// The barrier every store into an object's fields, a list's elements, a
+    /// map's entries or a class's tables has to go through. Stack and local
+    /// references are deliberately not counted: see `Table::counts`.
+    ///
+    /// **Over-counting is safe and under-counting is a use-after-free**, which
+    /// is the asymmetry the whole design rests on. A missed `retain` frees
+    /// something still in use; a missed `release` leaks until the tracing
+    /// backstop runs. `verify_counts` exists to prove no `retain` is missing.
+    pub fn retain(&mut self, value: Value) {
+        if let Some(id) = value.as_object() {
+            self.retain_id(id);
+        }
+    }
+
+    /// Note that a heap object no longer refers to `value`.
+    pub fn release(&mut self, value: Value) {
+        if let Some(id) = value.as_object() {
+            self.release_id(id);
+        }
+    }
+
+    /// Swap one heap reference for another, **retaining before releasing**.
+    ///
+    /// The order is not cosmetic: storing a value over itself would otherwise
+    /// drop the count to zero and make it a candidate for freeing between the
+    /// two halves of an assignment that changed nothing.
+    pub fn replace(&mut self, old: Value, new: Value) {
+        self.retain(new);
+        self.release(old);
+    }
+
+    pub fn retain_id(&mut self, id: ObjectId) {
+        let index = id.index();
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => self.classes.retain(index),
+            Some(ObjectType::Closure) => self.closures.retain(index),
+            Some(ObjectType::Fn) => self.functions.retain(index),
+            Some(ObjectType::Fiber) => self.fibers.retain(index),
+            Some(ObjectType::Instance) => self.instances.retain(index),
+            Some(ObjectType::List) => self.lists.retain(index),
+            Some(ObjectType::Map) => self.maps.retain(index),
+            Some(ObjectType::Range) => self.ranges.retain(index),
+            Some(ObjectType::String) => self.strings.retain(index),
+            Some(ObjectType::Upvalue) => self.upvalues.retain(index),
+            None => {}
+        }
+    }
+
+    /// Drop a reference; the handle is remembered if the count reached zero.
+    pub fn release_id(&mut self, id: ObjectId) {
+        let index = id.index();
+        let emptied = match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => self.classes.release(index),
+            Some(ObjectType::Closure) => self.closures.release(index),
+            Some(ObjectType::Fn) => self.functions.release(index),
+            Some(ObjectType::Fiber) => self.fibers.release(index),
+            Some(ObjectType::Instance) => self.instances.release(index),
+            Some(ObjectType::List) => self.lists.release(index),
+            Some(ObjectType::Map) => self.maps.release(index),
+            Some(ObjectType::Range) => self.ranges.release(index),
+            Some(ObjectType::String) => self.strings.release(index),
+            Some(ObjectType::Upvalue) => self.upvalues.release(index),
+            None => false,
+        };
+        if emptied {
+            self.candidates.push(id);
+        }
+    }
+
+    /// What the count says, for tests and for the verifier.
+    pub fn count_of(&self, id: ObjectId) -> u8 {
+        let index = id.index();
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => self.classes.count(index),
+            Some(ObjectType::Closure) => self.closures.count(index),
+            Some(ObjectType::Fn) => self.functions.count(index),
+            Some(ObjectType::Fiber) => self.fibers.count(index),
+            Some(ObjectType::Instance) => self.instances.count(index),
+            Some(ObjectType::List) => self.lists.count(index),
+            Some(ObjectType::Map) => self.maps.count(index),
+            Some(ObjectType::Range) => self.ranges.count(index),
+            Some(ObjectType::String) => self.strings.count(index),
+            Some(ObjectType::Upvalue) => self.upvalues.count(index),
+            None => 0,
+        }
+    }
+
+    /// Recompute every reference count from the object graph.
+    ///
+    /// **For batch construction, not for steady state.** Building the core
+    /// library sets a metaclass on a dozen classes, reparents four more onto
+    /// `Sequence` and binds several hundred methods -- all of it once, at
+    /// start-up, on objects that live for the whole run. Instrumenting each of
+    /// those sites would be thirty-odd barriers to maintain for work that
+    /// happens before any Wren code runs.
+    ///
+    /// So the counts are simply rebuilt afterwards, from the same `trace` the
+    /// collector uses. Correct by the same argument as the creation barrier:
+    /// a type that traces correctly counts correctly.
+    ///
+    /// It is O(the whole heap) and it runs three times in a VM's life -- after
+    /// the core library, and after each of the two modules built on demand.
+    pub fn rebuild_counts(&mut self) {
+        each_table!(&mut *self, table, _kind, {
+            for count in &mut table.counts {
+                *count = 0;
+            }
+        });
+
+        let ids = self.ids();
+        let mut referents: Vec<ObjectId> = Vec::new();
+        for id in &ids {
+            if ObjectType::from_tag(id.tag()) == Some(ObjectType::Fiber) {
+                continue;
+            }
+            referents.clear();
+            self.trace_at(*id, &mut referents);
+            for target in core::mem::take(&mut referents) {
+                self.retain_id(target);
+            }
+        }
+        self.candidates.clear();
+    }
+
+    /// Check every count against the references that actually exist.
+    ///
+    /// **This is how a write barrier is shown to be complete**, rather than
+    /// audited by reading the code and hoping. It walks every live object,
+    /// counts the references it holds, and reports any handle whose count
+    /// disagrees. Run across the 873 programs in the repository, a clean
+    /// report is real evidence; a single missing `retain` would be a
+    /// use-after-free the moment prompt freeing is switched on.
+    ///
+    /// Returns `(handle, counted, actual)` for each disagreement.
+    ///
+    /// A fiber's references are not counted -- fibers are roots, and their
+    /// stacks are stacks -- so they are excluded here for the same reason.
+    pub fn verify_counts(&self) -> Vec<(ObjectId, u8, u32)> {
+        let mut actual: alloc::collections::BTreeMap<u32, u32> =
+            alloc::collections::BTreeMap::new();
+        let mut referents: Vec<ObjectId> = Vec::new();
+        for id in self.ids() {
+            if ObjectType::from_tag(id.tag()) == Some(ObjectType::Fiber) {
+                continue;
+            }
+            referents.clear();
+            self.trace_at(id, &mut referents);
+            for target in &referents {
+                *actual.entry(target.raw()).or_insert(0) += 1;
+            }
+        }
+
+        let mut wrong = Vec::new();
+        for id in self.ids() {
+            let counted = self.count_of(id);
+            let real = actual.get(&id.raw()).copied().unwrap_or(0);
+            // A stuck count is not a disagreement, it is the design.
+            if counted == u8::MAX {
+                continue;
+            }
+            if u32::from(counted) != real {
+                wrong.push((id, counted, real));
+            }
+        }
+        wrong
+    }
+
     /// What kind of object a handle names, **from the handle alone**.
     ///
     /// No table is touched: the type is four bits of the handle. That is the
@@ -571,6 +808,41 @@ impl Heap {
             Some(ObjectType::String) => self.strings.occupied(index),
             Some(ObjectType::Upvalue) => self.upvalues.occupied(index),
             None => false,
+        }
+    }
+
+    /// Empty a slot and put it back on its table's free list.
+    ///
+    /// Dropping the payload releases whatever its `Vec`s held. The references
+    /// it made are the caller's business -- `release_id` has to have been
+    /// called for each of them first, or their counts would be left too high.
+    fn discard(&mut self, id: ObjectId) {
+        let index = id.index();
+        macro_rules! discard {
+            ($table:expr) => {{
+                if $table
+                    .slots
+                    .get(index as usize)
+                    .is_some_and(Option::is_some)
+                {
+                    $table.slots[index as usize] = None;
+                    $table.counts[index as usize] = 0;
+                    $table.free.push(index);
+                }
+            }};
+        }
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => discard!(self.classes),
+            Some(ObjectType::Closure) => discard!(self.closures),
+            Some(ObjectType::Fn) => discard!(self.functions),
+            Some(ObjectType::Fiber) => discard!(self.fibers),
+            Some(ObjectType::Instance) => discard!(self.instances),
+            Some(ObjectType::List) => discard!(self.lists),
+            Some(ObjectType::Map) => discard!(self.maps),
+            Some(ObjectType::Range) => discard!(self.ranges),
+            Some(ObjectType::String) => discard!(self.strings),
+            Some(ObjectType::Upvalue) => discard!(self.upvalues),
+            None => {}
         }
     }
 
@@ -764,10 +1036,16 @@ impl Heap {
         // Sweep, one table at a time. Each knows its own slot size, which is
         // the whole point: a `List` slot is twelve bytes where a `Range` slot
         // is twenty-four, and neither pays for the other.
+        //
+        // **Two passes, because freeing is a barrier too.** An object about to
+        // go releases everything it referred to, and that touches other
+        // tables -- so what dies is gathered first and freed after, rather
+        // than mutating ten tables while iterating one.
         let mut bytes = 0usize;
         let mut live = 0usize;
         let mut slots_seen = 0usize;
-        each_table!(&mut *self, table, _kind, {
+        let mut dead: Vec<ObjectId> = Vec::new();
+        each_table!(&mut *self, table, kind, {
             let slot = table.slot_size();
             slots_seen += table.slots.len();
             for index in 0..table.slots.len() {
@@ -781,12 +1059,27 @@ impl Heap {
                         bytes += slot + value.contents_size();
                     }
                 } else {
-                    // Dropping the payload releases whatever its `Vec`s held.
-                    table.slots[index] = None;
-                    table.free.push(index as u32);
+                    dead.push(ObjectId::tagged(kind.tag(), index as u32));
                 }
             }
         });
+
+        let mut orphaned: Vec<ObjectId> = Vec::new();
+        for id in &dead {
+            if ObjectType::from_tag(id.tag()) == Some(ObjectType::Fiber) {
+                continue;
+            }
+            self.trace_at(*id, &mut orphaned);
+        }
+        for id in orphaned {
+            self.release_id(id);
+        }
+        for id in &dead {
+            self.discard(*id);
+        }
+        // Everything that died took its candidacy with it, and what survived
+        // is about to be re-confirmed the next time a count reaches zero.
+        self.candidates.clear();
 
         #[cfg(feature = "profile")]
         {
