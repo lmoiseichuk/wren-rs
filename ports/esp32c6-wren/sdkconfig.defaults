@@ -7,10 +7,28 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # overflow that reads like a Wren bug rather than a configuration one.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
-# Optimise for size. This is the reference implementation and the comparison is
-# partly about footprint, so building it the way somebody shipping it would.
-CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# **The optimisation level is not set here.** It is the one thing that differs
+# between the two published builds, so it lives in `sdkconfig.size` and
+# `sdkconfig.perf` -- see tools/release.sh. Putting a default here would mean
+# one of the two builds silently inheriting the other's intent.
 
 # Panic straight to a reboot rather than into the debug monitor: a benchmark run
 # that dies should say so and come back, not sit waiting for a human.
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+
+# **The task watchdog has to go, and the reason is a finding rather than a
+# nuisance.**
+#
+# Wren's interpreter loop runs to completion: it never blocks, never yields and
+# offers no hook to do either. On FreeRTOS that starves the idle task, and after
+# about five seconds the task watchdog fires and reboots the part. Seven of
+# upstream's twelve benchmarks died this way -- `delta_blue`, `binary_trees`,
+# `fib` and others -- and every one of them reads as "Wren crashed" until you
+# see `task_wdt: - IDLE (CPU 0)` in the output.
+#
+# Disabling it is right for a benchmark rig, where uninterrupted compute is the
+# entire point. It would be wrong for a product: a real embedded VM needs a
+# yield hook so the rest of the system keeps running, and its absence here is a
+# requirement the Rust implementation should meet rather than inherit.
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_INT_WDT=n

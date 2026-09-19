@@ -1,0 +1,7 @@
+# The size-optimised build: `-Os`.
+#
+# **This is the one whose footprint gets published**, and the one to set beside
+# MicroPython -- their released ESP32 builds are size-optimised too, so a `-O2`
+# Wren against a stock MicroPython would be comparing build flags rather than
+# languages.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y

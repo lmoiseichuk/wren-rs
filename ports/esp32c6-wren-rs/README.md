@@ -6,6 +6,37 @@ This repository's Rust VM on the ESP32-C6.
 it pulls in any other, with no C build step, no submodule and no `build.rs`
 compiling somebody else's tree.
 
+## What it needs
+
+A Rust toolchain with the ESP-IDF target, plus the same ESP-IDF this project's
+C port uses — `esp-idf-sys` drives the IDF build underneath Cargo.
+
+```sh
+# Rust, if it is not already here
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# The RISC-V ESP-IDF target and the build helper
+rustup target add riscv32imac-esp-espidf
+cargo install ldproxy espflash
+
+# Serial access, then log out and back in
+sudo usermod -aG dialout "$USER"
+
+# ESP-IDF prerequisites, which esp-idf-sys needs present
+sudo apt update
+sudo apt install -y git wget flex bison gperf python3 python3-pip python3-venv \
+                    cmake ninja-build ccache libffi-dev libssl-dev dfu-util \
+                    libusb-1.0-0 python3-serial
+```
+
+**No `xtensa` toolchain and no `espup`.** The C6 is RISC-V, so the stock Rust
+target is enough — that whole layer only appears for Xtensa parts.
+
+What it does *not* need is the thing worth pointing at: **no C compiler for the
+VM, no submodule, no `build.rs` compiling somebody else's tree.** The
+`wren` crate is pure Rust with no dependencies. That is the deliverable, and the
+contrast with the C port's setup above is a large part of the point.
+
 ## Status
 
 Not built yet — the VM it depends on is still being written. See the root README

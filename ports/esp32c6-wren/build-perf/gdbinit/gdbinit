@@ -1,0 +1,2 @@
+source /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-perf/gdbinit/symbols
+source /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-perf/gdbinit/connect

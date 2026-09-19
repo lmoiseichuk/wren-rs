@@ -845,6 +845,13 @@
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren/CMakeFiles/install.dir
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren/CMakeFiles/install/local.dir
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren/CMakeFiles/install/strip.dir
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/CMakeFiles/__idf_wren_api_tests.dir
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/CMakeFiles/edit_cache.dir
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/CMakeFiles/rebuild_cache.dir
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/CMakeFiles/list_install_components.dir
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/CMakeFiles/install.dir
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/CMakeFiles/install/local.dir
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/CMakeFiles/install/strip.dir
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/main/CMakeFiles/__idf_main.dir
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/main/CMakeFiles/edit_cache.dir
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/main/CMakeFiles/rebuild_cache.dir

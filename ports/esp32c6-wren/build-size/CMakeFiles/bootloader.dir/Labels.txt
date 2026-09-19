@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/CMakeFiles/bootloader
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/CMakeFiles/bootloader.rule
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/CMakeFiles/bootloader-complete.rule
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

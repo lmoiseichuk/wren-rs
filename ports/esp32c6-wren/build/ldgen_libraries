@@ -159,5 +159,7 @@
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wifi_provisioning/libwifi_provisioning.a
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/json/libjson.a
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren/libwren.a
-/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/main/libmain.a
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/libwren_api_tests.a
 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren/libwren.a
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/main/libmain.a
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/libwren_api_tests.a

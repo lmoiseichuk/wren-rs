@@ -20,7 +20,7 @@ source "$HERE/board.sh"
 
 PORT_NAME="${1:-}"
 if [[ -z "$PORT_NAME" ]]; then
-    echo "usage: $0 <port> [board] [--monitor]" >&2
+    echo "usage: $0 <port> [size|perf|tests] [board] [--monitor]" >&2
     echo >&2
     echo "ports:" >&2
     for dir in "$ROOT"/ports/*/; do
@@ -32,13 +32,31 @@ fi
 shift
 
 BOARD=""
+VARIANT="tests"
 MONITOR=0
 for arg in "$@"; do
     case "$arg" in
         --monitor) MONITOR=1 ;;
+        size|perf|tests) VARIANT="$arg" ;;
         *) BOARD="$arg" ;;
     esac
 done
+
+# **The variant decides the sdkconfig, and the build directory follows it.**
+#
+# ESP-IDF regenerates `sdkconfig` from `sdkconfig.defaults` only when there is
+# no `sdkconfig` yet. A stale one silently ignores every later change to the
+# defaults -- which is how a whole test run happened with the task watchdog
+# still enabled after it had been switched off, producing seven reboots and
+# sixteen timeouts that were read as Wren failures.
+#
+# One build directory per variant, each with its own sdkconfig, is what makes
+# that impossible rather than merely unlikely.
+case "$VARIANT" in
+    size)  CONFIGS="sdkconfig.defaults;sdkconfig.size"; API=OFF ;;
+    perf)  CONFIGS="sdkconfig.defaults;sdkconfig.perf"; API=OFF ;;
+    tests) CONFIGS="sdkconfig.defaults;sdkconfig.size"; API=ON  ;;
+esac
 
 PORT_DIR="$ROOT/ports/$PORT_NAME"
 [[ -d "$PORT_DIR" ]] || { echo "no such port: $PORT_NAME" >&2; exit 1; }
@@ -55,14 +73,18 @@ DEVICE="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_${MAC}-if00"
 IDF="${IDF_EXPORT:-$HOME/.espressif/esp-idf/v5.5/export.sh}"
 [[ -f "$IDF" ]] || { echo "no ESP-IDF at $IDF -- set IDF_EXPORT" >&2; exit 1; }
 
-echo "port  : $PORT_NAME"
-echo "board : ${BOARD:-<default>}  $MAC"
+echo "port    : $PORT_NAME"
+echo "variant : $VARIANT"
+echo "board   : ${BOARD:-<default>}  $MAC"
 
 cd "$PORT_DIR"
 # shellcheck disable=SC1090
 source "$IDF" >/dev/null 2>&1
+BUILD_DIR="build-$VARIANT"
+ARGS=(-B "$BUILD_DIR" -DSDKCONFIG_DEFAULTS="$CONFIGS" -DWREN_API_TESTS="$API"
+      -DSDKCONFIG="$BUILD_DIR/sdkconfig" -p "$DEVICE")
 if (( MONITOR )); then
-    idf.py -p "$DEVICE" flash monitor
+    idf.py "${ARGS[@]}" flash monitor
 else
-    idf.py -p "$DEVICE" flash
+    idf.py "${ARGS[@]}" flash
 fi

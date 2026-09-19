@@ -564,6 +564,11 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
+  include("/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/wren_api_tests/cmake_install.cmake")
+endif()
+
+if(NOT CMAKE_INSTALL_LOCAL_ONLY)
+  # Include the install script for the subdirectory.
   include("/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/main/cmake_install.cmake")
 endif()
 

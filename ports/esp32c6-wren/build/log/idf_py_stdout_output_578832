@@ -1,0 +1,85 @@
+Command: ninja flash
+[1/10] Performing build step for 'bootloader'
+[1/1] cd /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/bootloader/esp-idf/esptool_py && /home/ldm/.espressif/python_env/idf5.5_py3.13_env/bin/python /home/ldm/.espressif/esp-idf/v5.5/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/bootloader/bootloader.bin
+Bootloader binary size 0x5760 bytes. 0x28a0 bytes (32%) free.
+[2/10] No install step for 'bootloader'
+[3/10] Completed 'bootloader'
+[4/10] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/main/main.c: In function 'wren_task':
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/main/main.c:472:5: warning: 'esp_vfs_usb_serial_jtag_use_driver' is deprecated: Please use usb_serial_jtag_vfs_use_driver() instead [-Wdeprecated-declarations]
+  472 |     esp_vfs_usb_serial_jtag_use_driver();
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/main/main.c:20:
+/home/ldm/.espressif/esp-idf/v5.5/components/vfs/include/esp_vfs_dev.h:63:6: note: declared here
+   63 | void esp_vfs_usb_serial_jtag_use_driver(void) __attribute__((deprecated("Please use usb_serial_jtag_vfs_use_driver() instead")));
+      |      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/main/main.c:473:5: warning: 'esp_vfs_dev_usb_serial_jtag_set_rx_line_endings' is deprecated: Please use usb_serial_jtag_vfs_set_rx_line_endings instead [-Wdeprecated-declarations]
+  473 |     esp_vfs_dev_usb_serial_jtag_set_rx_line_endings(ESP_LINE_ENDINGS_LF);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/main/main.c:19:
+/home/ldm/.espressif/esp-idf/v5.5/components/vfs/include/esp_vfs_usb_serial_jtag.h:19:6: note: declared here
+   19 | void esp_vfs_dev_usb_serial_jtag_set_rx_line_endings(esp_line_endings_t mode) __attribute__((deprecated("Please use usb_serial_jtag_vfs_set_rx_line_endings instead")));
+      |      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/main/main.c:474:5: warning: 'esp_vfs_dev_usb_serial_jtag_set_tx_line_endings' is deprecated: Please use usb_serial_jtag_vfs_set_tx_line_endings instead [-Wdeprecated-declarations]
+  474 |     esp_vfs_dev_usb_serial_jtag_set_tx_line_endings(ESP_LINE_ENDINGS_CRLF);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/ldm/.espressif/esp-idf/v5.5/components/vfs/include/esp_vfs_usb_serial_jtag.h:21:6: note: declared here
+   21 | void esp_vfs_dev_usb_serial_jtag_set_tx_line_endings(esp_line_endings_t mode) __attribute__((deprecated("Please use usb_serial_jtag_vfs_set_tx_line_endings instead")));
+      |      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[5/10] Linking C static library esp-idf/main/libmain.a
+[6/10] Generating esp-idf/esp_system/ld/sections.ld
+[7/10] Linking CXX executable esp32c6-wren.elf
+[8/10] Generating binary image from built executable
+esptool.py v4.12.0
+Creating esp32c6 image...
+Merged 1 ELF section
+Successfully created esp32c6 image.
+Generated /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp32c6-wren.bin
+[9/10] cd /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp-idf/esptool_py && /home/ldm/.espressif/python_env/idf5.5_py3.13_env/bin/python /home/ldm/.espressif/esp-idf/v5.5/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/partition_table/partition-table.bin /home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build/esp32c6-wren.bin
+esp32c6-wren.bin binary size 0x436f0 bytes. Smallest app partition is 0x100000 bytes. 0xbc910 bytes (74%) free.
+[9/10] cd /home/ldm/.espressif/esp-idf/v5.5/components/esptool_py && /home/ldm/.espressif/tools/cmake/3.30.2/bin/cmake -D IDF_PATH=/home/ldm/.espressif/esp-idf/v5.5 -D "SERIAL_TOOL=/home/ldm/.espressif/python_env/idf5.5_py3.13_env/bin/python;;/home/ldm/.espressif/esp-idf/v5.5/components/esptool_py/esptool/esptool.py;--chip;esp32c6" -D "SERIAL_TOOL_ARGS=--before=default_reset;--after=hard_reset;write_flash;@flash_args" -D WORKING_DIRECTORY=/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build -P /home/ldm/.espressif/esp-idf/v5.5/components/esptool_py/run_serial_tool.cmake
+esptool.py --chip esp32c6 -p /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_10:BD:A3:AC:E1:F4-if00 -b 460800 --before=default_reset --after=hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 2MB 0x0 bootloader/bootloader.bin 0x10000 esp32c6-wren.bin 0x8000 partition_table/partition-table.bin
+esptool.py v4.12.0
+Serial port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_10:BD:A3:AC:E1:F4-if00
+Connecting...
+Chip is ESP32-C6FH4 (QFN32) (revision v0.2)
+Features: Wi-Fi 6, BT 5 (LE), IEEE802.15.4, Single Core + LP Core, 160MHz, Embedded Flash 4MB
+Crystal is 40MHz
+USB mode: USB-Serial/JTAG
+MAC: 10:bd:a3:ff:fe:ac:e1:f4
+BASE MAC: 10:bd:a3:ac:e1:f4
+MAC_EXT: ff:fe
+Uploading stub...
+Running stub...
+Stub running...
+Changing baud rate to 460800
+Changed.
+Configuring flash size...
+Flash will be erased from 0x00000000 to 0x00005fff...
+Flash will be erased from 0x00010000 to 0x00053fff...
+Flash will be erased from 0x00008000 to 0x00008fff...
+SHA digest in image updated
+Compressed 22368 bytes to 13795...
+Writing at 0x00000000... (100 %)
+Wrote 22368 bytes (13795 compressed) at 0x00000000 in 0.2 seconds (effective 1144.3 kbit/s)...
+Hash of data verified.
+Compressed 276208 bytes to 152686...
+Writing at 0x00010000... (10 %)
+Writing at 0x0001caf3... (20 %)
+Writing at 0x000234ee... (30 %)
+Writing at 0x00029f51... (40 %)
+Writing at 0x00031051... (50 %)
+Writing at 0x00037af9... (60 %)
+Writing at 0x0003e2b3... (70 %)
+Writing at 0x0004431f... (80 %)
+Writing at 0x0004a921... (90 %)
+Writing at 0x00050a64... (100 %)
+Wrote 276208 bytes (152686 compressed) at 0x00010000 in 0.9 seconds (effective 2333.7 kbit/s)...
+Hash of data verified.
+Compressed 3072 bytes to 103...
+Writing at 0x00008000... (100 %)
+Wrote 3072 bytes (103 compressed) at 0x00008000 in 0.0 seconds (effective 1133.9 kbit/s)...
+Hash of data verified.
+
+Leaving...
+Hard resetting via RTS pin...

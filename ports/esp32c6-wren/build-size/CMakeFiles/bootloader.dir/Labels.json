@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/CMakeFiles/bootloader"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/CMakeFiles/bootloader.rule"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/CMakeFiles/bootloader-complete.rule"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+		},
+		{
+			"file" : "/home/ldm/src/dooing/wren-rs/ports/esp32c6-wren/build-size/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"bootloader"
+		],
+		"name" : "bootloader"
+	}
+}

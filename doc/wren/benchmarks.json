@@ -1,0 +1,102 @@
+{
+ "meta": {
+  "board": "ESP32-C6FH4 rev v0.2 @ 160 MHz",
+  "port": "ports/esp32c6-wren",
+  "wren": "vendor/wren 0.4.0, unmodified",
+  "repeats": 3,
+  "run": "2026-09-19 00:52:58 UTC",
+  "note": "median of the runs; self_seconds is the benchmark's own System.clock figure, wall_ms is the device's timer"
+ },
+ "results": [
+  {
+   "benchmark": "binary_trees",
+   "self_seconds": null,
+   "wall_ms": null,
+   "heap_bytes": null,
+   "stack_bytes": null,
+   "runs": 3,
+   "failures": 3
+  },
+  {
+   "benchmark": "binary_trees_gc",
+   "self_seconds": null,
+   "wall_ms": null,
+   "heap_bytes": null,
+   "stack_bytes": null,
+   "runs": 3,
+   "failures": 3
+  },
+  {
+   "benchmark": "delta_blue",
+   "self_seconds": null,
+   "wall_ms": 21.532,
+   "heap_bytes": 20508,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 2
+  },
+  {
+   "benchmark": "fib",
+   "self_seconds": 25.43,
+   "wall_ms": 25442.305,
+   "heap_bytes": 7132,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 0
+  },
+  {
+   "benchmark": "fibers",
+   "self_seconds": null,
+   "wall_ms": null,
+   "heap_bytes": null,
+   "stack_bytes": null,
+   "runs": 3,
+   "failures": 3
+  },
+  {
+   "benchmark": "for",
+   "self_seconds": null,
+   "wall_ms": null,
+   "heap_bytes": null,
+   "stack_bytes": null,
+   "runs": 3,
+   "failures": 3
+  },
+  {
+   "benchmark": "map_numeric",
+   "self_seconds": null,
+   "wall_ms": null,
+   "heap_bytes": null,
+   "stack_bytes": null,
+   "runs": 3,
+   "failures": 3
+  },
+  {
+   "benchmark": "map_string",
+   "self_seconds": null,
+   "wall_ms": 32.809,
+   "heap_bytes": 59424,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 2
+  },
+  {
+   "benchmark": "method_call",
+   "self_seconds": 12.17,
+   "wall_ms": 12186.582,
+   "heap_bytes": 19652,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 0
+  },
+  {
+   "benchmark": "string_equals",
+   "self_seconds": 23.73,
+   "wall_ms": 23738.083,
+   "heap_bytes": 6712,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 0
+  }
+ ]
+}

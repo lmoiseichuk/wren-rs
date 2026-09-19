@@ -7,6 +7,79 @@ Serial/JTAG.
 about the Rust implementation is a difference measured against the same
 language on the same silicon.
 
+## What it needs
+
+ESP-IDF v5.5 with the `esp32c6` target, and `python3-serial` for the host
+tools. Nothing else — Wren has no dependencies of its own, which is part of why
+it was a reasonable thing to port.
+
+```sh
+# Prerequisites
+sudo apt update
+sudo apt install -y git wget flex bison gperf python3 python3-pip python3-venv \
+                    cmake ninja-build ccache libffi-dev libssl-dev dfu-util \
+                    libusb-1.0-0 python3-serial
+
+# Serial access, then log out and back in
+sudo usermod -aG dialout "$USER"
+
+# ESP-IDF v5.5 with the C6 target
+mkdir -p ~/.espressif/esp-idf && cd ~/.espressif/esp-idf
+git clone -b v5.5 --recursive https://github.com/espressif/esp-idf.git v5.5
+cd v5.5 && ./install.sh esp32c6
+```
+
+Two that are not in Espressif's instructions and cost time here:
+
+* **`python3-serial`** — not on their list, but every tool in `tools/` needs it.
+* **Run the whole `install.sh`.** A tree missing any one tool refuses to export,
+  even a tool a build never uses. This bench had everything except
+  `openocd-esp32` — a debugger — and `export.sh` failed with
+  `Activation script failed` until it was fetched:
+
+  ```sh
+  ~/.espressif/python_env/idf5.5_py3.13_env/bin/python \
+      ~/.espressif/esp-idf/v5.5/tools/idf_tools.py install openocd-esp32
+  ```
+
+If IDF lives elsewhere, `export IDF_EXPORT=/path/to/export.sh`.
+
+Two things specific to this port:
+
+* **`vendor/wren` must be checked out.** It is a submodule and the CMake here
+  globs its `src/vm` and `src/optional` directly; an un-initialised submodule
+  fails as a missing source directory rather than as a missing submodule.
+
+  ```sh
+  git submodule update --init --recursive
+  ```
+* **The `tests` variant also compiles `vendor/wren/test/api/*.c`**, upstream's
+  foreign-function fixtures. Those are test code, so `size` and `perf` leave
+  them out — see the variants below.
+
+## Builds
+
+Three, each stored under `release/` with the `esptool.py` line to flash it with
+no toolchain at all:
+
+| variant | flags | image | for |
+|---|---|---|---|
+| `size` | `-Os` | 272,736 B | the published footprint, and the comparison against MicroPython |
+| `perf` | `-O2` | 301,888 B | the speed ceiling — `-O2` costs **+29 KB** |
+| `tests` | `-Os` + api fixtures | 287,008 B | the test suite — the fixtures cost **+14 KB** |
+
+```sh
+tools/flash.sh esp32c6-wren size        # build and flash one
+tools/release.sh esp32c6-wren perf      # build and store it under release/
+```
+
+**One build directory per variant, each with its own `sdkconfig`.** That is not
+tidiness: ESP-IDF regenerates `sdkconfig` from `sdkconfig.defaults` only when
+there is no `sdkconfig` yet, so a stale one silently ignores every later change
+to the defaults. A whole test run happened here with the task watchdog still
+enabled after it had been switched off, producing seven reboots and sixteen
+timeouts that were read as Wren failures.
+
 ## Status: running
 
 ```
@@ -97,6 +170,26 @@ with a diagnostic — a null store on the first benchmark that allocates.
 A 42% reduction, and it costs nothing: on the defaults the garbage from
 compiling the core library is never collected, so it stays resident for the life
 of the VM.
+
+### 5. A program that computes for more than a few seconds reboots the board
+
+Wren's interpreter loop runs to completion. It does not block, does not yield,
+and offers no hook to do either — so on FreeRTOS the idle task is starved and
+the task watchdog fires:
+
+```
+E (32922) task_wdt: Task watchdog got triggered.
+E (32922) task_wdt:  - IDLE (CPU 0)
+```
+
+**Seven of upstream's twelve benchmarks died this way**, including `delta_blue`,
+`binary_trees` and `fib`. Every one of them reads as "Wren crashed" until the
+watchdog line is spotted in the output.
+
+This port disables the watchdog, which is right for a benchmark rig and wrong
+for a product. **A VM meant to run alongside anything else needs a yield hook**,
+and Wren has none — that is a requirement the Rust implementation should meet
+rather than inherit.
 
 ## What the Rust implementation has to beat
 

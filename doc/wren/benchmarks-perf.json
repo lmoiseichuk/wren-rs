@@ -1,0 +1,50 @@
+{
+ "meta": {
+  "board": "ESP32-C6FH4 rev v0.2 @ 160 MHz",
+  "port": "ports/esp32c6-wren",
+  "wren": "vendor/wren 0.4.0, unmodified",
+  "repeats": 3,
+  "variant": "perf",
+  "benchmarks": "benchmarks/wren -- scaled for this part, see benchmarks/README.md",
+  "run": "2026-09-19 01:08:28 UTC",
+  "note": "median of the runs; self_seconds is the benchmark's own System.clock figure, wall_ms is the device's timer"
+ },
+ "results": [
+  {
+   "benchmark": "binary_trees",
+   "self_seconds": 2.16,
+   "wall_ms": 2168.187,
+   "heap_bytes": 78784,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 0
+  },
+  {
+   "benchmark": "fib",
+   "self_seconds": 3.25,
+   "wall_ms": 3258.595,
+   "heap_bytes": 6616,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 0
+  },
+  {
+   "benchmark": "list_build",
+   "self_seconds": 0.13,
+   "wall_ms": 134.405,
+   "heap_bytes": 134712,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 0
+  },
+  {
+   "benchmark": "method_call",
+   "self_seconds": 0.35,
+   "wall_ms": 362.184,
+   "heap_bytes": 15096,
+   "stack_bytes": 33552,
+   "runs": 3,
+   "failures": 0
+  }
+ ]
+}

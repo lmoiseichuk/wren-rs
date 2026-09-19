@@ -7,6 +7,7 @@
 // the reference would be tuning the thing we are measuring against.
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -20,10 +21,24 @@
 
 #include "wren.h"
 
-// How much a line of input may be. Generous for a console, and it is static
-// rather than heap so that the heap numbers printed below are about Wren rather
-// than about this file.
-#define LINE_MAX 512
+// Upstream's foreign-function fixtures, so the `api/` group can run. Optional:
+// see components/wren_api_tests/CMakeLists.txt.
+#if __has_include("api_tests.h")
+#include "api_tests.h"
+#define HAVE_API_TESTS 1
+#endif
+
+// How much a line of input may be.
+//
+// **2 KB, because the test suite has lines longer than 512 bytes.** The
+// `limit/` group generates deliberately enormous programs, and `long_function`
+// puts a great deal on one line. A truncated line does not fail loudly: it
+// usually still compiles and quietly means something else, which arrived as
+// `unexpected compile error` on three tests that have nothing wrong with them.
+//
+// Static rather than heap so the heap numbers reported below are about Wren
+// rather than about this file.
+#define LINE_MAX 2048
 
 // ---------------------------------------------------------------------------
 // Wren's hooks into the outside world.
@@ -48,6 +63,76 @@ static void error_fn(WrenVM* vm, WrenErrorType type, const char* module,
             printf("  at %s:%d in %s\n", module ? module : "?", line, message);
             break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Modules, for `import`.
+// ---------------------------------------------------------------------------
+//
+// **There is no filesystem here, so `import` needs somewhere else to look.**
+// Upstream's CLI resolves a module name to a path and reads the file; this
+// board has neither. Instead the host registers a module's source over the
+// console before running a test that imports it, and `loadModuleFn` serves from
+// that registry.
+//
+// Without this, every one of the fourteen `language/module/*` tests fails with a
+// runtime error -- which reads as "Wren's imports do not work on this part" and
+// is really "this port never told Wren where to look".
+//
+// The name is whatever the program wrote: `import "./module"` arrives here as
+// `./module`, because no `resolveModuleFn` is installed. That is deliberate --
+// resolution is the embedder's policy, and for a test harness the literal
+// string is the right key.
+#define MODULE_MAX 8
+#define MODULE_NAME_MAX 96
+
+typedef struct {
+    char name[MODULE_NAME_MAX];
+    char* source;   // owned; freed when the slot is reused or cleared
+} module_entry;
+
+static module_entry modules[MODULE_MAX];
+static int module_count = 0;
+
+static void modules_clear(void) {
+    for (int i = 0; i < module_count; i++) {
+        free(modules[i].source);
+        modules[i].source = NULL;
+    }
+    module_count = 0;
+}
+
+// Wren frees the source it was handed; this is how it says so.
+static void load_module_complete(WrenVM* vm, const char* name,
+                                 WrenLoadModuleResult result) {
+    (void)vm;
+    (void)name;
+    free((void*)result.source);
+}
+
+static WrenLoadModuleResult load_module(WrenVM* vm, const char* name) {
+    (void)vm;
+    WrenLoadModuleResult result;
+    result.source = NULL;
+    result.onComplete = NULL;
+    result.userData = NULL;
+
+    for (int i = 0; i < module_count; i++) {
+        if (strcmp(modules[i].name, name) != 0) continue;
+        // **A copy, because Wren takes ownership.** Handing over the registry's
+        // own pointer would have it freed underneath us and the module would be
+        // gone for the next test that imports it.
+        size_t length = strlen(modules[i].source);
+        char* copy = (char*)malloc(length + 1);
+        if (copy == NULL) return result;
+        memcpy(copy, modules[i].source, length + 1);
+        result.source = copy;
+        result.onComplete = load_module_complete;
+        return result;
+    }
+    // Not found: Wren reports "Could not load module", which is what the tests
+    // for a missing import expect.
+    return result;
 }
 
 // **Wren's default garbage collector thresholds cannot work on this part.**
@@ -75,6 +160,14 @@ static void configure(WrenConfiguration* config) {
     config->errorFn = error_fn;
     config->initialHeapSize = WREN_INITIAL_HEAP;
     config->minHeapSize = WREN_MIN_HEAP;
+    config->loadModuleFn = load_module;
+#ifdef HAVE_API_TESTS
+    // **Bound unconditionally, but they only fire for `./test/...` modules.**
+    // `api_tests.c` gates on that prefix itself, so an ordinary program run as
+    // `main` is unaffected and pays nothing for these being present.
+    config->bindForeignMethodFn = APITest_bindForeignMethod;
+    config->bindForeignClassFn = APITest_bindForeignClass;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +238,9 @@ static const benchmark BENCHMARKS[] = {
 
 static const int BENCHMARK_COUNT = sizeof(BENCHMARKS) / sizeof(BENCHMARKS[0]);
 
+// Defined with the task below; a benchmark wants to report it per run.
+static size_t stack_used(void);
+
 // Run one benchmark in a fresh VM, and report time and peak cost.
 //
 // **A fresh VM per run**, so one benchmark's garbage cannot flatter or burden
@@ -166,11 +262,20 @@ static void run_benchmark(const benchmark* which) {
     wrenFreeVM(vm);
     size_t recovered = free_heap();
 
-    printf("bench: %-6s %8lld us   vm %5u B   peak %6u B   %s\n",
+    // **Stack beside heap, per benchmark.** The two are separate budgets and a
+    // program can be comfortable in one and out of the other -- `tree` is heap
+    // hungry and shallow, a deep recursion is the reverse. Reporting only the
+    // heap would hide half of what decides whether a part can run this.
+    //
+    // The figure is the task's high-water mark, which FreeRTOS tracks as the
+    // minimum free ever seen and cannot be reset. So it is monotonic across a
+    // run: what matters is *which* benchmark makes it grow.
+    printf("bench: %-6s %8lld us   vm %5u B   peak %6u B   stack %5u B   %s\n",
            which->name,
            (long long)elapsed,
            (unsigned)(before - after_vm),
            (unsigned)(before - lowest),
+           (unsigned)stack_used(),
            result == WREN_RESULT_SUCCESS ? "ok" : "FAILED");
 
     if (recovered + 64 < before) {
@@ -182,6 +287,178 @@ static void run_benchmark(const benchmark* which) {
 }
 
 // ---------------------------------------------------------------------------
+// Running a whole file, for the test suite.
+// ---------------------------------------------------------------------------
+
+// Defined below with the rest of the console; declared here because `.run`
+// needs to keep reading lines of its own.
+static int read_line(char* buffer, size_t limit);
+static size_t stack_used(void);
+
+// **Echo off while a file is being sent, and that is not cosmetic.**
+//
+// The console echoes each character so a person typing can see what they typed.
+// During `.run` the sender is a script, which is not reading -- so the echo
+// fills the device's transmit buffer, the write blocks, the reader stops
+// draining, and the tail of the file is lost. The first test to expose this
+// printed four of its twenty lines and looked like a Wren bug.
+static int echo_enabled = 1;
+
+// **The console evaluates one line at a time, and a test file is not one line.**
+// `.run` collects lines until a lone `.end` and interprets the lot as a single
+// module, which is what upstream's own runner does with a file. Without it every
+// test with a class or an `if` block would fail for reasons that have nothing to
+// do with Wren.
+//
+// **64 KB.** The `limit/` group is the reason: `many_constants` declares 65,536
+// of them and `many_globals` 4,096, so those files run to tens of kilobytes.
+// At 16 KB they came back as `source too large`, which is the harness's limit
+// being reported as Wren's.
+//
+// It is affordable: the board has ~385 KB of heap free at boot and this is
+// static. A file that still does not fit is reported rather than silently
+// truncated, since a truncated program usually still compiles and then quietly
+// means something else.
+#define SOURCE_MAX (64 * 1024)
+static char source_buffer[SOURCE_MAX];
+
+// Markers the host watches for. **Printed either side of the program's own
+// output**, so the runner can tell Wren's output from the console's without
+// guessing, and can tell a finished run from a board that rebooted mid-test.
+#define RUN_BEGIN "<<<wren-begin>>>"
+#define RUN_END   "<<<wren-end>>>"
+
+// Read lines into `source_buffer` until a lone `.end`. Shared by `.run` and
+// `.module`, which differ only in what they do with the result.
+//
+// Returns the length, or -1 if it did not fit.
+static long collect_source(char* line, size_t line_limit) {
+    size_t used = 0;
+    int overflowed = 0;
+
+    echo_enabled = 0;
+    while (1) {
+        int length = read_line(line, line_limit);
+        if (length < 0) continue;
+        if (strcmp(line, ".end") == 0) break;
+        // **A `.run` while collecting means the last one never finished.**
+        //
+        // If an `.end` is lost -- and it can be, when the device is busy
+        // running a slow test and its receive buffer fills -- collection never
+        // stops, and everything after it is swallowed as program text:
+        // the next `.run`, then the next file. It surfaced as a five-line test
+        // reporting `Error at 'run'` on line 215, which is unreadable as
+        // anything but a Wren bug.
+        //
+        // Starting over is the right recovery. The host is telling us a new
+        // program begins here, and whatever came before is already lost.
+        if (strcmp(line, ".run") == 0) {
+            used = 0;
+            overflowed = 0;
+            continue;
+        }
+        if (used + (size_t)length + 2 >= SOURCE_MAX) {
+            overflowed = 1;
+            continue;   // keep draining to `.end`, or the next command inherits it
+        }
+        memcpy(source_buffer + used, line, (size_t)length);
+        used += (size_t)length;
+        source_buffer[used++] = '\n';
+    }
+    source_buffer[used] = '\0';
+    echo_enabled = 1;
+    return overflowed ? -1 : (long)used;
+}
+
+// `.module <name>` then source then `.end`: register a module for `import`.
+//
+// **The name is copied before anything else happens**, because the caller
+// passes a pointer *into* the console's line buffer and `collect_source` reuses
+// that same buffer for every following line. Reading it afterwards gave the
+// tail of the module's first line as its name -- `registered le = "the module"`
+// -- so every import then failed with "could not load module", which looks like
+// the loader not working and is really a dangling pointer.
+static void register_module(const char* name, char* line, size_t line_limit) {
+    char name_copy[MODULE_NAME_MAX];
+    size_t name_length = strlen(name);
+    if (name_length >= MODULE_NAME_MAX) {
+        printf("module: name longer than %d bytes, truncated\n", MODULE_NAME_MAX - 1);
+        name_length = MODULE_NAME_MAX - 1;
+    }
+    memcpy(name_copy, name, name_length);
+    name_copy[name_length] = '\0';
+
+    long used = collect_source(line, line_limit);
+    if (used < 0) {
+        printf("module: source too large for %d bytes\n", SOURCE_MAX);
+        return;
+    }
+    if (module_count >= MODULE_MAX) {
+        printf("module: no free slot (%d registered)\n", MODULE_MAX);
+        return;
+    }
+    char* copy = (char*)malloc((size_t)used + 1);
+    if (copy == NULL) {
+        printf("module: out of memory\n");
+        return;
+    }
+    memcpy(copy, source_buffer, (size_t)used + 1);
+    memcpy(modules[module_count].name, name_copy, name_length + 1);
+    modules[module_count].source = copy;
+    module_count++;
+    printf("module: registered %s (%ld B)\n", name_copy, used);
+}
+
+static void run_source(WrenVM* vm, char* line, size_t line_limit,
+                       const char* module) {
+    long used = collect_source(line, line_limit);
+    int overflowed = used < 0;
+
+    printf("%s\n", RUN_BEGIN);
+    if (overflowed) {
+        printf("source too large for %d bytes\n", SOURCE_MAX);
+    } else {
+        // **Measured around every run, not just around benchmarks.** Upstream's
+        // benchmark files time themselves with `System.clock` and print their
+        // own `elapsed:` line, which is what makes their numbers comparable
+        // with published ones from other machines. What they cannot report is
+        // what the run cost this board, so the port adds it: wall time, the
+        // heap low-water mark, and the stack high-water mark.
+        size_t before = free_heap();
+        int64_t started = esp_timer_get_time();
+
+        WrenInterpretResult result = wrenInterpret(vm, module, source_buffer);
+
+        int64_t elapsed = esp_timer_get_time() - started;
+        size_t lowest = free_heap();
+
+        switch (result) {
+            case WREN_RESULT_SUCCESS: break;
+            case WREN_RESULT_COMPILE_ERROR: printf("[result] compile error\n"); break;
+            case WREN_RESULT_RUNTIME_ERROR: printf("[result] runtime error\n"); break;
+        }
+#ifdef HAVE_API_TESTS
+        // **Five of the `api/` tests are driven from C, not from Wren.**
+        // The `.wren` half defines a class and the C half calls into it with
+        // `wrenCall`; running only the script produces no output at all, which
+        // is why they failed with nothing printed even once the foreign methods
+        // bound. `APITest_Run` matches on the test name and is a no-op for
+        // every other module, so this is safe to call unconditionally.
+        if (result == WREN_RESULT_SUCCESS && strncmp(module, "./test/api/", 11) == 0) {
+            char with_extension[MODULE_NAME_MAX + 8];
+            snprintf(with_extension, sizeof(with_extension), "%s.wren", module);
+            APITest_Run(vm, with_extension);
+        }
+#endif
+        printf("[cost] %lld us  heap %u B  stack %u B\n",
+               (long long)elapsed,
+               (unsigned)(before > lowest ? before - lowest : 0),
+               (unsigned)stack_used());
+    }
+    printf("%s\n", RUN_END);
+}
+
+// ---------------------------------------------------------------------------
 // The console.
 // ---------------------------------------------------------------------------
 
@@ -190,7 +467,16 @@ static void print_banner(void) {
     printf("wren:  %s (upstream, unmodified)\n", WREN_VERSION_STRING);
     printf("idf:   %s\n", esp_get_idf_version());
     printf("heap:  %u B free at boot\n", (unsigned)free_heap());
+    // **The harness's own static cost, stated so it can be subtracted.** The
+    // source and line buffers exist to carry the test suite over a serial line;
+    // they are not Wren's and should not be charged to it when the Rust
+    // implementation is compared against these numbers.
+    printf("host:  %u B of that is this console's buffers\n",
+           (unsigned)(SOURCE_MAX + LINE_MAX));
     printf("type wren source and press enter, or:\n");
+    printf("  .run ... .end run a whole file\n");
+    printf("  .module <name> ... .end  register a module for import\n");
+    printf("  .modules      forget every registered module\n");
     printf("  .bench        run every benchmark\n");
     printf("  .mem          report free heap\n");
     printf("  .stack        report stack high-water mark\n");
@@ -210,17 +496,17 @@ static int read_line(char* buffer, size_t limit) {
             continue;
         }
         if (c == '\r' || c == '\n') {
-            fputc('\n', stdout);
+            if (echo_enabled) fputc('\n', stdout);
             buffer[length] = '\0';
             return (int)length;
         }
         if ((c == 0x7f || c == '\b') && length > 0) {
             length--;
-            fputs("\b \b", stdout);
+            if (echo_enabled) fputs("\b \b", stdout);
             continue;
         }
         buffer[length++] = (char)c;
-        fputc(c, stdout);
+        if (echo_enabled) fputc(c, stdout);
     }
     buffer[length] = '\0';
     return (int)length;
@@ -236,15 +522,19 @@ static int read_line(char* buffer, size_t limit) {
 // to beat, and it cannot be beaten if it was never measured.
 #define WREN_TASK_STACK 65536
 
-static void report_stack(void) {
-    // `uxTaskGetStackHighWaterMark` returns the *minimum free* the task has
-    // ever had, in words on this port. The used figure is what is left over.
+// `uxTaskGetStackHighWaterMark` returns the *minimum free* the task has ever
+// had, in words on this port. What was used is the rest.
+static size_t stack_used(void) {
     UBaseType_t free_words = uxTaskGetStackHighWaterMark(NULL);
-    size_t free_bytes = (size_t)free_words * sizeof(StackType_t);
+    return WREN_TASK_STACK - (size_t)free_words * sizeof(StackType_t);
+}
+
+static void report_stack(void) {
+    size_t used = stack_used();
     printf("stack: %u B of %u used, %u B never touched\n",
-           (unsigned)(WREN_TASK_STACK - free_bytes),
+           (unsigned)used,
            (unsigned)WREN_TASK_STACK,
-           (unsigned)free_bytes);
+           (unsigned)(WREN_TASK_STACK - used));
 }
 
 static void wren_task(void* arg) {
@@ -252,7 +542,16 @@ static void wren_task(void* arg) {
     // `\r\n` before a read returns, so collapsing them in the reader does
     // nothing -- the driver has to be told. The moisture project lost a day to
     // exactly this.
+    //
+    // **And the buffers, which default to 256 bytes each.** A test file arrives
+    // as a burst of a few kilobytes; at 256 bytes the driver drops the tail
+    // while the console is still reading character by character through the
+    // VFS. Measured: four of twenty expected lines survived at full speed,
+    // eleven at 5 ms per line, eighteen at 20 ms. That reads exactly like a
+    // Wren bug and is a buffer size.
     usb_serial_jtag_driver_config_t usb_config = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usb_config.rx_buffer_size = 4096;
+    usb_config.tx_buffer_size = 4096;
     usb_serial_jtag_driver_install(&usb_config);
     esp_vfs_usb_serial_jtag_use_driver();
     esp_vfs_dev_usb_serial_jtag_set_rx_line_endings(ESP_LINE_ENDINGS_LF);
@@ -286,6 +585,31 @@ static void wren_task(void* arg) {
             print_banner();
         } else if (strcmp(line, ".mem") == 0) {
             report_memory("now", 0);
+        } else if (strncmp(line, ".run", 4) == 0) {
+            // **A fresh VM per test**, as upstream's runner gives each file its
+            // own process: a test that defines a class must not collide with the
+            // next one, and a test that corrupts the VM must not poison the run.
+            // **The module name is copied before the buffer is reused**, for
+            // the same reason `.module` copies its name: `collect_source` reads
+            // into `line`, and a pointer into it would be reading the program's
+            // own text by the time it was used.
+            char module[MODULE_NAME_MAX] = "main";
+            if (line[4] == ' ' && line[5] != '\0') {
+                size_t length = strlen(line + 5);
+                if (length >= MODULE_NAME_MAX) length = MODULE_NAME_MAX - 1;
+                memcpy(module, line + 5, length);
+                module[length] = '\0';
+            }
+            wrenFreeVM(vm);
+            WrenConfiguration fresh;
+            configure(&fresh);
+            vm = wrenNewVM(&fresh);
+            run_source(vm, line, sizeof(line), module);
+        } else if (strncmp(line, ".module ", 8) == 0) {
+            register_module(line + 8, line, sizeof(line));
+        } else if (strcmp(line, ".modules") == 0) {
+            modules_clear();
+            printf("module: registry cleared\n");
         } else if (strcmp(line, ".stack") == 0) {
             report_stack();
         } else if (strcmp(line, ".bench") == 0) {

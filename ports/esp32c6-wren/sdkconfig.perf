@@ -1,0 +1,11 @@
+# The speed-optimised build: `-O2`.
+#
+# **Answers a different question**: not "does this fit" but "how fast can this
+# interpreter go on this part". Reported separately from the size build rather
+# than instead of it, because the two trade against each other and quoting one
+# as the answer hides the trade.
+#
+# Note what it cannot change: the C6 is RV32IMAC with no hardware floating
+# point, and Wren's single numeric type makes every number a double. No `-O`
+# level fixes soft float.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
