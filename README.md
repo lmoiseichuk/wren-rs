@@ -142,32 +142,72 @@ a reason that has nothing to do with the VM. The four benchmark programs do not
 use those methods — they are loops, field access, arithmetic and dispatch — so
 the published comparison is unaffected; a different benchmark might not be.
 
-### Step 3 measured: fast to write, slow to run
+### Step 3 measured
 
-On the same ESP32-C6, running the same four programs — full table and caveats
-in **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
+All three implementations on the same ESP32-C6FH4 @ 160 MHz, running the same
+four programs from `benchmarks/wren` with identical constants. Method and
+caveats: **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
 
-| | wren-rs | C Wren `-O2` | |
+**Speed** — each program's own `System.clock` figure, in seconds:
+
+| benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython |
+|---|---|---|---|---|---|
+| `binary_trees` depth 9 | 8.616 | 17.087 | **2.160** | 2.440 | 4.729 |
+| `fib(24)` x5 | 18.176 | 34.921 | **3.250** | 3.710 | 7.109 |
+| `list_build` 10,000 | 0.574 | 1.028 | **0.130** | 0.150 | 0.154 |
+| `method_call` | 2.766 | 4.810 | **0.350** | 0.420 | 1.748 |
+
+**Memory** — VM resident before any user code, and heap consumed per program
+(free before minus free after, no forced collection, measured the same way on
+both):
+
+| | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| `fib(24)` x5 | 18.176 s | 3.250 s | **5.6x slower** |
-| `binary_trees` depth 9 | 8.616 s | 2.160 s | **4.0x slower** |
-| `method_call` | 2.766 s | 0.350 s | **7.9x slower** |
-| `list_build` 10,000 | 0.574 s | 0.130 s | **4.4x slower** |
-| **VM resident** | **45,676 B** | 83,036 B | **45% smaller** |
+| **VM resident** | **45,676 B** | 83,036 B | — |
+| free to a program | ~282,000 B | ~227,000 B | 333,344 B |
+| `binary_trees` | 160,244 B | 78,812 B | 76,512 B |
+| `fib` | **4,120 B** | 6,612 B | 800 B |
+| `list_build` | **132,412 B** | 134,712 B | 65,440 B |
+| `method_call` | **9,800 B** | 15,080 B | 1,616 B |
 
-**The VM is far smaller and the interpreter is far slower**, and the second
-half of that was not what the design predicted. `doc/wren-rs/design.md` put the
+**Footprint** — and these do *not* compare across implementations, because the
+platforms differ: the C port is an ESP-IDF application carrying FreeRTOS and
+newlib, wren-rs is bare metal carrying neither, and MicroPython is a stock
+build with networking and TLS in it.
+
+| | `size` | `speed` |
+|---|---|---|
+| wren-rs full image | 273,376 B | 428,144 B |
+| the same firmware with no VM | 111,728 B | 113,472 B |
+| **wren-rs VM contribution** | **161,648 B** | **314,672 B** |
+| C Wren full ESP-IDF image | 272,736 B | 301,888 B |
+| MicroPython full image | 1,902,128 B | — |
+
+#### What these say
+
+**The VM is 45% smaller resident and four to eight times slower.** Both halves
+are the same design, and only one of them was predicted.
+
+The memory result is what compiling no core library at start-up buys: upstream
+builds `wren_core.wren` every time a VM is created, and this does not. 45,676 B
+against 83,036 B is the figure that decides whether a part is usable at all.
+
+The speed result contradicts this repository's own design note, which put the
 cost of reaching objects by index rather than by pointer at "single-digit to
-low-double-digit percent"; it is 4–8x. The note has been corrected and says why
-the estimate was wrong: a method call traverses six references, not one, and
-each is a bounds check where upstream follows a pointer.
+low-double-digit percent". It is 4–8x, worst on `method_call`, which is almost
+pure dispatch. [`doc/wren-rs/design.md`](doc/wren-rs/design.md) is corrected and
+says why the estimate was wrong: it was reasoned about as one bounds check per
+field access, and a single method call traverses six references — receiver to
+class, class through its box, class to method table, method to closure, closure
+to function, function to chunk. Upstream follows a pointer at each.
 
-The memory result is the other side of the same design. 45,676 B resident
-against 83,036 B is what compiling no core library at start-up buys — upstream
-builds `wren_core.wren` every time a VM is created.
+`binary_trees` is the one memory row that loses, and for a known reason: every
+object here occupies 24 bytes before its contents, the size of the largest
+variant of one enum, where upstream allocates each type at its own size. A tree
+of instances is exactly the workload that pays for it.
 
-Nothing here is tuned. It is the first run, published because a result that
-contradicts the design is worth more than a flattering one.
+Nothing here is tuned. It is the first run on hardware, published because a
+result that contradicts the design is worth more than a flattering one.
 
 ### Steps 1 and 2: the numbers to beat
 
