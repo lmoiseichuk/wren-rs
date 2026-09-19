@@ -173,9 +173,7 @@ fn one(path: &Path, root: &str) -> Option<Outcome> {
         return None;
     }
 
-    let is_error_test = source.contains("// expect runtime error:")
-        || source.contains("Error at")
-        || source.contains("// expect error");
+    let is_error_test = is_error_test(&source);
 
     // **A panic in the VM is a failure, not the end of the run.** A bad
     // program must not take the harness down with it, and the file that did it
@@ -220,16 +218,18 @@ fn group_of(path: &Path, root: &str) -> String {
 /// Run one file and decide whether it did what its comments say it should.
 fn check(source: &str, directory: &Path) -> Result<(), String> {
     let mut expected = Vec::new();
-    let mut expects_error = false;
 
     for line in source.lines() {
         if let Some(at) = line.find("// expect: ") {
             expected.push(line[at + 11..].to_string());
         }
-        if line.contains("// expect runtime error:") || line.contains("Error at") {
-            expects_error = true;
-        }
     }
+
+    // **The same three markers `one` classifies with.** They disagreed before:
+    // this function tested two of them, so a file marked only `// expect error`
+    // was scored as an output test expecting no lines, and every one of them
+    // was counted a failure for raising the error it asked for.
+    let expects_error = is_error_test(source);
 
     let mut vm = wren::Vm::new();
 
@@ -271,6 +271,13 @@ fn check(source: &str, directory: &Path) -> Result<(), String> {
             }
         }
     }
+}
+
+/// Does this file expect to fail?
+fn is_error_test(source: &str) -> bool {
+    source.contains("// expect runtime error:")
+        || source.contains("Error at")
+        || source.contains("// expect error")
 }
 
 /// Collapse a message to something worth counting.

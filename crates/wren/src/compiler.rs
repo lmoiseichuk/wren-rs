@@ -66,15 +66,25 @@ enum Precedence {
     Conditional, // ?:
     LogicalOr,   // ||
     LogicalAnd, // &&
-    Equality,   // == !=
-    Is,         // is
-    Comparison, // < > <= >=
-    Range,      // .. ...
+    Equality,     // == !=
+    Is,           // is
+    Comparison,   // < > <= >=
+    BitwiseOr,    // |
+    BitwiseXor,   // ^
+    BitwiseAnd,   // &
+    BitwiseShift, // << >>
+    Range,        // .. ...
     Term,       // + -
     Factor,     // * / %
     Unary,      // - !
     Call,       // . ( [
 }
+
+/// How many locals one function may have, matching upstream's `MAX_LOCALS`.
+///
+/// Set by the bytecode rather than by taste: `LoadLocal` takes a `u8`, so slot
+/// 255 is the last one addressable.
+const MAX_LOCALS: usize = 256;
 
 /// A local variable: its name, and the scope it belongs to.
 struct Local {
@@ -378,8 +388,14 @@ impl<'a> Compiler<'a> {
     /// which is how the loop-discard and scope-end bugs presented. The
     /// disassembler in `bytecode.rs` exists for exactly this class of fault.
     fn add_local(&mut self, name: &str) -> Result<usize, CompileError> {
-        if self.state().locals.len() >= u8::MAX as usize {
-            return Err(self.error_at(self.previous, "Too many local variables in scope."));
+        // 256, upstream's `MAX_LOCALS`, which is what a `u8` slot index can
+        // address. The receiver occupies slot zero, so a function body really
+        // gets 255 of its own -- upstream counts the same way.
+        if self.state().locals.len() >= MAX_LOCALS {
+            return Err(self.error_at(
+                self.previous,
+                "Cannot declare more than 256 variables in one scope.",
+            ));
         }
         let depth = self.state().scope_depth;
         self.state_mut()
@@ -840,6 +856,10 @@ impl<'a> Compiler<'a> {
                 self.parse_precedence(Precedence::Unary)?;
                 self.emit_call("!", 0, line)
             }
+            TokenKind::Tilde => {
+                self.parse_precedence(Precedence::Unary)?;
+                self.emit_call("~", 0, line)
+            }
             _ => Err(self.error_at(token, "Expected expression.")),
         }
     }
@@ -882,6 +902,11 @@ impl<'a> Compiler<'a> {
             TokenKind::EqEq => "==",
             TokenKind::BangEq => "!=",
             TokenKind::Is => "is",
+            TokenKind::Pipe => "|",
+            TokenKind::Caret => "^",
+            TokenKind::Amp => "&",
+            TokenKind::LtLt => "<<",
+            TokenKind::GtGt => ">>",
             TokenKind::DotDot => "..",
             TokenKind::DotDotDot => "...",
             _ => return Err(self.error_at(token, "Expected operator.")),
@@ -955,8 +980,24 @@ impl<'a> Compiler<'a> {
 
     fn subscript(&mut self) -> Result<(), CompileError> {
         let line = self.line();
+
+        // **A subscript can take more than one argument.** `grid[x, y]` is the
+        // method `[_,_]`, which is how a two-dimensional container is written
+        // in Wren -- there is no separate syntax for it.
+        let mut arity = 0;
         self.skip_newlines()?;
-        self.expression()?;
+        loop {
+            self.skip_newlines()?;
+            self.expression()?;
+            arity += 1;
+            if arity > 16 {
+                return Err(self.error_at(self.current, "Cannot pass more than 16 arguments."));
+            }
+            self.skip_newlines()?;
+            if !self.match_token(TokenKind::Comma)? {
+                break;
+            }
+        }
         self.skip_newlines()?;
         self.consume(TokenKind::RightBracket, "Expect ']' after subscript.")?;
 
@@ -964,9 +1005,9 @@ impl<'a> Compiler<'a> {
             self.advance()?;
             self.skip_newlines()?;
             self.expression()?;
-            return self.emit_call("[_]=(_)", 2, line);
+            return self.emit_call(&subscript_signature(arity, true), arity + 1, line);
         }
-        self.emit_call("[_]", 1, line)
+        self.emit_call(&subscript_signature(arity, false), arity, line)
     }
 
     fn argument_list(&mut self) -> Result<usize, CompileError> {
@@ -1794,6 +1835,10 @@ fn infix_precedence(kind: TokenKind) -> Precedence {
         TokenKind::EqEq | TokenKind::BangEq => Precedence::Equality,
         TokenKind::Is => Precedence::Is,
         TokenKind::Lt | TokenKind::Gt | TokenKind::LtEq | TokenKind::GtEq => Precedence::Comparison,
+        TokenKind::Pipe => Precedence::BitwiseOr,
+        TokenKind::Caret => Precedence::BitwiseXor,
+        TokenKind::Amp => Precedence::BitwiseAnd,
+        TokenKind::LtLt | TokenKind::GtGt => Precedence::BitwiseShift,
         TokenKind::DotDot | TokenKind::DotDotDot => Precedence::Range,
         TokenKind::Plus | TokenKind::Minus => Precedence::Term,
         TokenKind::Star | TokenKind::Slash | TokenKind::Percent => Precedence::Factor,
@@ -1813,7 +1858,11 @@ fn tighter(precedence: Precedence) -> Precedence {
         Precedence::LogicalAnd => Precedence::Equality,
         Precedence::Equality => Precedence::Is,
         Precedence::Is => Precedence::Comparison,
-        Precedence::Comparison => Precedence::Range,
+        Precedence::Comparison => Precedence::BitwiseOr,
+        Precedence::BitwiseOr => Precedence::BitwiseXor,
+        Precedence::BitwiseXor => Precedence::BitwiseAnd,
+        Precedence::BitwiseAnd => Precedence::BitwiseShift,
+        Precedence::BitwiseShift => Precedence::Range,
         Precedence::Range => Precedence::Term,
         Precedence::Term => Precedence::Factor,
         Precedence::Factor => Precedence::Unary,
