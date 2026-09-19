@@ -66,10 +66,10 @@ identical constants on every implementation. Method and caveats:
 
 | benchmark | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| `binary_trees` depth 9 | 8.558 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 15.611 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.541 s | **0.130 s** | 0.154 s |
-| `method_call` | 2.294 s | **0.350 s** | 1.748 s |
+| `binary_trees` depth 9 | 7.851 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 13.843 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.494 s | **0.130 s** | 0.154 s |
+| `method_call` | 2.021 s | **0.350 s** | 1.748 s |
 | **VM resident** | **22,920 B** | 83,036 B | — |
 
 **Four to seven times slower than C, and 72% smaller resident.** The speed is
@@ -79,9 +79,9 @@ compiling no core library at start-up buys.
 
 **Judged by work, not only by time.** The chip's performance counter reports
 instructions retired, which does not move when the code moves — so a change
-that removes work can be told from one that merely landed better. This VM runs
-**112 machine instructions per bytecode instruction**; C Wren is near seventeen,
-and that ratio is the gap stated as work.
+that removes work can be told from one that merely landed better. Every change
+here is decided that way, and three that looked obviously right were thrown out
+because the work went up.
 
 **Read the seconds to about two percent.** The board is exact -- the same image gives
 the same time to the microsecond, three flashes running -- but *where the

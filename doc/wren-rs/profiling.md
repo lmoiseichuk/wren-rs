@@ -415,6 +415,57 @@ to see whether it touched dispatch or only one arm.
 
 ---
 
+## Where the work is now
+
+After the day's changes -- the collection check behind a boolean, the chunk
+moved rather than cloned, the upvalue early-out and five fused opcode pairs --
+the shape has changed enough to be worth restating.
+
+| | bytecode ops | instructions retired | per opcode |
+|---|---|---|---|
+| `method_call` | 1,000,051 | 122,933,098 | 122.9 |
+| `fib` | 6,377,116 | 815,452,532 | 127.9 |
+
+**Per opcode went up, and that is the fusion working**: what it removed were
+the cheap instructions, so what remains is denser. Total work fell on every
+benchmark. The per-opcode figure is only comparable between builds that fuse
+the same pairs.
+
+`Call` is now **26% of `method_call`'s instructions and 41% of `fib`'s**, and
+the price list says a primitive call is ~199 machine instructions and a closure
+call with its return ~410 -- unchanged by anything so far, because nothing so
+far has touched them.
+
+**And the cost inside a call is the lookup, not the work.** Sampling `fib`,
+which is 41% `Call`:
+
+| samples of 60 | |
+|---|---|
+| 27 | `run_frames` (dispatch) |
+| **7** | **`Vm::find_method`** |
+| 6 | `Chunk::read_short` |
+| 4 | `Vec<Value>::push` |
+| **3** | **`Vm::class_of`** |
+| 3 | `Vec<Frame>::push` |
+| 2 | `Vm::call_target` |
+| **2** | the `+` primitive itself |
+
+The arithmetic is two samples. Finding out *which* `+` to run is ten. That is
+what `find_method` costs: `heap.class(id)` is a table slot holding a `Box`,
+the `Box` holds the `ObjClass`, the `ObjClass` holds a `Vec` of method entries,
+and the entry is a fourth load -- four dependent loads before anything happens,
+and a dependent load is what an in-order core cannot hide.
+
+**So the next thing to try is a method cache**: a small direct-mapped table
+from `(class, symbol)` to the decoded entry, invalidated when a method is
+bound, which is rare. One load and a compare against four dependent loads.
+
+The pairs left to fuse are diffuse -- the largest is `Call -> Call` in `fib` at
+11.8%, and fusing across a call is not something a pass can do -- so a second
+round of fusion is worth much less than the first.
+
+---
+
 ## Which benchmark to optimise against, and in what order
 
 The four are not interchangeable, and two of them answer questions the others
