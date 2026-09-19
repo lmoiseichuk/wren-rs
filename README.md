@@ -77,6 +77,16 @@ the honest cost of reaching objects by a bounds-checked index rather than a
 pointer, which is what lets the crate forbid `unsafe`; the memory is what
 compiling no core library at start-up buys.
 
+**Read these to about two percent.** The board is exact -- the same image gives
+the same time to the microsecond, three flashes running -- but *where the
+instructions land* is worth more than that: padding every branch target to eight
+bytes, with the source untouched, takes `fib` from 16.774 s to 16.127. So a
+small difference between two builds is a fact about placement until it has been
+measured at several placements, and consistency across all four benchmarks is
+not the check it looks like. The experiment, and the mirror one showing that
+moving the *data* changes nothing at all, is in
+**[`doc/wren-rs/design.md`](doc/wren-rs/design.md)**.
+
 ### `f32` against `f64`
 
 `Num` is a double in Wren, and `--features f32` makes it a single. Same board,

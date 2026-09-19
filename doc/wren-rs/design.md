@@ -14,6 +14,57 @@ This one is **24,680 B resident** on the same part, measured the same way — 70
 under upstream. Most of that gap is two decisions argued below: compiling no
 core library at start-up, and an object that carries no header.
 
+## What a measurement on this board is worth
+
+Every number in this document is the C6's, because a workstation says nothing
+useful about an in-order core -- an out-of-order one hides a dependent load that
+this part pays for in full. It turned out the board needs a control of its own.
+
+**There is no run-to-run noise to average away.** Three flashes of the same
+image gave `binary_trees` 9.006731 s, 9.006731 s and 9.006731 s -- identical to
+the microsecond, not to three decimals. One run is the measurement, and a
+difference between two runs of the same image is not a thing that happens.
+
+**What moves instead is where the instructions land.** Adding one field to
+`Heap` moved `fib` by 1.8% -- and `fib` allocates four kilobytes in total,
+compacts nothing, and cannot be touched by a change to the collector at all.
+All four benchmarks moved by about that much in the same direction, which is the
+signature of the instruction stream shifting under the fetch rather than of work
+being removed.
+
+Shown directly, by changing *only* placement:
+`-Cllvm-args=-align-all-nofallthru-blocks=N` pads every branch target to a
+2^N-byte boundary and does nothing else to the program.
+
+| branch targets padded to | `binary_trees` | `fib` | `list_build` | `method_call` | image |
+|---|---|---|---|---|---|
+| nothing *(as published)* | 9.007 s | 16.774 s | 0.5659 s | 2.4788 s | 800,664 B |
+| 8 B | 8.737 s | **16.127 s** | 0.5445 s | **2.3820 s** | 817,164 B |
+| 16 B | **8.725 s** | 16.137 s | 0.5446 s | 2.3837 s | 846,172 B |
+| 32 B | 8.751 s | 16.174 s | **0.5445 s** | 2.3901 s | 891,936 B |
+
+**It is the code's placement, not the data's.** The mirror experiment leaks a
+fixed number of bytes before the VM is built, so every allocation the VM makes
+moves by that much while its code stays exactly where it was. A verified
+64-byte shift -- the next allocation really does move from `0x408013a0` to
+`0x408013e0` -- changed `binary_trees` by 0.009% and `fib` by 0.0002%. That is
+what the part's memory map predicts: instructions are fetched from flash through
+a cache, and data sits in SRAM with nothing in front of it, so data has no
+alignment to get wrong.
+
+*The first version of that experiment measured nothing, because the optimiser
+deleted a leaked allocation whose result nothing read -- both shifts reported
+the same address. A control needs its own control.*
+
+**What this costs the method.** A source change that alters the size of
+anything in the interpreter moves everything after it, and that alone is worth a
+couple of percent in either direction. So a one-or-two-percent difference
+between two builds is not evidence about the change -- and *consistency across
+all four benchmarks is not evidence either*, because that is exactly what
+placement produces. Anything in that range has to be measured at several
+paddings, which holds placement roughly still while the source varies, or left
+unclaimed.
+
 ## Value: NaN tagging, as upstream, in safe Rust
 
 A `Value` is 8 bytes: an `f64` whose NaN payload carries everything that is not
