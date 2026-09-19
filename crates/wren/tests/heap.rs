@@ -312,3 +312,63 @@ fn a_nonsense_growth_factor_cannot_collect_forever() {
     heap.set_growth(3, 0);
     assert!(heap.growth().1 >= 1, "denominator never zero");
 }
+
+#[test]
+fn a_ceiling_bounds_garbage_by_a_constant_not_a_ratio() {
+    // The property a fixed heap wants: peak is the live set plus a number the
+    // firmware chose, whatever the live set turns out to be. The ratio gives
+    // an allowance that grows with the workload, which is the wrong shape when
+    // the total does not.
+    let mut ratio = Heap::new();
+    let mut ceiling = Heap::new();
+    ceiling.set_headroom(Some(1024));
+
+    for heap in [&mut ratio, &mut ceiling] {
+        let mut kept = Vec::new();
+        for index in 0..512 {
+            kept.push(Value::object(heap.allocate(Object::String(
+                ObjString::from_text(&format!("string number {index} with some length to it")),
+            ))));
+        }
+        heap.collect(kept.iter().copied());
+    }
+
+    assert_eq!(
+        ratio.bytes(),
+        ceiling.bytes(),
+        "same objects, same live bytes"
+    );
+    assert_eq!(
+        ceiling.threshold(),
+        ceiling.bytes() + 1024,
+        "a ceiling is the live set plus exactly what was asked for"
+    );
+    assert!(
+        ratio.threshold() > ceiling.threshold(),
+        "1.5x of this live set should be further away than 1 KB: {} vs {}",
+        ratio.threshold(),
+        ceiling.threshold()
+    );
+}
+
+#[test]
+fn a_small_ceiling_is_not_swallowed_by_the_initial_threshold() {
+    // `INITIAL_THRESHOLD` is 4 KB, which is half a CH32V006's whole RAM. It
+    // exists so a program with three objects does not collect immediately, and
+    // it must not quietly override a caller who asked for less.
+    let mut heap = Heap::new();
+    heap.set_headroom(Some(1024));
+    heap.collect([]);
+    assert_eq!(heap.threshold(), 1024, "an empty heap plus a 1 KB ceiling");
+}
+
+#[test]
+fn a_nonsense_ceiling_cannot_collect_forever() {
+    // Zero would mean collecting after every allocation, freeing nothing and
+    // collecting again.
+    let mut heap = Heap::new();
+    heap.set_headroom(Some(0));
+    assert!(heap.headroom().is_some_and(|bytes| bytes > 0));
+    heap.set_headroom(None);
+    assert_eq!(heap.headroom(), None);
+}

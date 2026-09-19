@@ -13,24 +13,111 @@ trivial: it is the smallest interesting target rather than a toy.
 
 **A pure-Rust `cargo add` VM for small RISC-V and Xtensa parts.** No C build
 step, no submodule, no `build.rs` compiling somebody else's tree — a `no_std`
-crate that a firmware pulls in the way it pulls in any other. That is the
-deliverable; everything below is how it gets there and how it gets checked.
+crate that a firmware pulls in the way it pulls in any other.
 
-The parts in view, smallest first, because the smallest is what decides the
-design:
+It is complete: **829 of 829** of upstream's own tests pass, from source and
+through a bytecode round-trip, with no `unsafe` anywhere in the crate.
+
+## Where it fits
 
 | part | flash | RAM | verdict |
 |---|---|---|---|
-| CH32V006 | 62 KB | 8 KB | the hard limit — an interpreter here is a stretch and may not land |
-| CH32X035 | 62 KB | 20 KB | plausible with a tuned heap |
+| CH32V003 | 16 KB | 2 KB | no |
+| CH32V006 | 62 KB | 8 KB | **µwren only** — see below |
+| CH32X035 | 62 KB | 20 KB | **µwren only** — see below |
 | ESP32-C3 | 4 MB | 400 KB | comfortable |
 | ESP32-C6 | 4 MB | 512 KB | the development board, comfortable |
 
-8 KB of RAM is the number that shapes everything. A Wren `Obj` header, a value
-representation, a call frame and a GC all have to fit inside it with a user
-program still running, and the honest answer may be that the smallest parts get
-a subset rather than the language. Deciding that from measurement rather than
-from optimism is part of the work.
+**The measured floor is 22,920 B resident**, before a line of user code runs
+and with the compiler left out of the image entirely. That fits an ESP32 with
+room to spare and does not fit a CH32V006 at all.
+
+### µwren
+
+The gap on the small parts is not another feature flag. Dropping the compiler,
+the transcendentals and 64-bit numbers is already possible and already counted
+in that 22,920 B — what is left is **the core library itself**: the classes,
+their method tables and the primitives behind them are most of the figure.
+
+A part with 8 KB wants a deliberately reduced language — a subset of the core
+library, built with the linker discarding everything unreachable — and that is
+a separate deliverable from this one. It is named here rather than measured,
+because nothing has been measured about it yet.
+
+What *does* transfer to a small part today, because it was built for one:
+
+- **Bytecode, so nothing compiles on the device.** The compiler is 34,480 B at
+  `-Os` and a `.wrenc` carries a SHA-256 of the source it came from.
+- **32-bit numbers**, `--features f32`: 17–20 KB smaller, 6–13% faster, and a
+  fifth to a half off the heap. Not Wren — an `f32` is exact on integers only
+  to 2^24 — so it is off by default.
+- **A ceiling on garbage**, `Heap::set_headroom`: peak memory becomes *the live
+  set plus a constant you choose*. **On a part holding few objects it is free**
+  — `method_call` runs identically from a 32 KB ceiling down to 1 KB — because
+  a collection costs the live set, and a small part has a small one.
+
+## The numbers
+
+ESP32-C6FH4 at 160 MHz, `-O3`, the four programs in `benchmarks/wren` with
+identical constants on every implementation. Method and caveats:
+**[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
+
+### Against C and MicroPython
+
+| benchmark | wren-rs | C Wren `-O2` | MicroPython |
+|---|---|---|---|
+| `binary_trees` depth 9 | 9.104 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 16.966 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.579 s | **0.130 s** | 0.154 s |
+| `method_call` | 2.519 s | **0.350 s** | 1.748 s |
+| **VM resident** | **22,920 B** | 83,036 B | — |
+
+**Four to seven times slower than C, and 72% smaller resident.** The speed is
+the honest cost of reaching objects by a bounds-checked index rather than a
+pointer, which is what lets the crate forbid `unsafe`; the memory is what
+compiling no core library at start-up buys.
+
+### `f32` against `f64`
+
+`Num` is a double in Wren, and `--features f32` makes it a single. Same board,
+same commit, same programs:
+
+| | `f64` | `f32` | |
+|---|---|---|---|
+| `binary_trees` | 9.104 s | **8.207 s** | −9.9% |
+| `fib` | 16.966 s | **15.905 s** | −6.3% |
+| `list_build` | 0.579 s | **0.525 s** | −9.3% |
+| `method_call` | 2.519 s | **2.420 s** | −3.9% |
+| `binary_trees` peak | 117,384 B | **94,524 B** | −19.5% |
+| `list_build` peak | 132,844 B | **67,208 B** | −49.4% |
+| VM resident | 22,920 B | **22,632 B** | −1.3% |
+| image | 465,456 B | **447,280 B** | −3.9% |
+
+Faster *and* smaller, because `riscv32imac` has neither the `F` nor the `D`
+extension — both widths are software and the narrower one is less work. A
+`Value` halves to four bytes, which is why `list_build`, whose whole memory is
+a list of numbers, halves with it.
+
+**It is not Wren, and the cost is exact rather than vague.** An `f32` is exact
+on integers only to 2^24, so `list_build` — which sums to 49,995,000 — prints
+**49,992,896**, and upstream's suite goes from 829 of 829 to **798**. Off by
+default; conformance and every other table here are `f64`.
+
+### Memory, from the first run on hardware
+
+| | `binary_trees` peak | VM resident |
+|---|---|---|
+| first hardware run | 160,244 B | 45,676 B |
+| packed method tables, `Vec` slack returned | 158,124 B | 24,680 B |
+| one table per type | 133,888 B | 22,920 B |
+| instance fields in chunks | **117,384 B** | 22,920 B |
+| …and a 16 KB ceiling on garbage | **109,004 B** | 22,920 B |
+| …and `f32` | **94,524 B** | 22,632 B |
+
+**A third off the peak and a half off resident**, every step chosen by the heap
+profiler. The two steps that were *guessed* at — reference counting and a young
+generation — are the two that are switched off:
+**[`doc/wren-rs/memory.md`](doc/wren-rs/memory.md)**.
 
 ## The plan
 
@@ -148,149 +235,57 @@ a reason that has nothing to do with the VM. The four benchmark programs do not
 use those methods — they are loops, field access, arithmetic and dispatch — so
 the published comparison is unaffected; a different benchmark might not be.
 
-### Step 3 measured
+### What the measurements changed
 
-All three implementations on the same ESP32-C6FH4 @ 160 MHz, running the same
-four programs from `benchmarks/wren` with identical constants. Method and
-caveats: **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
+Four findings, each of which overturned something this repository had written
+down. They are the reason the two documents below are worth reading rather than
+skimming.
 
-**Speed** — each program's own `System.clock` figure, in seconds:
+**The design note's central estimate was wrong by an order of magnitude.** It
+put the cost of reaching objects by a bounds-checked index rather than a
+pointer at "single-digit to low-double-digit percent". The first run on
+hardware said **four to eight times**. The note had reasoned about one bounds
+check per field access; a single method call traversed *ten* heap lookups, and
+six of them were asking for the same two objects over and over.
+→ [`design.md`](doc/wren-rs/design.md)
 
-| benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython |
-|---|---|---|---|---|---|
-| `binary_trees` depth 9 | 9.104 | 15.371 | **2.160** | 2.440 | 4.729 |
-| `fib(24)` x5 | 16.966 | 33.669 | **3.250** | 3.710 | 7.109 |
-| `list_build` 10,000 | 0.579 | 1.028 | **0.130** | 0.150 | 0.154 |
-| `method_call` | 2.519 | 4.326 | **0.350** | 0.420 | 1.748 |
+**The host could not see any of the speed work.** Every dispatch change
+measured inside the noise on a workstation and 10–15% on the board. An
+out-of-order core hides a dependent load that an in-order RISC-V pays for in
+full — so a laptop cannot tell you whether an indirection matters.
+→ [`design.md`](doc/wren-rs/design.md)
 
-The first run on hardware was slower than this — `binary_trees` 8.616,
-`fib` 18.176, `list_build` 0.574, `method_call` 2.766 at `speed`. What moved
-them is in **[what optimisation was worth](#what-optimisation-was-worth)**
-below.
+**All the garbage is acyclic, and it did not help.** The heap profiler found
+that across 873 programs, **100%** of what dies could be reclaimed by a
+reference count, and **84%** of allocations die before the next collection.
+Both findings are real. Both suggested replacing mark-sweep. All three
+candidates were built, machine-verified and measured — and **none of them
+stayed**, because collection is only 16.9% of the one benchmark that allocates
+and every replacement costs work proportional to what the program *does*.
+→ [`memory.md`](doc/wren-rs/memory.md)
 
-**Memory** — VM resident before any user code, and heap consumed per program
-(free before minus free after, no forced collection, measured the same way on
-both):
+**The biggest thing on the heap was not the objects.** It was the method
+tables, then the allocator's own per-object headers. Neither had been suspected;
+both were found by counting. → [`memory.md`](doc/wren-rs/memory.md)
 
-| | wren-rs | C Wren `-O2` | MicroPython |
-|---|---|---|---|
-| **VM resident** | **22,920 B** | 83,036 B | — |
-| free to a program | ~305,000 B | ~227,000 B | 333,344 B |
-| `binary_trees` | 117,384 B | 78,812 B | 76,512 B |
-| `fib` | **4,172 B** | 6,612 B | 800 B |
-| `list_build` | 132,460 B | 134,712 B | 65,440 B |
-| `method_call` | **8,572 B** | 15,080 B | 1,616 B |
+The full tables — every benchmark at both optimisation levels, against C Wren
+and MicroPython, with the method and caveats — are in
+**[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
 
-**Footprint** — and these do *not* compare across implementations, because the
-platforms differ: the C port is an ESP-IDF application carrying FreeRTOS and
-newlib, wren-rs is bare metal carrying neither, and MicroPython is a stock
-build with networking and TLS in it.
+### Two documents
 
-| | `size` | `speed` |
-|---|---|---|
-| wren-rs full image | 278,144 B | 440,576 B |
-| the same firmware with no VM | 111,728 B | 113,472 B |
-| **wren-rs VM contribution** | **166,416 B** | **327,104 B** |
-| C Wren full ESP-IDF image | 272,736 B | 301,888 B |
-| MicroPython full image | 1,902,128 B | — |
+**[`doc/wren-rs/design.md`](doc/wren-rs/design.md)** — the decisions and what
+they cost. NaN tagging in safe Rust; why an object carries **no header at all**
+where upstream spends sixteen bytes; the measured size of every object type on
+a 32-bit part; what a 32-bit `Num` would buy and what it breaks.
 
-#### What these say
-
-**The VM is 72% smaller resident and three to seven times slower.** Both halves
-are the same design, and only one of them was predicted.
-
-The memory result is what compiling no core library at start-up buys: upstream
-builds `wren_core.wren` every time a VM is created, and this does not. 22,920 B
-against 83,036 B is the figure that decides whether a part is usable at all.
-
-The speed result contradicts this repository's own design note, which put the
-cost of reaching objects by index rather than by pointer at "single-digit to
-low-double-digit percent". It was 4–8x on the first run and is 4–7x after the
-work described below, worst on `method_call`, which is almost pure dispatch.
-[`doc/wren-rs/design.md`](doc/wren-rs/design.md) is corrected and says why the
-estimate was wrong: it was reasoned about as one bounds check per
-field access, and a single method call traverses six references — receiver to
-class, class through its box, class to method table, method to closure, closure
-to function, function to chunk. Upstream follows a pointer at each.
-
-`binary_trees` is the one memory row that loses, and for a known reason: every
-object here occupies 24 bytes before its contents, the size of the largest
-variant of one enum, where upstream allocates each type at its own size. A tree
-of instances is exactly the workload that pays for it.
-
-#### What optimisation was worth
-
-The first run on hardware was published untuned, because a result that
-contradicts the design is worth more than a flattering one. Acting on it since:
-
-| | first run | now |
-|---|---|---|
-| VM resident | 45,676 B | **22,920 B** |
-| `method_call` | 2.766 s | **2.519 s** |
-| `fib` | 18.176 s | **16.966 s** |
-| `binary_trees` | 8.616 s | **9.104 s** |
-| `binary_trees` heap | 160,244 B | **117,384 B** |
-| `method_call` heap | 9,800 B | **8,572 B** |
-
-Three changes, each measured on the board:
-
-**The six indirections were partly redundant.** Entering a call asked the heap
-for the same two objects three times over — once for the arity, once for the
-code, once for the module — and returning did the walk again for the caller's
-chunk. Field access fetched its offset through closure and function on every
-read and every write. Method lookup walked the superclass chain where upstream
-copies a parent's methods down at class creation. Four lookups per call now,
-where there were ten.
-
-**The method tables were the largest thing on the heap**, not the instances: a
-class's table is indexed by global method symbol, so it is as long as the
-highest symbol that class answers to and almost all of it is empty. Handing back
-the `Vec` slack and packing an entry from 8 bytes to 4 took VM resident from
-49,004 B to 24,680 B.
-
-**Every object was charged for the largest one.** A slot held an `Object`, and
-an enum is as large as its largest variant, so a `List` that needs twelve bytes
-was charged twenty-four. One table per type charges each what it costs, and it
-made the benchmarks marginally *faster* as well: the type now lives in the
-handle, so seven of `class_of`'s ten answers touch no memory at all.
-
-**The host measured none of the speed work.** Every one of those changes was
-inside the noise on a workstation, because an out-of-order core hides a
-dependent load that an in-order RISC-V pays for in full. The board is the only
-place a change like this can be judged.
-
-#### Three replacements for the collector, all measured, none kept
-
-The heap profiler said the garbage 873 programs produce is 100% acyclic and
-that 84% of allocations die before the next collection. Both findings are
-real, and both suggested replacing mark-sweep. So all three candidates were
-built, verified against the whole suite, and measured on the board —
-`binary_trees`, speed profile:
-
-| | time | peak |
-|---|---|---|
-| **tracing, as it stands** | **8.455 s** | 133,880 B |
-| tracing + a 16 KB garbage ceiling | 9.240 s | **121,624 B** |
-| deferred reference counting | 9.630 s | 126,056 B |
-| a young generation + that ceiling | 9.105 s | 176,736 B |
-
-**Nothing beats the collector already there on time, and the simplest change
-beats everything on memory.** The profile had said why in advance: collection
-is 16.9% of the one benchmark that allocates and 0.0–0.6% of the other three,
-so a replacement can win at most 17% of one program — while each of these adds
-work proportional to what the program *does* rather than to what the collector
-*costs*.
-
-Refcounting is behind `--features refcount` and a nursery behind
-`--features nursery`; both are correct — 829 of 829, with their write barriers
-machine-verified — and both are off. `Heap::set_headroom` is the one that
-stayed useful: it makes peak memory *the live set plus a constant* instead of
-half as much again as the live set, which is the shape a fixed heap wants.
-
-[`doc/wren-rs/design.md`](doc/wren-rs/design.md) carries the measurements and
-what each cost.
-[`doc/wren-rs/design.md`](doc/wren-rs/design.md) carries the measurements and
-what each would cost.
+**[`doc/wren-rs/memory.md`](doc/wren-rs/memory.md)** — where memory goes and
+what reclaims it. The heap census, which found the biggest item twice and was
+twice a surprise; instance fields in adaptive chunks; three replacements for
+mark-sweep built, verified and rejected, each with the number that justified it
+and how that number was misread; and the ceiling on garbage that **costs
+nothing at all on a part holding few objects**, which is the setting a CH32
+wants.
 
 ### Step 4 measured: shipping bytecode
 
@@ -304,39 +299,11 @@ tools/build-bytecode.sh           # rebuild every .wrenc
 tools/build-bytecode.sh --check   # verify each against its source
 ```
 
-**The suite passes 829 of 829 through the bytecode round-trip as well** — every
-test compiled, written, re-loaded into a fresh VM and run. That is the claim
-that matters before any number below: the two paths produce the same program.
+**The suite passes 829 of 829 through the round-trip as well** — every test
+compiled, written, re-loaded into a fresh VM and run. That is the claim that
+matters before any number: the two paths produce the same program.
 
-**Four builds, no compiler linked** — the configuration a device actually
-ships. Same board, same bytecode; the only differences are the optimiser and
-whether a number is a double or a single.
-
-| | `-Os` f64 | `-Os` f32 | `-O3` f64 | `-O3` f32 |
-|---|---|---|---|---|
-| `binary_trees` depth 9 | 14.172 s | 13.042 s | 7.882 s | **7.015 s** |
-| `fib(24)` x5 | 32.642 s | 29.739 s | 16.737 s | **14.638 s** |
-| `list_build` 10,000 | 0.992 s | 0.891 s | 0.570 s | **0.495 s** |
-| `method_call` | 4.183 s | 3.914 s | 2.382 s | **2.128 s** |
-| image | 244,416 B | **227,184 B** | 360,816 B | 341,056 B |
-| VM resident | 24,680 B | **23,880 B** | 24,680 B | **23,880 B** |
-| `binary_trees` heap | 155,676 B | **120,772 B** | 155,672 B | **120,772 B** |
-| `list_build` heap | 132,096 B | **66,508 B** | 132,096 B | **66,508 B** |
-| loading a program | 785–1,924 µs | 781–1,924 µs | 758–1,375 µs | 756–1,416 µs |
-
-**`f32` is 6–13% faster, 17–20 KB smaller, and takes a fifth to a half off the
-heap.** The part has neither the `F` nor the `D` extension, so both widths are
-software and the narrower one is simply less work; `list_build`'s heap halves
-because a list of 10,000 numbers is 10,000 `Value`s.
-
-**It is not Wren, and the cost is exact rather than vague.** An `f32` holds
-integers exactly only to 2^24, so `list_build` — which sums to 49,995,000 —
-prints **49,992,896**. Upstream's suite goes from 829 of 829 to 798, every
-failure a precision one. The feature is off by default and conformance runs and
-every other table here are `f64`.
-
-**The compiler is a flat cost on top of any of these**, which is why it is out
-of the table rather than in it. One package built twice, with and without
+**What the compiler is worth**, from one package built twice with and without
 `wren/compiler`:
 
 | | `-Os` | `-O3` |
@@ -345,40 +312,21 @@ of the table rather than in it. One package built twice, with and without
 | `f32` bytecode / with compiler | 227,712 B / 262,256 B | 343,776 B / 425,104 B |
 | **the compiler** | **~34,500 B** | **~81,200 B** |
 
-It barely moves with the number width — 34,480 B against 34,544 B — because a
+It barely moves with the number width — 34,480 B against 34,544 — because a
 lexer and a parser do not care how wide a double is.
 
-#### A node, not a harness
+Loading a program takes 756–1,924 µs where compiling it takes 25–35 ms. That is
+6.5× and it barely matters against a program that then runs for seconds — and
+it is the dominant number on the duty cycle these parts are bought for, where a
+node wakes, samples and sleeps.
 
-`ports/esp32c6-wren-boot` is the shape a device would actually take: at
-start-up it looks for a program called `boot`, runs it, then looks for `main`
-and runs that — MicroPython's convention, and a missing name is skipped rather
-than faulted. It is **one package built twice**, so the only difference between
-the two images is whether `wren/compiler` is on.
+**What bytecode costs is everything a compiler would have allowed**: no REPL,
+no `eval`, no program arriving over the air as text.
 
-| `-Os` | bytecode | compiler |
-|---|---|---|
-| image | **244,960 B** | 279,440 B |
-| prepare, both files | **9,821 µs** | 64,154 µs |
-| run, both files | 3,196,086 µs | 3,211,906 µs |
-| reset to idle | **3,228,083 µs** | 3,298,642 µs |
-| heap left | **183,040 B** | 172,552 B |
-
-**Preparation is 6.5x faster and here it barely matters** — 9.8 ms against
-64.2 ms, against programs that then run for three seconds. It becomes the
-dominant number on the duty cycle these parts are actually bought for: a node
-that wakes, samples and sleeps pays prepare on every wake and the run cost for
-a few milliseconds.
-
-**Running is a wash, as it should be.** Both builds execute the same bytecode
-through the same interpreter, and that the two agree is the evidence the
-comparison is sound.
-
-**What bytecode costs is everything a compiler would have allowed.** No REPL,
-no `eval`, no accepting a program that arrives over the air as text. That is
-the trade, and ~34,500 B is what it is worth.
-
-Details, and the programs themselves:
+`ports/esp32c6-wren-boot` is the shape a device would actually take — it looks
+for `boot` and then `main`, MicroPython's convention, and is **one package
+built twice** so the only difference between the two images is that feature.
+Details and the programs themselves:
 **[`ports/esp32c6-wren-boot/README.md`](ports/esp32c6-wren-boot/README.md)**.
 
 ### Steps 1 and 2: the numbers to beat
@@ -403,21 +351,6 @@ the suite results are in [`doc/wren/README.md`](doc/wren/README.md).
 and paying for it in heap. The image comparison is against a stock
 `ESP32_GENERIC_C6` carrying networking and TLS, so it flatters Wren; the heap
 and speed figures are like for like.
-
-### Step 3 so far
-
-The lexer, the value representation, the object model and a mark-sweep collector
-over it — 52 tests, `#![forbid(unsafe_code)]`, and it builds for
-`riscv32imac-unknown-none-elf` with and without an allocator.
-
-**The central decision is the object representation**, because most of the rest
-follows from it. Values are NaN-tagged into 8 bytes as upstream does, but
-objects are reached by a 4-byte handle into one table rather than by pointer —
-which means an object carries **no header at all** where upstream spends 16
-bytes on one, the collector can be replaced without touching the rest of the VM,
-and none of it needs `unsafe`. What it costs is set out beside what it buys in
-[`crates/wren/README.md`](crates/wren/README.md), with the full argument and the
-measured layout in [`doc/wren-rs/design.md`](doc/wren-rs/design.md).
 
 ### What step 1 established about the small parts
 

@@ -44,6 +44,12 @@ use crate::value::Value;
 /// Whether the heap keeps a young generation.
 const NURSERY: bool = cfg!(feature = "nursery");
 
+/// The smallest ceiling on floating garbage that still makes progress.
+///
+/// Below this, a collection would be triggered again before enough has been
+/// allocated for the next one to free anything.
+const MIN_HEADROOM: usize = 256;
+
 /// How many `Value`s the *n*th field chunk holds.
 ///
 /// **Adaptive, because one size is wrong at both ends.** Four kilobytes is a
@@ -1260,15 +1266,40 @@ impl Heap {
     /// Collect once the live set has grown by this many bytes, rather than by
     /// a multiple of itself.
     ///
-    /// **This is the setting for a fixed heap.** The growth factor is
-    /// upstream's and it is a ratio, so the garbage a program is allowed to
-    /// accumulate scales with how much it is holding -- exactly backwards for
-    /// a part where the total is fixed. A headroom makes the peak the live set
-    /// plus a constant, which is a number a firmware can budget against.
+    /// **This is the setting for a fixed heap**, and it is the one knob on
+    /// this type that a firmware is expected to touch. The growth factor is
+    /// upstream's and it is a ratio, so the garbage a program may accumulate
+    /// scales with how much it is holding -- exactly backwards for a part
+    /// where the total is a constant. A headroom makes peak memory **the live
+    /// set plus this many bytes**, which is a number that can be budgeted
+    /// against before the program is written.
     ///
-    /// `None` restores the ratio.
+    /// **It means exactly what it says: [`INITIAL_THRESHOLD`] does not apply.**
+    /// That floor exists so a program with a handful of objects does not
+    /// collect on its third allocation, and it is 4 KB -- which is half the
+    /// RAM of a CH32V006 and would quietly swallow any ceiling smaller than
+    /// itself. A caller asking for 1 KB gets 1 KB.
+    ///
+    /// **Small is cheaper than it looks on a small part.** Collection costs
+    /// the live set, so the parts that most want a tight ceiling are the ones
+    /// where tightening it costs least: a program holding two hundred objects
+    /// pays almost nothing to collect them often, where `binary_trees` holding
+    /// a thousand-node tree pays for every sweep.
+    ///
+    /// `None` restores the ratio, which is what the published benchmarks use
+    /// so that they stay comparable with the C port.
     pub fn set_headroom(&mut self, bytes: Option<usize>) {
-        self.headroom = bytes;
+        // A ceiling of nothing would mean collecting after every allocation,
+        // freeing nothing and collecting again -- a livelock rather than a
+        // tight bound. Clamped rather than trusted, for the same reason
+        // `set_growth` clamps: this is set once at start-up and a typo in it
+        // should not be an infinite loop.
+        self.headroom = bytes.map(|bytes| bytes.max(MIN_HEADROOM));
+    }
+
+    /// The ceiling on floating garbage, if one is set.
+    pub fn headroom(&self) -> Option<usize> {
+        self.headroom
     }
 
     /// The growth factor in force, as `(numerator, denominator)`.
@@ -1621,13 +1652,13 @@ impl Heap {
         self.live = live;
         self.bytes = bytes;
         self.threshold = match self.headroom {
+            // No `INITIAL_THRESHOLD` here: a ceiling means what it says.
             Some(headroom) => bytes.saturating_add(headroom),
             None => {
                 let (numerator, denominator) = self.growth;
-                bytes * numerator / denominator
+                (bytes * numerator / denominator).max(INITIAL_THRESHOLD)
             }
-        }
-        .max(INITIAL_THRESHOLD);
+        };
         self.collections += 1;
 
         Collection {
