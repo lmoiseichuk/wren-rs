@@ -700,15 +700,22 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
     use core::fmt::Write as _;
 
     let mut out = alloc::string::String::new();
-    let mut offset = 0;
-    while offset < chunk.code.len() {
-        let at = offset;
-        let Some(op) = Op::from_byte(chunk.code[offset]) else {
-            let _ = writeln!(out, "{at:04} ??? {}", chunk.code[offset]);
-            offset += 1;
+    let mut at = 0;
+    while at < chunk.code.len() {
+        let Some(op) = Op::from_byte(chunk.code[at]) else {
+            let _ = writeln!(out, "{at:04} ??? {}", chunk.code[at]);
+            at += 1;
             continue;
         };
-        offset += 1;
+        // **How far to move is asked for, not restated.** This carried its own
+        // per-opcode `offset +=` table, a second copy of `instruction_len`
+        // that had to agree with it byte for byte and twice did not. The arms
+        // below format operands and nothing else; the walk is one call.
+        let Some(len) = Chunk::instruction_len(&chunk.code, at) else {
+            let _ = writeln!(out, "{at:04} ??? truncated");
+            break;
+        };
+        let offset = at + 1;
 
         let mut operand = alloc::string::String::new();
         match op {
@@ -719,7 +726,6 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
             | Op::MethodStatic
             | Op::ImportModule => {
                 let _ = write!(operand, " {}", chunk.read_short(offset));
-                offset += 2;
             }
             Op::LoadLocal
             | Op::StoreLocal
@@ -733,17 +739,14 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
             | Op::StoreStaticField
             | Op::Class => {
                 let _ = write!(operand, " {}", chunk.code[offset]);
-                offset += 1;
             }
             Op::Jump | Op::JumpIf | Op::And | Op::Or => {
                 let target = offset + 2 + chunk.read_short(offset) as usize;
                 let _ = write!(operand, " -> {target:04}");
-                offset += 2;
             }
             Op::Loop => {
                 let target = offset + 2 - chunk.read_short(offset) as usize;
                 let _ = write!(operand, " -> {target:04}");
-                offset += 2;
             }
             Op::ImportVariable => {
                 let _ = write!(
@@ -752,7 +755,6 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                     chunk.read_short(offset),
                     chunk.read_short(offset + 2)
                 );
-                offset += 4;
             }
             Op::Call | Op::Super => {
                 let _ = write!(
@@ -761,18 +763,14 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                     chunk.code[offset],
                     chunk.read_short(offset + 1)
                 );
-                offset += 3;
             }
             Op::Closure => {
                 let index = chunk.read_short(offset);
-                offset += 2;
-                let count = chunk.code[offset] as usize;
-                offset += 1;
+                let count = chunk.code[offset + 2] as usize;
                 let _ = write!(operand, " {index} upvalues {count}");
                 // The descriptors are part of the instruction, so they have to
                 // be consumed or every later offset is wrong -- which is
                 // exactly the sort of thing this exists to catch.
-                offset += count * 2;
             }
             // The fused pairs, whose second operand sits past the dead byte
             // where the second opcode used to be.
@@ -783,7 +781,6 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                     chunk.code[offset],
                     chunk.read_short(offset + 2)
                 );
-                offset += 4;
             }
             Op::LoadLocalPair => {
                 let _ = write!(
@@ -792,15 +789,14 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                     chunk.code[offset],
                     chunk.code[offset + 2]
                 );
-                offset += 3;
             }
             Op::LoadLocalReturn | Op::StoreFieldThisPop | Op::LoadFieldThisReturn => {
                 let _ = write!(operand, " {}", chunk.code[offset]);
-                offset += 2;
             }
             _ => {}
         }
         let _ = writeln!(out, "{at:04} {op:?}{operand}");
+        at += len;
     }
     out
 }
