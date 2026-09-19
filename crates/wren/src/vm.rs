@@ -140,8 +140,21 @@ pub struct Frame {
     /// The stack slot holding the receiver. Local slot *n* is `base + n`, and
     /// slot 0 is `this`.
     pub base: usize,
-    /// The code this frame runs, so resuming it does not have to find it again.
-    pub chunk: Rc<Chunk>,
+    /// The code this frame runs, held only while the frame is *not* running.
+    ///
+    /// **The same rule as `ip` above, for the same reason.** While a frame
+    /// runs, the interpreter keeps its chunk in a local; the field is filled in
+    /// when the frame stops being the running one, and emptied when it starts
+    /// again. That makes a call and its return move one `Rc` along the frame
+    /// stack rather than clone it twice and drop it twice -- and a refcount is
+    /// a load, an add and a store on a hot path that does nothing else with
+    /// that memory.
+    ///
+    /// `None` on a frame that is not running means nobody stored it: a
+    /// primitive that re-enters the interpreter cannot, not knowing its
+    /// caller's chunk. [`Vm::resume_chunk`] derives it in that case, which is
+    /// a heap walk on a path that is already leaving the interpreter.
+    pub chunk: Option<Rc<Chunk>>,
     /// The module this frame's code resolves its variables against.
     pub module: usize,
     /// Where this method's own fields start in its receiver.
@@ -969,7 +982,9 @@ impl Vm {
             closure,
             ip: 0,
             base,
-            chunk: target.chunk.clone(),
+            // The frame about to run holds no chunk; its caller's is whatever
+            // the interpreter that called this has in its local.
+            chunk: None,
             module: target.module,
             field_offset: target.field_offset,
         });
@@ -1231,9 +1246,12 @@ impl Vm {
     }
 
     /// Make the running fiber's stack and frames its own again.
-    fn park_current(&mut self, ip: usize) {
+    fn park_current(&mut self, ip: usize, chunk: Rc<Chunk>) {
         if let Some(frame) = self.frames.last_mut() {
             frame.ip = ip;
+            // It stops being the running frame here, so this is where its
+            // chunk goes back -- exactly as its `ip` does.
+            frame.chunk = Some(chunk);
         }
         let Some(id) = self.current_fiber else { return };
         let stack = ::core::mem::take(&mut self.stack);
@@ -1241,6 +1259,23 @@ impl Vm {
         if let Some(fiber) = self.heap.fiber_mut(id) {
             fiber.stack = stack;
             fiber.frames = frames;
+        }
+    }
+
+    /// The chunk the top frame resumes into, taken out of it.
+    ///
+    /// Emptying the field is what marks the frame as running again, so this is
+    /// the only way to resume one. When the field is empty the chunk is found
+    /// the long way, through the frame's closure -- see the note on
+    /// [`Frame::chunk`] for when that happens.
+    fn resume_chunk(&mut self) -> Result<Rc<Chunk>, RuntimeError> {
+        let Some(frame) = self.frames.last_mut() else {
+            return Err(RuntimeError::new("No frame to resume."));
+        };
+        let closure = frame.closure;
+        match frame.chunk.take() {
+            Some(chunk) => Ok(chunk),
+            None => Ok(self.call_target(closure)?.chunk),
         }
     }
 
@@ -1275,7 +1310,8 @@ impl Vm {
                 closure: entry,
                 ip: 0,
                 base: 0,
-                chunk: target.chunk,
+                // Not running yet -- whoever resumes this fiber takes it.
+                chunk: Some(target.chunk),
                 module: target.module,
                 field_offset: target.field_offset,
             });
@@ -1293,9 +1329,14 @@ impl Vm {
     }
 
     /// Carry out a [`Switch`] requested by a primitive.
-    fn perform_switch(&mut self, switch: Switch, ip: usize) -> Result<(), RuntimeError> {
+    fn perform_switch(
+        &mut self,
+        switch: Switch,
+        ip: usize,
+        chunk: Rc<Chunk>,
+    ) -> Result<(), RuntimeError> {
         let from = self.current_fiber;
-        self.park_current(ip);
+        self.park_current(ip, chunk);
 
         if switch.set_caller {
             if let Some(fiber) = self.heap.fiber_mut(switch.target) {
@@ -1678,7 +1719,7 @@ impl Vm {
                             message: format!("{class_name} does not implement '{name}'."),
                             line: chunk.line_at(at),
                         };
-                        match self.deliver_error(error, ip)? {
+                        match self.deliver_error(error, ip, chunk.clone())? {
                             Some((next_chunk, next_ip, next_base)) => {
                                 chunk = next_chunk;
                                 ip = next_ip;
@@ -1701,7 +1742,7 @@ impl Vm {
 
                             let value = match outcome {
                                 Ok(value) => value,
-                                Err(error) => match self.deliver_error(error, ip)? {
+                                Err(error) => match self.deliver_error(error, ip, chunk.clone())? {
                                     Some((next_chunk, next_ip, next_base)) => {
                                         chunk = next_chunk;
                                         ip = next_ip;
@@ -1724,7 +1765,7 @@ impl Vm {
                             }
                             if let Some(switch) = self.pending_switch.take() {
                                 let failing = switch.as_error.then_some(switch.value);
-                                self.perform_switch(switch, ip)?;
+                                self.perform_switch(switch, ip, chunk.clone())?;
                                 if let Some(value) = failing {
                                     // The target fails the moment it resumes,
                                     // which is what makes `transferError`
@@ -1734,7 +1775,7 @@ impl Vm {
                                         message,
                                         line: chunk.line_at(at),
                                     };
-                                    match self.deliver_error(error, 0)? {
+                                    match self.deliver_error(error, 0, chunk.clone())? {
                                         Some((next_chunk, next_ip, next_base)) => {
                                             chunk = next_chunk;
                                             ip = next_ip;
@@ -1745,10 +1786,13 @@ impl Vm {
                                         None => unreachable!("deliver_error returns or switches"),
                                     }
                                 }
+                                // Taking the chunk back is the move that pairs with the one
+                                // the call made, and it empties the field so the frame counts
+                                // as running again.
+                                chunk = self.resume_chunk()?;
                                 let frame = self.frames.last().expect("a frame to resume");
                                 ip = frame.ip;
                                 base = frame.base;
-                                chunk = frame.chunk.clone();
                                 module = frame.module;
                                 continue;
                             }
@@ -1775,18 +1819,24 @@ impl Vm {
                                     line: chunk.line_at(at),
                                 });
                             }
+                            // **The caller's chunk moves into its frame and
+                            // the callee's into the local.** One `Rc` changes
+                            // hands and none is cloned or dropped: the caller
+                            // stops running exactly here, which is already
+                            // where its `ip` is written back.
+                            let caller_chunk = ::core::mem::replace(&mut chunk, target.chunk);
                             if let Some(frame) = self.frames.last_mut() {
                                 frame.ip = ip;
+                                frame.chunk = Some(caller_chunk);
                             }
                             self.frames.push(Frame {
                                 closure,
                                 ip: 0,
                                 base: receiver_at,
-                                chunk: target.chunk.clone(),
+                                chunk: None,
                                 module: target.module,
                                 field_offset: target.field_offset,
                             });
-                            chunk = target.chunk;
                             ip = 0;
                             base = receiver_at;
                             module = target.module;
@@ -1844,12 +1894,18 @@ impl Vm {
                             // iterator local as null.
                             base = self.stack.len();
                             self.stack.push(Value::NULL);
+                            // The module body becomes the running frame, so
+                            // this one stops running and takes its chunk back.
+                            if let Some(frame) = self.frames.last_mut() {
+                                frame.ip = ip;
+                                frame.chunk = Some(chunk);
+                            }
                             chunk = self.push_frame(closure, base)?;
                             ip = 0;
                             module = self.module_of(closure);
                             continue;
                         }
-                        Err(error) => match self.deliver_error(error, ip)? {
+                        Err(error) => match self.deliver_error(error, ip, chunk.clone())? {
                             Some((next_chunk, next_ip, next_base)) => {
                                 chunk = next_chunk;
                                 ip = next_ip;
@@ -1929,11 +1985,15 @@ impl Vm {
                                     as_error: false,
                                 },
                                 ip,
+                                chunk.clone(),
                             )?;
+                            // Taking the chunk back is the move that pairs with the one
+                            // the call made, and it empties the field so the frame counts
+                            // as running again.
+                            chunk = self.resume_chunk()?;
                             let frame = self.frames.last().expect("a frame to resume");
                             ip = frame.ip;
                             base = frame.base;
-                            chunk = frame.chunk.clone();
                             module = frame.module;
                             continue;
                         }
@@ -1951,10 +2011,13 @@ impl Vm {
                     // **The return path.** This ran twice per call before --
                     // closure to function to chunk, and again for the module --
                     // and is now two field reads and a refcount bump.
+                    // Taking the chunk back is the move that pairs with the one
+                    // the call made, and it empties the field so the frame counts
+                    // as running again.
+                    chunk = self.resume_chunk()?;
                     let frame = self.frames.last().expect("a frame to return to");
                     ip = frame.ip;
                     base = frame.base;
-                    chunk = frame.chunk.clone();
                     module = frame.module;
                 }
                 Op::Jump => {
@@ -2039,6 +2102,11 @@ impl Vm {
         &mut self,
         error: RuntimeError,
         ip: usize,
+        // The running frame's chunk, so that parking it can put the chunk
+        // back where a later resume will look for it. This path is leaving
+        // the interpreter either way, so the clone its callers pay costs
+        // nothing that matters.
+        chunk: Rc<Chunk>,
     ) -> Result<Option<(Rc<Chunk>, usize, usize)>, RuntimeError> {
         let Some(catcher) = self.catcher() else {
             return Err(error);
@@ -2080,9 +2148,11 @@ impl Vm {
                 as_error: false,
             },
             ip,
+            chunk,
         )?;
+        let chunk = self.resume_chunk()?;
         let frame = self.frames.last().expect("a frame to resume");
-        Ok(Some((frame.chunk.clone(), frame.ip, frame.base)))
+        Ok(Some((chunk, frame.ip, frame.base)))
     }
 
     fn read_upvalue(&self, base: usize, slot: usize) -> Result<Value, RuntimeError> {
