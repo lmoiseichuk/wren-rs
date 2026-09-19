@@ -80,6 +80,17 @@ enum Precedence {
     Call,       // . ( [
 }
 
+/// The longest a variable or method name may be, matching upstream.
+///
+/// Set by upstream's fixed-size buffers rather than by anything fundamental,
+/// but a name longer than this is rejected there, so a program that compiles
+/// on one and not the other would be a compatibility difference in the
+/// direction nobody wants.
+const MAX_NAME: usize = 64;
+
+/// How many parameters a method may take.
+const MAX_PARAMETERS: usize = 16;
+
 /// How many locals one function may have, matching upstream's `MAX_LOCALS`.
 ///
 /// Set by the bytecode rather than by taste: `LoadLocal` takes a `u8`, so slot
@@ -393,7 +404,37 @@ impl<'a> Compiler<'a> {
     /// at the break but a variable reading as some unrelated value much later,
     /// which is how the loop-discard and scope-end bugs presented. The
     /// disassembler in `bytecode.rs` exists for exactly this class of fault.
+    /// Reject a name that is too long, wherever one is declared or called.
+    fn check_name(&self, name: &str) -> Result<(), CompileError> {
+        if name.len() > MAX_NAME {
+            return Err(self.error_at(
+                self.previous,
+                &format!("Variable name cannot be longer than {MAX_NAME} characters."),
+            ));
+        }
+        Ok(())
+    }
+
     fn add_local(&mut self, name: &str) -> Result<usize, CompileError> {
+        self.check_name(name)?;
+
+        // **A name may not be declared twice in one scope.** Shadowing an
+        // outer scope is fine and useful; redeclaring in the same one is a
+        // mistake, and silently rebinding would make the first declaration
+        // look as though it never happened.
+        let depth = self.state().scope_depth;
+        if self
+            .state()
+            .locals
+            .iter()
+            .any(|local| local.depth == depth && local.name == name)
+        {
+            return Err(self.error_at(
+                self.previous,
+                "Variable is already defined in this scope.",
+            ));
+        }
+
         // 256, upstream's `MAX_LOCALS`, which is what a `u8` slot index can
         // address. The receiver occupies slot zero, so a function body really
         // gets 255 of its own -- upstream counts the same way.
@@ -493,6 +534,7 @@ impl<'a> Compiler<'a> {
         let path = self.unescaped(self.previous)?;
         let line = self.line();
 
+        let path = String::from_utf8_lossy(&path).into_owned();
         let path_value = self.vm.new_string(&path);
         let Some(path_constant) = self.chunk_mut().add_constant(path_value) else {
             return Err(self.error_at(self.previous, "A function may only contain 65536 unique constants."));
@@ -845,7 +887,7 @@ impl<'a> Compiler<'a> {
             }
             TokenKind::String => {
                 let text = self.unescaped(token)?;
-                let value = self.vm.new_string(&text);
+                let value = self.vm.new_string_bytes(text);
                 self.emit_constant(value, line)
             }
             TokenKind::Interpolation => self.interpolation(),
@@ -1048,8 +1090,11 @@ impl<'a> Compiler<'a> {
                 self.skip_newlines()?;
                 self.expression()?;
                 arity += 1;
-                if arity > 16 {
-                    return Err(self.error_at(self.current, "Cannot pass more than 16 arguments."));
+                if arity > MAX_PARAMETERS {
+                    return Err(self.error_at(
+                        self.current,
+                        &format!("Cannot pass more than {MAX_PARAMETERS} arguments."),
+                    ));
                 }
                 self.skip_newlines()?;
                 if !self.match_token(TokenKind::Comma)? {
@@ -1291,7 +1336,7 @@ impl<'a> Compiler<'a> {
     ///
     /// A bad escape is a compile error pointing at the string it is in, which
     /// is why this is a method: the free function has no token to blame.
-    fn unescaped(&self, token: Token) -> Result<String, CompileError> {
+    fn unescaped(&self, token: Token) -> Result<Vec<u8>, CompileError> {
         unescape(token.text(self.source)).map_err(|message| CompileError {
             message,
             line: clamp_line(token.line),
@@ -1429,7 +1474,7 @@ impl<'a> Compiler<'a> {
     fn interpolation(&mut self) -> Result<(), CompileError> {
         let line = clamp_line(self.previous.line);
         let head = self.unescaped(self.previous)?;
-        let value = self.vm.new_string(&head);
+        let value = self.vm.new_string_bytes(head);
         self.emit_constant(value, line)?;
 
         loop {
@@ -1444,7 +1489,7 @@ impl<'a> Compiler<'a> {
             // `Interpolation` if there is a further `%(`, or the final `String`.
             if self.match_token(TokenKind::Interpolation)? {
                 let text = self.unescaped(self.previous)?;
-                let value = self.vm.new_string(&text);
+                let value = self.vm.new_string_bytes(text);
                 self.emit_constant(value, line)?;
                 self.emit_call("+(_)", 1, line)?;
                 continue;
@@ -1452,7 +1497,7 @@ impl<'a> Compiler<'a> {
 
             self.consume(TokenKind::String, "Expect end of string interpolation.")?;
             let text = self.unescaped(self.previous)?;
-            let value = self.vm.new_string(&text);
+            let value = self.vm.new_string_bytes(text);
             self.emit_constant(value, line)?;
             self.emit_call("+(_)", 1, line)?;
             return Ok(());
@@ -1849,8 +1894,11 @@ impl<'a> Compiler<'a> {
                 self.skip_newlines()?;
                 self.consume(TokenKind::Name, "Expect parameter name.")?;
                 names.push(self.previous.text(self.source).to_string());
-                if names.len() > 16 {
-                    return Err(self.error_at(self.current, "Cannot have more than 16 parameters."));
+                if names.len() > MAX_PARAMETERS {
+                    return Err(self.error_at(
+                        self.current,
+                        &format!("Cannot have more than {MAX_PARAMETERS} parameters."),
+                    ));
                 }
                 self.skip_newlines()?;
                 if !self.match_token(TokenKind::Comma)? {
@@ -1895,6 +1943,16 @@ impl<'a> Compiler<'a> {
     }
 
     fn emit_call(&mut self, signature: &str, arity: usize, line: u16) -> Result<(), CompileError> {
+        // The *name*, not the whole signature: `foo(_,_)` is longer than `foo`
+        // by the parameters, and it is the name upstream measures.
+        let name = signature.split(['(', '=', '[']).next().unwrap_or(signature);
+        if name.len() > MAX_NAME {
+            return Err(self.error_at(
+                self.previous,
+                &format!("Method names cannot be longer than {MAX_NAME} characters."),
+            ));
+        }
+
         let symbol = self.vm.method_names.ensure(signature);
         if symbol > u16::MAX as usize {
             return Err(self.error_at(self.previous, "Too many method names."));
@@ -1989,44 +2047,44 @@ fn tighter(precedence: Precedence) -> Precedence {
 /// The lexer deliberately leaves them alone — it has no allocator and a token
 /// is a span, so it cannot produce a decoded string. This is where that is
 /// paid for, and it is the only place that knows the escape set.
-fn unescape(raw: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(raw.len());
+fn unescape(raw: &str) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
     let mut characters = raw.chars();
 
     while let Some(character) = characters.next() {
         if character != '\\' {
-            out.push(character);
+            push_char(&mut out, character);
             continue;
         }
         match characters.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('0') => out.push('\0'),
-            Some('"') => out.push('"'),
-            Some('\'') => out.push('\''),
-            Some('\\') => out.push('\\'),
-            Some('%') => out.push('%'),
-            Some('a') => out.push('\u{7}'),
-            Some('b') => out.push('\u{8}'),
-            Some('e') => out.push('\u{1b}'),
-            Some('f') => out.push('\u{c}'),
-            Some('v') => out.push('\u{b}'),
+            Some('n') => out.push(b'\n'),
+            Some('r') => out.push(b'\r'),
+            Some('t') => out.push(b'\t'),
+            Some('0') => out.push(0),
+            Some('"') => out.push(b'"'),
+            Some('\'') => out.push(b'\''),
+            Some('\\') => out.push(b'\\'),
+            Some('%') => out.push(b'%'),
+            Some('a') => out.push(7),
+            Some('b') => out.push(8),
+            Some('e') => out.push(0x1b),
+            Some('f') => out.push(0xc),
+            Some('v') => out.push(0xb),
 
             // `\xNN` is a raw byte, which is why it is pushed as one rather
             // than as a character: a Wren string is bytes, and `\xff` is a
             // byte that is not valid UTF-8 on its own.
             Some('x') => {
-                let byte = read_hex(&mut characters, 2, "byte")?;
-                // Pushed through `char` because the output is a Rust `String`;
-                // a lone high byte becomes its Latin-1 character, which
-                // round-trips through the string's bytes for the values a
-                // program can actually write here.
-                out.push(byte as u8 as char);
+                // **One byte, not one character.** `"\xff"` is a single byte
+                // that is not valid UTF-8 on its own, and Wren is 8-bit clean
+                // -- `"\xff".count` is 1. Decoding into a Rust `String` would
+                // turn it into the two bytes of U+00FF.
+                out.push(read_hex(&mut characters, 2, "byte")? as u8);
             }
             // `\uNNNN` and `\UNNNNNNNN` are code points.
-            Some('u') => out.push(read_code_point(&mut characters, 4)?),
-            Some('U') => out.push(read_code_point(&mut characters, 8)?),
+            // A code point, encoded as the UTF-8 bytes that represent it.
+            Some('u') => push_char(&mut out, read_code_point(&mut characters, 4)?),
+            Some('U') => push_char(&mut out, read_code_point(&mut characters, 8)?),
 
             // **An unknown escape is an error, not a passthrough.** Keeping
             // both characters was quietly turning a typo into output.
@@ -2035,6 +2093,12 @@ fn unescape(raw: &str) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// Append a character as its UTF-8 bytes.
+fn push_char(out: &mut Vec<u8>, character: char) {
+    let mut buffer = [0u8; 4];
+    out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
 }
 
 /// Read exactly `digits` hexadecimal digits.

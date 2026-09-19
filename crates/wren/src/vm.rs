@@ -541,6 +541,15 @@ impl Vm {
         Value::object(self.heap.allocate(Object::String(ObjString::from_text(text))))
     }
 
+    /// Allocate a string from raw bytes.
+    ///
+    /// **Wren strings are bytes**, and a literal containing `\xff` is not
+    /// valid UTF-8. Going through `&str` would either reject it or silently
+    /// re-encode it as two bytes; neither is what the program wrote.
+    pub fn new_string_bytes(&mut self, bytes: Vec<u8>) -> Value {
+        Value::object(self.heap.allocate(Object::String(ObjString::new(bytes))))
+    }
+
     /// Read a string object, for a primitive that needs its contents.
     pub fn string_at(&self, value: Value) -> Option<&str> {
         match self.heap.get(value.as_object()?)? {
