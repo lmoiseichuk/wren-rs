@@ -79,5 +79,34 @@ fn main() {
                 running as f64 * 100.0 / total as f64,
             );
         }
+
+        // **Adjacent pairs, which is what a peephole pass can act on.** One
+        // opcode costs about thirty-one machine instructions and nearly all of
+        // it is dispatch, so a pair fused into a single instruction saves that
+        // thirty-one however cheap the two halves are.
+        let mut pairs: Vec<(usize, u64)> = vm
+            .op_pairs
+            .iter()
+            .enumerate()
+            .filter(|(_, &count)| count > 0)
+            .map(|(index, &count)| (index, count))
+            .collect();
+        pairs.sort_by_key(|&(_, count)| core::cmp::Reverse(count));
+
+        let paired: u64 = pairs.iter().map(|&(_, count)| count).sum();
+        println!();
+        println!("{:<40} {:>14} {:>8}", "adjacent pair", "count", "share");
+        println!("{}", "-".repeat(64));
+        for (index, count) in pairs.into_iter().take(10) {
+            let name = |byte: u8| match Op::from_byte(byte) {
+                Some(op) => format!("{op:?}"),
+                None => format!("<{byte}>"),
+            };
+            let label = format!("{} -> {}", name((index / 256) as u8), name((index % 256) as u8));
+            println!(
+                "{label:<40} {count:>14} {:>7.2}%",
+                count as f64 * 100.0 / paired as f64
+            );
+        }
     }
 }

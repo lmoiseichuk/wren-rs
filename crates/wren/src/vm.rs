@@ -390,6 +390,36 @@ pub struct Vm {
     /// array nor the increment.
     #[cfg(feature = "profile")]
     pub op_counts: [u64; 256],
+    /// How many times each opcode followed each other opcode, indexed
+    /// `previous * 256 + current`.
+    ///
+    /// **What a peephole pass would have to work with.** An opcode costs about
+    /// thirty-one machine instructions of which most is dispatch, so fusing an
+    /// adjacent pair into one instruction saves that whole thirty-one every
+    /// time the pair occurs. Which pairs those are is a fact about real
+    /// programs and not something to reason out: `Call` and `LoadLocal` are
+    /// equally common in `fib` without being adjacent, because the receiver
+    /// and the argument are pushed between them.
+    ///
+    /// A `Vec` rather than an array because 65,536 counters is half a
+    /// megabyte, which is not something to put in every `Vm`.
+    #[cfg(feature = "profile")]
+    pub op_pairs: alloc::vec::Vec<u64>,
+    /// The opcode before the one now running, for the pair counter.
+    #[cfg(feature = "profile")]
+    previous_op: u16,
+    /// Where the previous instruction ended, and which chunk it was in.
+    ///
+    /// **A pair only counts if it is adjacent in the code**, which is the only
+    /// kind a compiler pass could fuse. Counting whichever opcode merely ran
+    /// next makes the callee's first instruction look like a pair with the
+    /// `Call`, and the most common "pair" in `method_call` measured that way
+    /// -- `Call -> LoadFieldThis`, at 9.6% -- is two instructions in different
+    /// functions.
+    #[cfg(feature = "profile")]
+    previous_end: usize,
+    #[cfg(feature = "profile")]
+    previous_chunk: usize,
 }
 
 impl Vm {
@@ -484,6 +514,14 @@ impl Vm {
             output: Vec::new(),
             #[cfg(feature = "profile")]
             op_counts: [0; 256],
+            #[cfg(feature = "profile")]
+            op_pairs: alloc::vec![0; 256 * 256],
+            #[cfg(feature = "profile")]
+            previous_op: u16::MAX,
+            #[cfg(feature = "profile")]
+            previous_end: usize::MAX,
+            #[cfg(feature = "profile")]
+            previous_chunk: 0,
         };
         // `List`, `Map`, `Range` and `String` are sequences.
         for class in [list_class, map_class, range_class, string_class] {
@@ -1548,6 +1586,15 @@ impl Vm {
             #[cfg(feature = "profile")]
             {
                 self.op_counts[byte as usize] += 1;
+                let here = Rc::as_ptr(&chunk) as usize;
+                if self.previous_op != u16::MAX
+                    && self.previous_end == at
+                    && self.previous_chunk == here
+                {
+                    self.op_pairs[self.previous_op as usize * 256 + byte as usize] += 1;
+                }
+                self.previous_op = byte as u16;
+                self.previous_chunk = here;
             }
 
             let Some(op) = Op::from_byte(byte) else {
@@ -2065,6 +2112,13 @@ impl Vm {
             // cost thirty-nine in total. None of those four can change except
             // by allocating, so the heap works the answer out when it
             // allocates and leaves it here to be read.
+            // Where this instruction ended, for the adjacency test above.
+            // Known only now: the arm is what consumed the operands.
+            #[cfg(feature = "profile")]
+            {
+                self.previous_end = ip;
+            }
+
             if (NURSERY && self.heap.young() >= NURSERY_OBJECTS) || self.heap.collection_due() {
                 self.collect_point(ip);
             }
