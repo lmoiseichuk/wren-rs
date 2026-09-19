@@ -40,14 +40,16 @@ const SLOT: u64 = 24;
 /// What a slot costs now, per type, on `riscv32imac`.
 ///
 /// **Measured, not reasoned about** -- these are `size_of::<Option<T>>()` read
-/// back from a cross-compile, which is why two of them are not what the
-/// payload sizes suggest. `Class`, `Fn` and `Fiber` are 4 because they are
-/// still boxed and the slot holds only the pointer. `Upvalue` is 24 rather
-/// than 16 because `ObjUpvalue` has no spare bit pattern for `Option` to use,
-/// so the discriminant costs a whole word -- which means 19.2% of allocations
-/// got nothing out of this change, and an occupancy bitmap instead of `Option`
-/// is what would fix it.
-const OWN: [u64; 10] = [4, 16, 4, 16, 12, 16, 24, 16, 24, 4];
+/// back from a cross-compile. `Class`, `Fn` and `Fiber` are 4 because they are
+/// still boxed and the slot holds only the pointer; every other type's slot is
+/// exactly its payload, because each has a spare bit pattern for `Option` to
+/// put its discriminant in.
+///
+/// `Upvalue` was the exception at 24 for a 16-byte payload -- a `usize` and a
+/// `Value` offer no niche between them -- which mattered because upvalues are
+/// 19.2% of everything allocated. Biasing its stack slot by one makes the
+/// field `NonZeroU32`, and that is the niche.
+const OWN: [u64; 10] = [4, 16, 4, 16, 12, 16, 24, 16, 16, 4];
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();

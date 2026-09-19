@@ -1034,15 +1034,14 @@ impl Vm {
     fn capture_upvalue(&mut self, slot: usize) -> ObjectId {
         for existing in &self.open_upvalues {
             if let Some(upvalue) = self.heap.upvalue(*existing) {
-                if upvalue.is_open() && upvalue.slot == slot {
+                if upvalue.is_open() && upvalue.slot() == slot {
                     return *existing;
                 }
             }
         }
-        let id = self.heap.allocate(Object::Upvalue(ObjUpvalue {
-            slot,
-            closed: Value::UNDEFINED,
-        }));
+        let id = self
+            .heap
+            .allocate(Object::Upvalue(ObjUpvalue::new(slot, Value::UNDEFINED)));
         self.open_upvalues.push(id);
         id
     }
@@ -1056,7 +1055,7 @@ impl Vm {
         let mut still_open = Vec::new();
         for id in ::core::mem::take(&mut self.open_upvalues) {
             let slot = match self.heap.upvalue(id) {
-                Some(upvalue) if upvalue.is_open() => upvalue.slot,
+                Some(upvalue) if upvalue.is_open() => upvalue.slot(),
                 _ => continue,
             };
             if slot < from {
@@ -2055,7 +2054,11 @@ impl Vm {
         match self.heap.upvalue(id) {
             Some(upvalue) => {
                 if upvalue.is_open() {
-                    Ok(self.stack.get(upvalue.slot).copied().unwrap_or(Value::NULL))
+                    Ok(self
+                        .stack
+                        .get(upvalue.slot())
+                        .copied()
+                        .unwrap_or(Value::NULL))
                 } else {
                     Ok(upvalue.closed)
                 }
@@ -2075,7 +2078,7 @@ impl Vm {
             return Err(RuntimeError::new("No such upvalue."));
         };
         let target = match self.heap.upvalue(id) {
-            Some(upvalue) => upvalue.is_open().then_some(upvalue.slot),
+            Some(upvalue) => upvalue.is_open().then_some(upvalue.slot()),
             _ => return Err(RuntimeError::new("Not an upvalue.")),
         };
         match target {

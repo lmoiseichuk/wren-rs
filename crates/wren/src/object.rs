@@ -665,8 +665,19 @@ pub struct ObjClosure {
 /// reused by something else.
 #[derive(Clone, Copy, Debug)]
 pub struct ObjUpvalue {
-    /// The absolute stack slot, while open.
-    pub slot: usize,
+    /// The absolute stack slot, while open, **stored one greater**.
+    ///
+    /// **So that `Option<ObjUpvalue>` costs nothing.** A slot in a table is an
+    /// `Option<T>`, which is free when the payload has a spare bit pattern and
+    /// a whole word when it does not. A `usize` and a `Value` have none
+    /// between them, so an upvalue slot was 24 bytes for a 16-byte payload --
+    /// and upvalues are 19.2% of everything this VM allocates, which made it
+    /// the single largest thing that got nothing out of one table per type.
+    ///
+    /// Biasing by one makes the field `NonZeroU32`, which is the niche
+    /// `Option` needs. Slot zero is a real stack slot, hence the bias rather
+    /// than a sentinel.
+    slot: core::num::NonZeroU32,
     /// The captured value once closed, and `undefined` while still open.
     ///
     /// **A sentinel rather than an `Option`.** `Option<Value>` costs sixteen
@@ -679,6 +690,23 @@ pub struct ObjUpvalue {
 }
 
 impl ObjUpvalue {
+    /// Capture a stack slot. `closed` is `undefined` while it stays open.
+    pub fn new(slot: usize, closed: Value) -> ObjUpvalue {
+        // Saturating rather than wrapping: a stack that deep cannot exist --
+        // `MAX_FRAMES` is 256 -- and a panic in the allocator would be a worse
+        // answer than a wrong upvalue for a stack that does not.
+        let biased = (slot as u32).saturating_add(1);
+        ObjUpvalue {
+            slot: core::num::NonZeroU32::new(biased).expect("biased by one"),
+            closed,
+        }
+    }
+
+    /// The stack slot this points at, while open.
+    pub fn slot(&self) -> usize {
+        self.slot.get() as usize - 1
+    }
+
     /// Still pointing at a live stack slot.
     pub fn is_open(&self) -> bool {
         self.closed.is_undefined()
