@@ -33,14 +33,21 @@ const TYPES: [&str; 10] = [
     "Class", "Closure", "Fn", "Instance", "List", "Map", "Range", "String", "Upvalue", "Fiber",
 ];
 
-/// What each payload costs in a slot today, on a 32-bit part. Every slot is
-/// the largest variant, so this is the same for all of them -- the column is
-/// here to be compared against `own`, not for its own sake.
+/// What one slot cost when every object shared one table: the largest variant.
+/// Kept as the baseline the per-type columns are read against.
 const SLOT: u64 = 24;
 
-/// What each type's payload would cost in a table of its own. From
-/// `doc/wren-rs/design.md`, measured for `riscv32imac`.
-const OWN: [u64; 10] = [4, 4, 4, 16, 12, 16, 24, 16, 16, 4];
+/// What a slot costs now, per type, on `riscv32imac`.
+///
+/// **Measured, not reasoned about** -- these are `size_of::<Option<T>>()` read
+/// back from a cross-compile, which is why two of them are not what the
+/// payload sizes suggest. `Class`, `Fn` and `Fiber` are 4 because they are
+/// still boxed and the slot holds only the pointer. `Upvalue` is 24 rather
+/// than 16 because `ObjUpvalue` has no spare bit pattern for `Option` to use,
+/// so the discriminant costs a whole word -- which means 19.2% of allocations
+/// got nothing out of this change, and an occupancy bitmap instead of `Option`
+/// is what would fix it.
+const OWN: [u64; 10] = [4, 16, 4, 16, 12, 16, 24, 16, 24, 4];
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -175,7 +182,7 @@ fn report(total: &wren::heap::Profile, ran: usize, natural: usize, wall: u64) {
     println!("population");
     println!(
         "  {:<10} {:>12} {:>7}  {:>14} {:>14}",
-        "type", "allocated", "share", "slots B", "own-table B"
+        "type", "allocated", "share", "one-table B", "per-type B"
     );
     let mut order: Vec<usize> = (0..TYPES.len()).collect();
     order.sort_by_key(|index| core::cmp::Reverse(total.allocated[*index]));
@@ -200,7 +207,7 @@ fn report(total: &wren::heap::Profile, ran: usize, natural: usize, wall: u64) {
         "total", ""
     );
     println!(
-        "  per-type tables would save {} B of slots ({:.1}%)",
+        "  per-type tables save {} B of slots ({:.1}%) -- built, see design.md",
         slot_bytes - own_bytes,
         percent(slot_bytes - own_bytes, slot_bytes)
     );

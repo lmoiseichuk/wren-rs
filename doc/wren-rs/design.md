@@ -364,6 +364,24 @@ The fixed cost is about 400 bytes of `Vec` headers for ten tables instead of
 one, which is why `fib` and `method_call` gained a few hundred bytes each while
 `binary_trees` saved twenty-four kilobytes.
 
+**It saved 34% of the slot bytes, not the 50% the census predicted**, and the
+gap is worth naming because it is the next thing to fix. A slot is
+`size_of::<Option<T>>()`, and `Option` needs a spare bit pattern or it costs a
+whole word:
+
+| | payload | slot | why |
+|---|---|---|---|
+| `List` | 12 | 12 | the `Vec` pointer is the niche |
+| `Closure` | 16 | 16 | same |
+| `Upvalue` | 16 | **24** | a `usize` and a `Value`, neither with a spare pattern |
+| `Range` | 24 | 24 | unchanged, and it is 0.05% of allocations |
+| `Class`, `Fn`, `Fiber` | 48–56 | 4 | still boxed; the slot holds the pointer |
+
+`Upvalue` is **19.2% of everything allocated** and got nothing out of this. An
+occupancy bitmap beside each table instead of an `Option` in every slot would
+take it to 16 and cost one bit, and would do the same for anything else added
+later that has no niche.
+
 Two smaller things fell out of the same work:
 
 - **A closure lives in its slot now.** `ObjClosure` is a handle and a vector,
