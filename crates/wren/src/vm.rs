@@ -1179,6 +1179,101 @@ impl Vm {
         self.open_upvalues = still_open;
     }
 
+    /// Attach a class's attributes. Runs once per class that declares any.
+    #[cold]
+    #[inline(never)]
+    fn set_attributes(&mut self) {
+        let attributes = self.stack.pop().unwrap_or(Value::NULL);
+        let class = self.stack.pop().unwrap_or(Value::NULL);
+        if let Some(id) = class.as_object() {
+            if let Some(class) = self.heap.class_mut(id) {
+                class.attributes = attributes;
+            }
+            self.heap.wrote(id, attributes);
+        }
+    }
+
+    /// The error for running out of call frames.
+    #[cold]
+    #[inline(never)]
+    fn stack_overflow(line: u16) -> RuntimeError {
+        RuntimeError {
+            message: "Stack overflow.".into(),
+            line,
+        }
+    }
+
+    /// One variable out of an already-imported module.
+    ///
+    /// Out of line because an import happens once and its two failure messages
+    /// are most of its code. See [`Vm::bad_opcode`] for why that matters.
+    #[cold]
+    #[inline(never)]
+    fn imported_variable(
+        &self,
+        module_name: &str,
+        variable: &str,
+        line: u16,
+    ) -> Result<Value, RuntimeError> {
+        let Some(from) = self.module_index.get(module_name).copied() else {
+            return Err(RuntimeError {
+                message: format!("Could not load module '{module_name}'."),
+                line,
+            });
+        };
+        match self.modules[from].get(variable) {
+            Some(value) => Ok(value),
+            None => Err(RuntimeError {
+                message: format!(
+                    "Could not find a variable named '{variable}' in module '{module_name}'."
+                ),
+                line,
+            }),
+        }
+    }
+
+    /// The error for a byte that is not an opcode.
+    ///
+    /// **Out of line, and marked cold.** Building an error message means
+    /// formatting, which means a good deal of code; left inline it sits inside
+    /// the dispatch loop, and the loop is 20 KB against a 32 KB instruction
+    /// cache. What is never executed still has to be fetched past. See
+    /// `doc/wren-rs/profiling.md`.
+    #[cold]
+    #[inline(never)]
+    fn bad_opcode(byte: u8, line: u16) -> RuntimeError {
+        RuntimeError {
+            message: format!("bad opcode {byte}"),
+            line,
+        }
+    }
+
+    /// The error for a call to a method the receiver's class does not have.
+    #[cold]
+    #[inline(never)]
+    fn no_such_method(&mut self, receiver_at: usize, symbol: usize, line: u16) -> RuntimeError {
+        let name = self.method_names.name(symbol).unwrap_or("?").to_string();
+        let receiver = self.stack[receiver_at];
+        let class_name = self
+            .class_of(receiver)
+            .map(|class| self.class_name(class))
+            .unwrap_or_else(|| "null".to_string());
+        RuntimeError {
+            message: format!("{class_name} does not implement '{name}'."),
+            line,
+        }
+    }
+
+    /// The error for calling a function with the wrong number of arguments.
+    #[cold]
+    #[inline(never)]
+    fn wrong_arity(expected: usize, got: usize, line: u16) -> RuntimeError {
+        RuntimeError {
+            message: format!("Function expects {expected} argument(s) but got {got}."),
+            line,
+        }
+    }
+
     /// Every value the collector must treat as reachable.
     ///
     /// **Getting this list wrong is the classic collector bug**, and it fails
@@ -1619,10 +1714,7 @@ impl Vm {
             }
 
             let Some(op) = Op::from_byte(byte) else {
-                return Err(RuntimeError {
-                    message: format!("bad opcode {byte}"),
-                    line: chunk.line_at(at),
-                });
+                return Err(Self::bad_opcode(byte, chunk.line_at(at)));
             };
 
             match op {
@@ -1820,16 +1912,7 @@ impl Vm {
                     }
                     let found = self.find_method(start_from, symbol);
                     let Some(method) = found else {
-                        let name = self.method_names.name(symbol).unwrap_or("?").to_string();
-                        let receiver = self.stack[receiver_at];
-                        let class_name = self
-                            .class_of(receiver)
-                            .map(|class| self.class_name(class))
-                            .unwrap_or_else(|| "null".to_string());
-                        let error = RuntimeError {
-                            message: format!("{class_name} does not implement '{name}'."),
-                            line: chunk.line_at(at),
-                        };
+                        let error = self.no_such_method(receiver_at, symbol, chunk.line_at(at));
                         match self.deliver_error(error, ip, chunk.clone())? {
                             Some((next_chunk, next_ip, next_base)) => {
                                 chunk = next_chunk;
@@ -1916,19 +1999,14 @@ impl Vm {
                             // what a call cost.
                             let target = self.call_target(closure)?;
                             if target.arity != arity {
-                                return Err(RuntimeError {
-                                    message: format!(
-                                        "Function expects {} argument(s) but got {arity}.",
-                                        target.arity
-                                    ),
-                                    line: chunk.line_at(at),
-                                });
+                                return Err(Self::wrong_arity(
+                                    target.arity,
+                                    arity,
+                                    chunk.line_at(at),
+                                ));
                             }
                             if self.frames.len() >= MAX_FRAMES {
-                                return Err(RuntimeError {
-                                    message: "Stack overflow.".into(),
-                                    line: chunk.line_at(at),
-                                });
+                                return Err(Self::stack_overflow(chunk.line_at(at)));
                             }
                             // **The caller's chunk moves into its frame and
                             // the callee's into the local.** One `Rc` changes
@@ -1966,16 +2044,7 @@ impl Vm {
                     let value = *self.stack.last().unwrap();
                     self.set_static_field(index, value)?;
                 }
-                Op::SetAttributes => {
-                    let attributes = self.stack.pop().unwrap_or(Value::NULL);
-                    let class = self.stack.pop().unwrap_or(Value::NULL);
-                    if let Some(id) = class.as_object() {
-                        if let Some(class) = self.heap.class_mut(id) {
-                            class.attributes = attributes;
-                        }
-                        self.heap.wrote(id, attributes);
-                    }
-                }
+                Op::SetAttributes => self.set_attributes(),
                 Op::ImportModule => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
@@ -2040,20 +2109,7 @@ impl Vm {
                     let module_name = resolve_module(&self.modules[module].name, &module_name);
                     let variable = self.to_string(chunk.constants[variable_name]);
 
-                    let Some(from) = self.module_index.get(&module_name).copied() else {
-                        return Err(RuntimeError {
-                            message: format!("Could not load module '{module_name}'."),
-                            line: chunk.line_at(at),
-                        });
-                    };
-                    let Some(value) = self.modules[from].get(&variable) else {
-                        return Err(RuntimeError {
-                            message: format!(
-                                "Could not find a variable named '{variable}' in module '{module_name}'."
-                            ),
-                            line: chunk.line_at(at),
-                        });
-                    };
+                    let value = self.imported_variable(&module_name, &variable, chunk.line_at(at))?;
                     self.stack.push(value);
                 }
                 Op::Return | Op::End | Op::LoadLocalReturn | Op::LoadFieldThisReturn => {
