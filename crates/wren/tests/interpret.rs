@@ -749,3 +749,174 @@ fn importing_with_no_loader_fails_rather_than_panics() {
         "Could not load module 'm'."
     );
 }
+
+// --- static fields ----------------------------------------------------------
+
+#[test]
+fn a_static_field_is_shared_by_every_instance() {
+    let source = "
+class Counter {
+  construct new() {}
+  bump { __n = (__n == null) ? 1 : __n + 1 }
+  n { __n }
+}
+Counter.new().bump
+Counter.new().bump
+System.print(Counter.new().n)
+";
+    assert_eq!(run(source), "2\n");
+}
+
+#[test]
+fn a_static_field_is_visible_from_static_and_instance_methods_alike() {
+    let source = "
+class Both {
+  construct new() {}
+  static set { __v = \"set statically\" }
+  read { __v }
+}
+Both.set
+System.print(Both.new().read)
+";
+    assert_eq!(run(source), "set statically\n");
+}
+
+#[test]
+fn an_unset_static_field_reads_as_null() {
+    assert_eq!(
+        run("class A {\n construct new() {}\n v { __missing }\n}\nSystem.print(A.new().v)"),
+        "null\n"
+    );
+}
+
+#[test]
+fn a_nested_class_has_its_own_static_fields() {
+    // The storage is on the class a method was *defined* in, so an inner class
+    // writing `__field` cannot disturb the outer one's.
+    let source = "
+class Outer {
+  static go {
+    __field = \"outer\"
+    class Inner {
+      static go { __field = \"inner\" }
+    }
+    Inner.go
+    System.print(__field)
+  }
+}
+Outer.go
+";
+    assert_eq!(run(source), "outer\n");
+}
+
+#[test]
+fn a_static_field_outside_a_class_is_an_error() {
+    assert_eq!(
+        error("__nope = 1"),
+        "Cannot use a static field outside of a class definition."
+    );
+}
+
+// --- the collector, against the things it has already missed ----------------
+
+#[test]
+fn a_suspended_fiber_survives_a_collection() {
+    // **Regression.** While a fiber runs, its stack and frames live on the VM
+    // rather than in the heap object, so the object is referenced from nowhere
+    // else -- the root fiber especially, which no program names. Collecting it
+    // left `Fiber.yield` with no caller to return to.
+    let source = "
+var f = Fiber.new {
+  Fiber.yield(1)
+  Fiber.yield(2)
+  return 3
+}
+System.print(f.call())
+for (i in 1..400) {
+  var scratch = [i, \"padding %(i)\"]
+}
+System.print(f.call())
+System.print(f.call())
+";
+    assert_eq!(run(source), "1\n2\n3\n");
+}
+
+#[test]
+fn an_imported_variable_survives_a_collection() {
+    let source = "
+import \"m\" for Held
+for (i in 1..400) {
+  var scratch = [i, \"padding %(i)\"]
+}
+System.print(Held)
+";
+    assert_eq!(
+        run_with_modules(source, &[("m", "var Held = \"still here\"")]),
+        "still here\n"
+    );
+}
+
+// --- the random module ------------------------------------------------------
+
+#[test]
+fn random_floats_are_in_range() {
+    let source = "
+import \"random\" for Random
+var r = Random.new(12345)
+var ok = 0
+for (i in 1..200) {
+  var n = r.float()
+  if (n >= 0 && n < 1) ok = ok + 1
+}
+System.print(ok)
+";
+    assert_eq!(run(source), "200\n");
+}
+
+#[test]
+fn random_ints_respect_their_bounds() {
+    let source = "
+import \"random\" for Random
+var r = Random.new(99)
+var ok = 0
+for (i in 1..200) {
+  var n = r.int(10, 20)
+  if (n >= 10 && n < 20) ok = ok + 1
+}
+System.print(ok)
+";
+    assert_eq!(run(source), "200\n");
+}
+
+#[test]
+fn a_seeded_generator_repeats_itself() {
+    // Not required by upstream's tests, which only ask for distribution -- but
+    // a generator that cannot be reproduced from a seed is not much use for
+    // debugging whatever it feeds.
+    let source = "
+import \"random\" for Random
+var a = Random.new(7)
+var b = Random.new(7)
+var same = 0
+for (i in 1..50) {
+  if (a.float() == b.float()) same = same + 1
+}
+System.print(same)
+";
+    assert_eq!(run(source), "50\n");
+}
+
+#[test]
+fn shuffle_keeps_every_element() {
+    let source = "
+import \"random\" for Random
+var r = Random.new(3)
+var list = [1, 2, 3, 4, 5]
+r.shuffle(list)
+var total = 0
+for (x in list) total = total + x
+System.print(list.count)
+System.print(total)
+";
+    assert_eq!(run(source), "5\n15\n");
+}

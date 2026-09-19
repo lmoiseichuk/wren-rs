@@ -122,6 +122,12 @@ pub enum Op {
     /// constructor body, then a return.
     Construct = 28,
 
+    /// Push static field `operand` of the class this method belongs to.
+    /// Operand: `u8`.
+    LoadStaticField = 32,
+    /// Store the top of the stack into static field `operand`. Operand: `u8`.
+    StoreStaticField = 33,
+
     /// Load and run the module named by `constants[operand]`, leaving its
     /// result. Operand: `u16`.
     ///
@@ -191,6 +197,8 @@ impl Op {
             29 => Op::Super,
             30 => Op::ImportModule,
             31 => Op::ImportVariable,
+            32 => Op::LoadStaticField,
+            33 => Op::StoreStaticField,
             _ => return None,
         };
         Some(op)
@@ -361,7 +369,7 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
             }
             Op::LoadLocal | Op::StoreLocal | Op::LoadUpvalue | Op::StoreUpvalue
             | Op::LoadFieldThis | Op::StoreFieldThis | Op::LoadField | Op::StoreField
-            | Op::Class => {
+            | Op::LoadStaticField | Op::StoreStaticField | Op::Class => {
                 let _ = write!(operand, " {}", chunk.code[offset]);
                 offset += 1;
             }

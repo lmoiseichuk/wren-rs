@@ -138,7 +138,7 @@ pub struct Module {
 }
 
 impl Module {
-    fn new() -> Module {
+    pub fn new() -> Module {
         Module { names: SymbolTable::new(), values: Vec::new() }
     }
 
@@ -210,6 +210,9 @@ pub struct Vm {
     pub map_entry_class: ObjectId,
     /// The class of a coroutine.
     pub fiber_class: ObjectId,
+    /// `Random`, once the built-in module has been imported. Until then this
+    /// points at `Object` and nothing refers to it.
+    pub random_class: ObjectId,
 
     /// The fiber currently running. Its stack and frames are the VM's own,
     /// and are swapped back into it when control moves elsewhere.
@@ -296,6 +299,7 @@ impl Vm {
             fn_class,
             map_entry_class,
             fiber_class,
+            random_class: object_class,
             current_fiber: None,
             pending_switch: None,
             rust_floor: 0,
@@ -331,6 +335,13 @@ impl Vm {
     fn load_module(&mut self, name: &str) -> Result<(usize, Option<ObjectId>), RuntimeError> {
         if let Some(index) = self.module_index.get(name) {
             return Ok((*index, None));
+        }
+
+        // Built-in modules are constructed rather than loaded: there is no
+        // source to find, and a firmware with no loader at all should still be
+        // able to `import "random"`.
+        if name == "random" {
+            return Ok((core::install_random(self), None));
         }
 
         let Some(loader) = self.module_loader.as_ref() else {
@@ -369,6 +380,7 @@ impl Vm {
             name: name.to_string(),
             field_offset: 0,
             super_class: None,
+            owner_class: None,
             module: index,
         })));
         let closure = self
@@ -623,6 +635,16 @@ impl Vm {
         for id in &self.open_upvalues {
             roots.push(Value::object(*id));
         }
+        // **The running fiber, and through it the chain of its callers.**
+        // While a fiber runs, its stack and frames live on the VM rather than
+        // in the object, so the object itself is referenced from nowhere else
+        // -- the root fiber in particular, which no program ever names.
+        // Freeing it made `Fiber.yield` unable to find who to go back to, and
+        // reported as "Not a fiber" five tests later. `Object::trace` follows
+        // `caller` from here.
+        if let Some(id) = self.current_fiber {
+            roots.push(Value::object(id));
+        }
         // The core classes are reachable from nothing else once a program has
         // stopped mentioning them by name, and freeing `Num` mid-program would
         // be spectacular.
@@ -630,6 +652,7 @@ impl Vm {
             self.num_class, self.bool_class, self.null_class, self.string_class,
             self.list_class, self.map_class, self.range_class, self.class_class,
             self.object_class, self.fn_class, self.map_entry_class, self.fiber_class,
+            self.random_class,
         ] {
             roots.push(Value::object(class));
         }
@@ -814,6 +837,7 @@ impl Vm {
             name: "(module)".into(),
             field_offset: 0,
             super_class: None,
+            owner_class: None,
             module,
         })));
         let closure = self
@@ -1094,6 +1118,18 @@ impl Vm {
                         }
                     }
                 }
+                Op::LoadStaticField => {
+                    let index = chunk.code[ip] as usize;
+                    ip += 1;
+                    let value = self.static_field(index);
+                    self.stack.push(value);
+                }
+                Op::StoreStaticField => {
+                    let index = chunk.code[ip] as usize;
+                    ip += 1;
+                    let value = *self.stack.last().unwrap();
+                    self.set_static_field(index, value)?;
+                }
                 Op::ImportModule => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
@@ -1112,7 +1148,14 @@ impl Vm {
                             if let Some(frame) = self.frames.last_mut() {
                                 frame.ip = ip;
                             }
-                            let base = self.stack.len();
+                            // **Assigned, not `let`.** A fresh binding here
+                            // would shadow the loop's `base` for this arm only,
+                            // so the module body would run against the caller's
+                            // base and its return would truncate the stack past
+                            // the caller's own slots. The symptom was a `for`
+                            // loop after any import reading its hidden
+                            // iterator local as null.
+                            base = self.stack.len();
                             self.stack.push(Value::NULL);
                             chunk = self.push_frame(closure, base)?;
                             ip = 0;
@@ -1413,6 +1456,42 @@ impl Vm {
         }
     }
 
+    /// The class whose static fields the running method should see.
+    fn owner_class(&self) -> Option<ObjectId> {
+        self.frames
+            .last()
+            .and_then(|frame| self.function_of(frame.closure))
+            .and_then(|function| function.owner_class)
+    }
+
+    fn static_field(&self, index: usize) -> Value {
+        // Unset reads as null rather than as an error, which is what
+        // `use_before_set` expects: a static field springs into existence the
+        // first time it is mentioned.
+        let Some(owner) = self.owner_class() else { return Value::NULL };
+        match self.heap.get(owner) {
+            Some(Object::Class(class)) => {
+                class.static_fields.get(index).copied().unwrap_or(Value::NULL)
+            }
+            _ => Value::NULL,
+        }
+    }
+
+    fn set_static_field(&mut self, index: usize, value: Value) -> Result<(), RuntimeError> {
+        let Some(owner) = self.owner_class() else {
+            return Err(RuntimeError::new(
+                "Cannot use a static field outside of a class definition.",
+            ));
+        };
+        if let Some(Object::Class(class)) = self.heap.get_mut(owner) {
+            if class.static_fields.len() <= index {
+                class.static_fields.resize(index + 1, Value::NULL);
+            }
+            class.static_fields[index] = value;
+        }
+        Ok(())
+    }
+
     fn current_field_offset(&self) -> usize {
         self.frames
             .last()
@@ -1482,7 +1561,7 @@ impl Vm {
             Some(Object::Class(class)) => class.superclass,
             _ => None,
         };
-        self.set_field_offset(closure, inherited, superclass);
+        self.set_field_offset(closure, inherited, superclass, class_id);
 
         let target = if is_static {
             match self.heap.get(class_id) {
@@ -1504,7 +1583,13 @@ impl Vm {
     /// A closure written inside a method still refers to the same fields, so
     /// the offset has to reach it too — upstream walks nested functions at bind
     /// time for the same reason.
-    fn set_field_offset(&mut self, closure: ObjectId, offset: usize, superclass: Option<ObjectId>) {
+    fn set_field_offset(
+        &mut self,
+        closure: ObjectId,
+        offset: usize,
+        superclass: Option<ObjectId>,
+        owner: ObjectId,
+    ) {
         let Some(Object::Closure(closure)) = self.heap.get(closure) else {
             return;
         };
@@ -1522,9 +1607,10 @@ impl Vm {
         if let Some(Object::Fn(function)) = self.heap.get_mut(function) {
             function.field_offset = offset;
             function.super_class = superclass;
+            function.owner_class = Some(owner);
         }
         for id in nested {
-            self.set_field_offset_of_fn(id, offset, superclass);
+            self.set_field_offset_of_fn(id, offset, superclass, owner);
         }
     }
 
@@ -1533,6 +1619,7 @@ impl Vm {
         function: ObjectId,
         offset: usize,
         superclass: Option<ObjectId>,
+        owner: ObjectId,
     ) {
         let nested: Vec<ObjectId> = match self.heap.get(function) {
             Some(Object::Fn(function)) => function
@@ -1547,9 +1634,10 @@ impl Vm {
         if let Some(Object::Fn(function)) = self.heap.get_mut(function) {
             function.field_offset = offset;
             function.super_class = superclass;
+            function.owner_class = Some(owner);
         }
         for id in nested {
-            self.set_field_offset_of_fn(id, offset, superclass);
+            self.set_field_offset_of_fn(id, offset, superclass, owner);
         }
     }
 

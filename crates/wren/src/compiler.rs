@@ -150,6 +150,10 @@ impl FnState {
 struct ClassState {
     /// Field names in declaration order; the index is the field's slot.
     fields: Vec<String>,
+    /// Static field names, numbered the same way. Separate from `fields`
+    /// because they are separate storage: instance fields live on each
+    /// instance, static ones on the class.
+    static_fields: Vec<String>,
     in_static: bool,
     /// Where the class itself lives, so each method can reload it.
     variable: Variable,
@@ -818,6 +822,7 @@ impl<'a> Compiler<'a> {
             TokenKind::Name => self.variable(can_assign),
             TokenKind::This => self.load_this(),
             TokenKind::Field => self.field(can_assign),
+            TokenKind::StaticField => self.static_field(can_assign),
             TokenKind::Super => self.super_call(),
             TokenKind::LeftParen => {
                 self.skip_newlines()?;
@@ -1160,6 +1165,52 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// `__name`, a field on the class rather than on an instance.
+    ///
+    /// Unlike `_name` this works in a static method as well as an instance one,
+    /// because the storage is on the class and both kinds of method know which
+    /// class they belong to. It also needs no `this`, which is why there is no
+    /// direct-versus-indirect split here the way there is for instance fields.
+    fn static_field(&mut self, can_assign: bool) -> Result<(), CompileError> {
+        let name = self.previous.text(self.source).to_string();
+        let line = self.line();
+
+        if self.classes.is_empty() {
+            return Err(self.error_at(
+                self.previous,
+                "Cannot use a static field outside of a class definition.",
+            ));
+        }
+
+        let index = match self
+            .class_state()
+            .static_fields
+            .iter()
+            .position(|field| *field == name)
+        {
+            Some(index) => index,
+            None => {
+                let class = self.classes.last_mut().expect("a class being compiled");
+                if class.static_fields.len() >= u8::MAX as usize {
+                    return Err(self.error_at(self.previous, "A class can only have 255 static fields."));
+                }
+                class.static_fields.push(name);
+                class.static_fields.len() - 1
+            }
+        };
+
+        if can_assign && self.check(TokenKind::Eq) {
+            self.advance()?;
+            self.skip_newlines()?;
+            self.expression()?;
+            self.chunk_mut().emit_op(Op::StoreStaticField, line);
+        } else {
+            self.chunk_mut().emit_op(Op::LoadStaticField, line);
+        }
+        self.chunk_mut().emit_byte(index as u8, line);
+        Ok(())
+    }
+
     fn class_state(&self) -> &ClassState {
         self.classes.last().expect("a class being compiled")
     }
@@ -1333,6 +1384,7 @@ impl<'a> Compiler<'a> {
             name: state.name,
             field_offset: 0,
             super_class: None,
+            owner_class: None,
             module: self.module,
         })));
 
@@ -1467,6 +1519,7 @@ impl<'a> Compiler<'a> {
 
         self.classes.push(ClassState {
             fields: Vec::new(),
+            static_fields: Vec::new(),
             in_static: false,
             variable,
         });

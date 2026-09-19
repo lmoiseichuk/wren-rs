@@ -1559,6 +1559,221 @@ fn install_system(vm: &mut Vm) {
     }
 }
 
+/// Build the built-in `random` module and return its index.
+///
+/// **A native module rather than Wren source.** Upstream ships `random` as a
+/// `.wren` file compiled at start-up; compiling it on a part with 8 KB is the
+/// thing this implementation is trying not to do, so the class is built
+/// directly.
+///
+/// The generator is xorshift128, not upstream's WELL512a. Upstream's tests ask
+/// for statistical properties -- "roughly evenly distributed", "within range"
+/// -- and never for a particular sequence, so matching the exact algorithm
+/// would buy nothing. If a program ever needs to reproduce upstream's stream
+/// from a seed, that is the point at which WELL512a becomes worth writing.
+pub fn install_random(vm: &mut Vm) -> usize {
+    let name = vm.heap.allocate(Object::String(ObjString::from_text("Random")));
+    let class = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(name, Some(vm.object_class)))));
+
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Random metaclass")));
+    let metaclass = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+    if let Some(Object::Class(random)) = vm.heap.get_mut(class) {
+        random.metaclass = Some(metaclass);
+        // Four `u32` words of state, each exactly representable as an `f64`.
+        random.num_fields = 4;
+    }
+
+    define(vm, metaclass, "new()", |vm, _| {
+        let class = vm.random_class;
+        let seed = default_seed();
+        Ok(new_random(vm, class, seed))
+    });
+    define(vm, metaclass, "new(_)", |vm, at| {
+        let seed = number_argument(vm, at, 1)? as i64 as u32;
+        let class = vm.random_class;
+        Ok(new_random(vm, class, seed))
+    });
+
+    define(vm, class, "float()", |vm, at| {
+        let value = next_float(vm, receiver(vm, at));
+        Ok(Value::num(value))
+    });
+    define(vm, class, "float(_)", |vm, at| {
+        let end = number_argument(vm, at, 1)?;
+        let value = next_float(vm, receiver(vm, at));
+        Ok(Value::num(value * end))
+    });
+    define(vm, class, "float(_,_)", |vm, at| {
+        let start = number_argument(vm, at, 1)?;
+        let end = number_argument(vm, at, 2)?;
+        let value = next_float(vm, receiver(vm, at));
+        Ok(Value::num(start + value * (end - start)))
+    });
+
+    define(vm, class, "int()", |vm, at| {
+        let value = next_u32(vm, receiver(vm, at));
+        Ok(Value::num(value as f64))
+    });
+    define(vm, class, "int(_)", |vm, at| {
+        let end = number_argument(vm, at, 1)?;
+        let value = next_float(vm, receiver(vm, at));
+        Ok(Value::num(math::floor(value * end)))
+    });
+    define(vm, class, "int(_,_)", |vm, at| {
+        let start = number_argument(vm, at, 1)?;
+        let end = number_argument(vm, at, 2)?;
+        let value = next_float(vm, receiver(vm, at));
+        Ok(Value::num(start + math::floor(value * (end - start))))
+    });
+
+    define(vm, class, "sample(_)", |vm, at| {
+        let list = argument(vm, at, 1);
+        let elements = list_elements(vm, list);
+        if elements.is_empty() {
+            return Err(RuntimeError::new("Not enough elements to sample."));
+        }
+        let pick = next_float(vm, receiver(vm, at));
+        let index = (pick * elements.len() as f64) as usize;
+        Ok(elements[index.min(elements.len() - 1)])
+    });
+
+    define(vm, class, "sample(_,_)", |vm, at| {
+        let list = argument(vm, at, 1);
+        let count = number_argument(vm, at, 2)?;
+        let mut elements = list_elements(vm, list);
+        if count < 0.0 || count as usize > elements.len() {
+            return Err(RuntimeError::new("Not enough elements to sample."));
+        }
+        // **Without replacement**, which is what Wren's `sample` promises: a
+        // partial Fisher-Yates, taking the first `count` after shuffling only
+        // as far as needed.
+        let wanted = count as usize;
+        let receiver = receiver(vm, at);
+        for index in 0..wanted {
+            let pick = next_float(vm, receiver);
+            let last = elements.len() - 1;
+            let choice = index + (pick * (elements.len() - index) as f64) as usize;
+            elements.swap(index, choice.min(last));
+        }
+        elements.truncate(wanted);
+        Ok(new_list(vm, elements))
+    });
+
+    define(vm, class, "shuffle(_)", |vm, at| {
+        let list = argument(vm, at, 1);
+        let mut elements = list_elements(vm, list);
+        if elements.is_empty() {
+            return Ok(list);
+        }
+        let receiver = receiver(vm, at);
+        // Fisher-Yates, downward, which is the version that needs no rejection
+        // and touches each element once.
+        let mut index = elements.len() - 1;
+        while index > 0 {
+            let pick = next_float(vm, receiver);
+            let choice = (pick * (index + 1) as f64) as usize;
+            elements.swap(index, choice.min(index));
+            index -= 1;
+        }
+        if let Some(Object::List(target)) = list.as_object().and_then(|id| vm.heap.get_mut(id)) {
+            target.elements = elements;
+        }
+        Ok(list)
+    });
+
+    vm.random_class = class;
+
+    let mut module = crate::vm::Module::new();
+    module.define("Random", Value::object(class));
+    vm.modules.push(module);
+    let index = vm.modules.len() - 1;
+    vm.module_index.insert(alloc::string::String::from("random"), index);
+    index
+}
+
+fn new_random(vm: &mut Vm, class: crate::handle::ObjectId, seed: u32) -> Value {
+    // Spread one seed word across four state words. A state of all zeros is
+    // the one xorshift cannot escape, so the constants guarantee it never is.
+    let mut state = [
+        seed ^ 0x9e37_79b9,
+        seed.wrapping_mul(0x85eb_ca6b) | 1,
+        seed.wrapping_mul(0xc2b2_ae35) ^ 0x1234_5678,
+        seed.rotate_left(16) | 0x8000_0000,
+    ];
+    // Discard the first few outputs, which are the most correlated with the
+    // seed.
+    for _ in 0..8 {
+        step(&mut state);
+    }
+    let fields = state.iter().map(|word| Value::num(*word as f64)).collect();
+    let id = vm.heap.allocate(Object::Instance(ObjInstance { class, fields }));
+    Value::object(id)
+}
+
+/// xorshift128, one step.
+fn step(state: &mut [u32; 4]) -> u32 {
+    let mut t = state[0];
+    t ^= t << 11;
+    t ^= t >> 8;
+    state[0] = state[1];
+    state[1] = state[2];
+    state[2] = state[3];
+    state[3] = state[3] ^ (state[3] >> 19) ^ t;
+    state[3]
+}
+
+fn next_u32(vm: &mut Vm, receiver: Value) -> u32 {
+    let Some(id) = receiver.as_object() else { return 0 };
+    let mut state = [0u32; 4];
+    match vm.heap.get(id) {
+        Some(Object::Instance(instance)) => {
+            for (slot, word) in state.iter_mut().enumerate() {
+                *word = instance.fields.get(slot).copied().and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+            }
+        }
+        _ => return 0,
+    }
+    let value = step(&mut state);
+    if let Some(Object::Instance(instance)) = vm.heap.get_mut(id) {
+        for (slot, word) in state.iter().enumerate() {
+            instance.fields[slot] = Value::num(*word as f64);
+        }
+    }
+    value
+}
+
+/// A double in `[0, 1)`, built from 53 bits so every representable value in
+/// the range is reachable -- 32 bits would leave most of them unused.
+fn next_float(vm: &mut Vm, receiver: Value) -> f64 {
+    let high = next_u32(vm, receiver) as u64;
+    let low = next_u32(vm, receiver) as u64;
+    let bits = ((high << 21) ^ (low >> 11)) & ((1u64 << 53) - 1);
+    bits as f64 / (1u64 << 53) as f64
+}
+
+#[cfg(feature = "std")]
+fn default_seed() -> u32 {
+    // Entropy from the clock. Not cryptographic, and not claimed to be -- it
+    // exists so two runs of the same program differ.
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos() ^ since.as_secs() as u32)
+        .unwrap_or(0x1234_5678)
+}
+
+#[cfg(not(feature = "std"))]
+fn default_seed() -> u32 {
+    // **No clock on a bare-metal target**, so an unseeded generator repeats
+    // across resets. Saying so is better than inventing entropy that is not
+    // there; a firmware that needs a varying stream should seed from something
+    // it actually has, such as an ADC reading.
+    0x1234_5678
+}
+
 /// Build a list value from elements, for the compiler's list literals.
 pub fn new_list(vm: &mut Vm, elements: Vec<Value>) -> Value {
     let id = vm.heap.allocate(Object::List(ObjList { elements }));

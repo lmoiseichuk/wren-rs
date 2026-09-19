@@ -12,9 +12,9 @@ paragraph of the spec rather than at a vague gap.
 | | |
 |---|---|
 | probes | 96 |
-| **works** | **89** |
+| **works** | **91** |
 | differs | 3 |
-| missing | 4 |
+| missing | 2 |
 
 ## By chapter
 
@@ -31,7 +31,7 @@ paragraph of the spec rather than at a vague gap.
 | [Functions](#functions) | 7 | 0 | 0 |
 | [Concurrency](#concurrency) | 4 | 1 | 0 |
 | [Error handling](#error-handling) | 4 | 0 | 0 |
-| [Modularity](#modularity) | 0 | 0 | 3 |
+| [Modularity](#modularity) | 2 | 0 | 1 |
 
 ## Syntax
 
@@ -144,7 +144,7 @@ paragraph of the spec rather than at a vague gap.
 | Fields | works |  |
 | Fields are private | works |  |
 | Static members | works |  |
-| Static fields | **missing** | Expected expression. |
+| Static fields | **missing** | Expect '}' at end of block. |
 | Inheritance | works |  |
 | super | works |  |
 | is operator | works |  |
@@ -185,7 +185,7 @@ paragraph of the spec rather than at a vague gap.
 
 | feature | status | note |
 |---|---|---|
-| Importing | **missing** | Could not load module 'random'. |
-| Import with rename | **missing** | Could not load module 'random'. |
+| Importing | works |  |
+| Import with rename | works |  |
 | meta module | **missing** | Could not load module 'meta'. |
 

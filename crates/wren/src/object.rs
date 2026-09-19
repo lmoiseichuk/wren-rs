@@ -134,6 +134,11 @@ impl Object {
                 // it is worth having actually happened: the omission is
                 // invisible until a collection runs at exactly the wrong
                 // moment, which is the hardest kind of bug to go looking for.
+                for value in &class.static_fields {
+                    if let Some(id) = value.as_object() {
+                        gray.push(id);
+                    }
+                }
                 for method in class.methods.iter().flatten() {
                     match method {
                         Method::Closure(closure) => gray.push(*closure),
@@ -405,6 +410,18 @@ pub struct ObjClass {
     /// distinct method names pays for them in every class. Upstream has the
     /// same shape and the same cost.
     pub methods: Vec<Option<Method>>,
+    /// Values of the class's static fields, indexed as the compiler numbered
+    /// them.
+    ///
+    /// **Per class, and shared by its static and instance methods alike** --
+    /// `__count` means the same storage whichever kind of method touches it,
+    /// and a nested class declared inside a method has its own. Upstream gets
+    /// there by hoisting static fields into locals of the class body's scope
+    /// and letting methods capture them as upvalues; storing them on the class
+    /// is the same semantics with none of the upvalue machinery, at the cost
+    /// of needing to know which class a method was defined in -- see
+    /// [`ObjFn::owner_class`].
+    pub static_fields: Vec<Value>,
 }
 
 impl ObjClass {
@@ -416,6 +433,7 @@ impl ObjClass {
             num_fields: 0,
             metaclass: None,
             methods: Vec::new(),
+            static_fields: Vec::new(),
         }
     }
 
@@ -529,6 +547,11 @@ pub struct ObjFn {
     /// Where a `super` call in this body starts looking. Set at bind time,
     /// alongside [`ObjFn::field_offset`], for the same reason.
     pub super_class: Option<ObjectId>,
+    /// The class this method was defined in, for its static fields.
+    ///
+    /// Not the receiver's class: an inherited method touching `__count` means
+    /// the class it was *written* in, exactly as `super` does.
+    pub owner_class: Option<ObjectId>,
     /// Which module's variables this function's `LoadModuleVar` indices refer
     /// to. A function compiled in one module keeps resolving against that
     /// module wherever it is later called from.

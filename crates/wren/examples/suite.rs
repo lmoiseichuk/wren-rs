@@ -165,6 +165,14 @@ fn one(path: &Path, root: &str) -> Option<Outcome> {
     }
     let source = std::fs::read_to_string(path).ok()?;
 
+    // **`// nontest` means this file is a fixture, not a test.** Upstream marks
+    // the modules its import tests load, and counting them as tests in their
+    // own right scores a helper against expectations it never had -- 25 files
+    // that were quietly making the denominator and the failure list both wrong.
+    if source.lines().next().is_some_and(|line| line.contains("nontest")) {
+        return None;
+    }
+
     let is_error_test = source.contains("// expect runtime error:")
         || source.contains("Error at")
         || source.contains("// expect error");
