@@ -53,7 +53,7 @@ fn main() {
         println!();
         println!("{name}: {total} instructions executed");
         println!();
-        println!("{:<20} {:>14} {:>8}  {}", "opcode", "count", "share", "");
+        println!("{:<20} {:>14} {:>8}", "opcode", "count", "share");
         println!("{}", "-".repeat(56));
 
         // Sorted by count, because the question is always "what runs most".
