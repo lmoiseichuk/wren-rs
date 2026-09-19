@@ -256,13 +256,22 @@ pub struct Chunk {
     /// not have the other, and this crate takes no dependencies. `log n` on a
     /// table capped at 65,536 entries is sixteen comparisons at worst.
     lookup: BTreeMap<u64, u16>,
-    /// The source line each **byte** of `code` came from, for error messages.
+    /// Where each source line's code starts: `(offset, line)`, in order.
     ///
-    /// This is upstream's layout and it is frankly wasteful — a line number per
-    /// byte, where a whole statement usually shares one. A run-length encoding
-    /// would cost a fraction of it. Left alone until there is a program big
-    /// enough for the difference to show up in a measurement.
-    pub lines: Vec<u16>,
+    /// **One entry per line, not per byte.** Upstream's layout is a line
+    /// number for every byte of code, which measured at exactly twice the size
+    /// of the code itself -- 2,464 bytes of line numbers for 1,232 bytes of
+    /// instructions in `binary_trees`. A whole statement shares one line, so
+    /// nearly every entry equalled the one before it.
+    ///
+    /// **The file format already knew this**: `.wrenc` has always stored the
+    /// table run-length encoded, and the reader expanded it on the way in.
+    /// Only memory was paying, which is the wrong way round for this project.
+    ///
+    /// Nothing reads it on a working program -- [`Chunk::line_at`] is called
+    /// from the interpreter's error paths alone -- so a binary search costs
+    /// nothing that matters.
+    pub lines: Vec<(u32, u16)>,
 }
 
 impl Chunk {
@@ -281,7 +290,7 @@ impl Chunk {
     /// index for reusing constants, and a loaded chunk will never have another
     /// added. Writing it to the file would cost bytes for a table nothing
     /// reads.
-    pub fn from_parts(code: Vec<u8>, constants: Vec<Value>, lines: Vec<u16>) -> Chunk {
+    pub fn from_parts(code: Vec<u8>, constants: Vec<Value>, lines: Vec<(u32, u16)>) -> Chunk {
         let mut chunk = Chunk {
             code,
             constants,
@@ -302,8 +311,11 @@ impl Chunk {
     }
 
     pub fn emit_byte(&mut self, byte: u8, line: u16) {
+        match self.lines.last() {
+            Some((_, last)) if *last == line => {}
+            _ => self.lines.push((self.code.len() as u32, line)),
+        }
         self.code.push(byte);
-        self.lines.push(line);
     }
 
     /// Emit a big-endian `u16` operand.
@@ -471,6 +483,21 @@ impl Chunk {
     ///
     /// Run once, on a finished chunk. See the note on the fused variants of
     /// [`Op`] for why this can be done in place.
+    /// Nothing more will be added to this chunk: fuse its instruction pairs
+    /// and let go of what only the compiler needed.
+    ///
+    /// **The constant index is compile-time state that was outliving the
+    /// compiler.** `lookup` exists so that adding a constant can find an equal
+    /// one already there, and a chunk that has finished compiling will never
+    /// add another -- but it was kept for the life of the program, on a device
+    /// where that is the whole of memory. Measured on `binary_trees`: 240
+    /// bytes of entries against 1,232 bytes of actual code, and a `BTreeMap`
+    /// node is far larger than its entries.
+    pub fn finish(&mut self) {
+        self.fuse();
+        self.lookup = BTreeMap::new();
+    }
+
     pub fn fuse(&mut self) {
         let targets = Chunk::jump_targets(&self.code);
         let mut at = 0;
@@ -503,9 +530,40 @@ impl Chunk {
         }
     }
 
+    /// What this chunk costs in memory, split into its parts.
+    ///
+    /// `(code, lines, constants, lookup)`, in bytes. The last two are the
+    /// constant table and the compile-time index used to deduplicate it.
+    #[cfg(feature = "profile")]
+    pub fn footprint(&self) -> (usize, usize, usize, usize) {
+        (
+            self.code.capacity(),
+            self.lines.capacity() * core::mem::size_of::<(u32, u16)>(),
+            self.constants.capacity() * core::mem::size_of::<Value>(),
+            // A `BTreeMap` node holds up to eleven entries plus its links; this
+            // counts the entries alone, so it is a floor rather than the cost.
+            self.lookup.len() * (core::mem::size_of::<u64>() + core::mem::size_of::<u16>()),
+        )
+    }
+
     /// The source line for the instruction at `offset`, for an error message.
+    /// **Never inlined, because every caller is an error path.** There are
+    /// eight of them inside the interpreter's dispatch loop, one of them in
+    /// the closure that fixes up a failed primitive's line -- and when this
+    /// became a search rather than an index, inlining that body eight times
+    /// cost 2% of `fib`'s instructions *on the path where nothing fails*: the
+    /// closure grew past what the optimiser would fold away, so the successful
+    /// call had to build it.
+    #[cold]
+    #[inline(never)]
     pub fn line_at(&self, offset: usize) -> u16 {
-        self.lines.get(offset).copied().unwrap_or(0)
+        let offset = offset as u32;
+        // The last entry that starts at or before this offset owns it.
+        match self.lines.binary_search_by_key(&offset, |(start, _)| *start) {
+            Ok(index) => self.lines[index].1,
+            Err(0) => 0,
+            Err(index) => self.lines[index - 1].1,
+        }
     }
 }
 

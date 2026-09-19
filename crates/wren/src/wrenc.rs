@@ -250,11 +250,19 @@ fn write_function(
     // every entry equals the one before it, which is exactly what run-length
     // encoding is for. A runtime error with no line number would be the
     // cheaper trade and a much worse one.
+    // The chunk now holds this in the same shape the file does, so the run
+    // lengths are the gaps between entries rather than a count of repeats.
     let mut runs: Vec<(u16, u16)> = Vec::new();
-    for line in &chunk.lines {
-        match runs.last_mut() {
-            Some((count, value)) if value == line && *count < u16::MAX => *count += 1,
-            _ => runs.push((1, *line)),
+    for (index, (start, line)) in chunk.lines.iter().enumerate() {
+        let end = match chunk.lines.get(index + 1) {
+            Some((next, _)) => *next as usize,
+            None => chunk.code.len(),
+        };
+        let mut remaining = end.saturating_sub(*start as usize);
+        while remaining > 0 {
+            let run = remaining.min(u16::MAX as usize);
+            runs.push((run as u16, *line));
+            remaining -= run;
         }
     }
     write_u32(out, runs.len() as u32);
@@ -500,14 +508,20 @@ fn read_function(
 
     let mut code = reader.blob()?.to_vec();
 
+    // Straight into the compact form: one entry per line rather than per byte,
+    // which is what the chunk holds. Expanding it here and compressing again
+    // was a transient allocation the size of the code.
     let run_count = reader.u32()? as usize;
-    let mut lines = Vec::with_capacity(code.len());
+    let mut lines: Vec<(u32, u16)> = Vec::new();
+    let mut offset = 0u32;
     for _ in 0..run_count {
         let count = reader.u16()?;
         let line = reader.u16()?;
-        for _ in 0..count {
-            lines.push(line);
+        match lines.last() {
+            Some((_, last)) if *last == line => {}
+            _ => lines.push((offset, line)),
         }
+        offset += u32::from(count);
     }
 
     let constant_count = reader.u32()? as usize;

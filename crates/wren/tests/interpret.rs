@@ -385,6 +385,37 @@ fn a_runtime_error_reports_its_line() {
     assert_eq!(result.unwrap_err().line(), 3);
 }
 
+/// **The line table is one entry per line, not per byte**, so reporting a line
+/// is a search rather than an index -- see `Chunk::line_at`. These pin the
+/// cases that search has to get right: a line well into a program, a line
+/// reached only after a backward jump, and a line inside a called function,
+/// none of which the conformance suite checks because its error tests pass on
+/// any error at all.
+#[test]
+fn a_runtime_error_reports_a_line_far_into_the_program() {
+    let mut vm = Vm::new();
+    let source = (1..20)
+        .map(|n| format!("var v{n} = {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = vm.interpret(&format!("{source}\nSystem.print(v1.nope)"));
+    assert_eq!(result.unwrap_err().line(), 20);
+}
+
+#[test]
+fn a_runtime_error_inside_a_loop_reports_its_line() {
+    let mut vm = Vm::new();
+    let result = vm.interpret("var total = 0\nfor (i in 1..3) {\n  total = total + i\n}\ntotal.nope");
+    assert_eq!(result.unwrap_err().line(), 5);
+}
+
+#[test]
+fn a_runtime_error_inside_a_function_reports_its_line() {
+    let mut vm = Vm::new();
+    let result = vm.interpret("var f = Fn.new {\n  var x = 1\n  x.nope\n}\nf.call()");
+    assert_eq!(result.unwrap_err().line(), 3);
+}
+
 #[test]
 fn wrong_operand_type() {
     assert_eq!(

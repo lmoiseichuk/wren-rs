@@ -49,6 +49,27 @@ fn main() {
             continue;
         }
 
+        // What every compiled function costs, before it runs anything.
+        let (mut code, mut lines, mut constants, mut lookup) = (0, 0, 0, 0);
+        let mut functions = 0;
+        for index in 0..vm.heap.function_count() {
+            if let Some(chunk) = vm.heap.function_chunk(index) {
+                let (c, l, k, u) = chunk.footprint();
+                code += c;
+                lines += l;
+                constants += k;
+                lookup += u;
+                functions += 1;
+            }
+        }
+        println!();
+        println!("what the compiled program costs ({functions} functions)");
+        println!("  code          {code:>8} B");
+        println!("  line table    {lines:>8} B   ({:.1}x the code)", lines as f64 / code.max(1) as f64);
+        println!("  constants     {constants:>8} B");
+        println!("  constant index{lookup:>8} B   (compile-time only, still held)");
+        println!("  total         {:>8} B", code + lines + constants + lookup);
+
         let census = vm.heap.slot_census();
         let held: usize = census.iter().map(|(_, slots, _, size)| slots * size).sum();
         let live: usize = census

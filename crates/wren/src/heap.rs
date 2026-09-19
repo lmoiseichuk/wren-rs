@@ -1287,6 +1287,22 @@ impl Heap {
     /// ever. Whether that is worth a second level of indirection depends on
     /// how far apart these two columns actually are, which is a question about
     /// real programs. See "What is left worth building" in memory.md.
+    /// How many function slots the table has, for walking every chunk.
+    #[cfg(feature = "profile")]
+    pub fn function_count(&self) -> usize {
+        self.functions.slots.len()
+    }
+
+    /// The chunk of the function in slot `index`, if it holds one.
+    #[cfg(feature = "profile")]
+    pub fn function_chunk(&self, index: usize) -> Option<&crate::bytecode::Chunk> {
+        self.functions
+            .slots
+            .get(index)?
+            .as_ref()
+            .map(|function| &*function.chunk)
+    }
+
     #[cfg(feature = "profile")]
     pub fn slot_census(&self) -> alloc::vec::Vec<(&'static str, usize, usize, usize)> {
         alloc::vec![
