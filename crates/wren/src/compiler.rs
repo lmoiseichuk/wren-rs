@@ -525,6 +525,18 @@ impl<'a> Compiler<'a> {
         if level == 0 {
             return None;
         }
+
+        // **A method does not close over the locals surrounding its class.**
+        // Upstream stops the upvalue walk at the method boundary precisely so
+        // that a bare name in a method body falls through to a call on the
+        // receiver rather than capturing a variable from the code around the
+        // class -- see `findUpvalue` in wren_compiler.c. Without it, a local
+        // named `foo` outside a class shadows the class's own `foo` method
+        // inside it, which is the wrong way round.
+        if self.method_depth > 0 && level + 1 == self.method_depth {
+            return None;
+        }
+
         let enclosing = level - 1;
 
         if let Some(slot) = self.states[enclosing]

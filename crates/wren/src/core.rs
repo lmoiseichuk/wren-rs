@@ -156,6 +156,7 @@ pub fn install(vm: &mut Vm) {
     install_null(vm);
     install_string(vm);
     install_string_extras(vm);
+    install_string_views(vm);
     install_num_extras(vm);
     install_sequence(vm);
     install_list(vm);
@@ -222,7 +223,10 @@ fn install_object(vm: &mut Vm) {
         object.metaclass = Some(object_metaclass);
     }
     define(vm, object_metaclass, "same(_,_)", |vm, at| {
-        Ok(Value::bool(argument(vm, at, 1).is_same(argument(vm, at, 2))))
+        // **Value types compare by value**, so `Object.same(1..2, 1..2)` is
+        // true even though they are two objects. What `same` ignores is any
+        // `==` a *class* defines -- not the identity of the built-in values.
+        Ok(Value::bool(values_equal(vm, argument(vm, at, 1), argument(vm, at, 2))))
     });
 
     define(vm, class, "type", |vm, at| match vm.class_of(receiver(vm, at)) {
@@ -811,9 +815,17 @@ fn install_num_extras(vm: &mut Vm) {
             Some(digits) => u64::from_str_radix(digits, 16).ok().map(|value| value as f64),
             None => trimmed.parse::<f64>().ok(),
         };
-        // **Null rather than an error for junk.** The caller asked whether the
-        // text is a number, and "no" is an answer.
-        Ok(parsed.map_or(Value::NULL, Value::num))
+        // **Null rather than an error for junk**: the caller asked whether the
+        // text is a number, and "no" is an answer. A number too large to
+        // represent is different -- the text *is* a number, and quietly
+        // answering `infinity` would be a wrong one.
+        match parsed {
+            Some(value) if value.is_infinite() => {
+                Err(RuntimeError::new("Number literal is too large."))
+            }
+            Some(value) => Ok(Value::num(value)),
+            None => Ok(Value::NULL),
+        }
     });
 
     define(vm, metaclass, "pi", |_, _| Ok(Value::num(core::f64::consts::PI)));
@@ -902,6 +914,8 @@ fn install_string_extras(vm: &mut Vm) {
         // does. Equal to the length is allowed -- searching an empty tail is a
         // sensible question with the answer -1.
         let resolved = if start < 0.0 { start + text.len() as f64 } else { start };
+        // Equal to the length is allowed -- searching an empty tail answers
+        // -1 -- but past it is an error.
         if resolved < 0.0 || resolved > text.len() as f64 {
             return Err(RuntimeError::new("Start out of bounds."));
         }
@@ -984,29 +998,16 @@ fn install_string_extras(vm: &mut Vm) {
 
     // The byte and code-point views. Upstream returns lazy sequences; these are
     // lists, which answers `count`, `[_]` and iteration the same way.
+    // **Views over the string, not lists copied out of it.** A program can
+    // ask `s.bytes is StringByteSequence`, and building a list would also
+    // snapshot a string rather than read it.
     define(vm, class, "bytes", |vm, at| {
-        let values: Vec<Value> = string_bytes(vm, receiver(vm, at))
-            .iter()
-            .map(|byte| Value::num(*byte as f64))
-            .collect();
-        Ok(new_list(vm, values))
+        let class = vm.string_byte_sequence_class;
+        Ok(new_view(vm, class, &[receiver(vm, at)]))
     });
     define(vm, class, "codePoints", |vm, at| {
-        // **-1 for an incomplete sequence**, which is upstream's answer: the
-        // bytes are there and are not a character, and reporting a
-        // substitution character would claim the string holds something it
-        // does not.
-        let bytes = string_bytes(vm, receiver(vm, at));
-        let mut values = Vec::new();
-        let mut index = 0;
-        while index < bytes.len() {
-            match code_point_at(&bytes, index) {
-                Some(character) => values.push(Value::num(character as u32 as f64)),
-                None => values.push(Value::num(-1.0)),
-            }
-            index += utf8_length(bytes[index]);
-        }
-        Ok(new_list(vm, values))
+        let class = vm.string_code_point_sequence_class;
+        Ok(new_view(vm, class, &[receiver(vm, at)]))
     });
 
     // Iterating a string yields its characters, one code point at a time.
@@ -1156,6 +1157,103 @@ fn code_point_at(bytes: &[u8], at: usize) -> Option<char> {
         return None;
     }
     core::str::from_utf8(&bytes[at..end]).ok()?.chars().next()
+}
+
+/// `StringByteSequence` and `StringCodePointSequence`: two views over one
+/// string, differing only in what they call an element.
+///
+/// **Both index by byte.** That is not an oversight in the code-point view: a
+/// code point *starts* at a byte, and asking for one that starts inside a
+/// sequence is a real question with the answer -1. Numbering code points
+/// consecutively would make `s.codePoints[i]` and `s[i]` disagree about what
+/// `i` means, which is worse than an occasional -1.
+fn install_string_views(vm: &mut Vm) {
+    let class = vm.string_byte_sequence_class;
+
+    define(vm, class, "count", |vm, at| {
+        let string = instance_field(vm, receiver(vm, at), 0);
+        Ok(Value::num(string_bytes(vm, string).len() as f64))
+    });
+    define(vm, class, "[_]", |vm, at| {
+        let string = instance_field(vm, receiver(vm, at), 0);
+        let bytes = string_bytes(vm, string);
+        let index = number_argument(vm, at, 1)?;
+        let index = resolve_index(index, bytes.len())?;
+        Ok(Value::num(bytes[index] as f64))
+    });
+    define(vm, class, "iterate(_)", |vm, at| {
+        let string = instance_field(vm, receiver(vm, at), 0);
+        let length = string_bytes(vm, string).len();
+        let current = argument(vm, at, 1);
+        let next = if current.is_null() {
+            0.0
+        } else {
+            integer_argument(vm, at, 1, "Iterator")? + 1.0
+        };
+        if next < 0.0 || next >= length as f64 {
+            return Ok(Value::FALSE);
+        }
+        Ok(Value::num(next))
+    });
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        let string = instance_field(vm, receiver(vm, at), 0);
+        let bytes = string_bytes(vm, string);
+        let index = integer_argument(vm, at, 1, "Iterator")?;
+        if index < 0.0 || index as usize >= bytes.len() {
+            return Err(RuntimeError::new("Iterator out of bounds."));
+        }
+        Ok(Value::num(bytes[index as usize] as f64))
+    });
+
+    let class = vm.string_code_point_sequence_class;
+
+    define(vm, class, "count", |vm, at| {
+        let string = instance_field(vm, receiver(vm, at), 0);
+        let bytes = string_bytes(vm, string);
+        let count = bytes.iter().filter(|byte| !is_continuation(**byte)).count();
+        Ok(Value::num(count as f64))
+    });
+    define(vm, class, "[_]", |vm, at| {
+        let string = instance_field(vm, receiver(vm, at), 0);
+        let bytes = string_bytes(vm, string);
+        let index = number_argument(vm, at, 1)?;
+        let index = resolve_index(index, bytes.len())?;
+        Ok(Value::num(code_point_at(&bytes, index)
+            .map_or(-1.0, |character| character as u32 as f64)))
+    });
+    define(vm, class, "iterate(_)", |vm, at| {
+        // The same walk `String.iterate` does: one byte on, then past any
+        // continuation bytes.
+        let string = instance_field(vm, receiver(vm, at), 0);
+        let bytes = string_bytes(vm, string);
+        let current = argument(vm, at, 1);
+        let mut next = if current.is_null() {
+            0
+        } else {
+            let index = integer_argument(vm, at, 1, "Iterator")?;
+            if index < 0.0 || index as usize >= bytes.len() {
+                return Ok(Value::FALSE);
+            }
+            index as usize + 1
+        };
+        while next < bytes.len() && is_continuation(bytes[next]) {
+            next += 1;
+        }
+        if next >= bytes.len() {
+            return Ok(Value::FALSE);
+        }
+        Ok(Value::num(next as f64))
+    });
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        let string = instance_field(vm, receiver(vm, at), 0);
+        let bytes = string_bytes(vm, string);
+        let index = integer_argument(vm, at, 1, "Iterator")?;
+        if index < 0.0 || index as usize >= bytes.len() {
+            return Err(RuntimeError::new("Iterator out of bounds."));
+        }
+        Ok(Value::num(code_point_at(&bytes, index as usize)
+            .map_or(-1.0, |character| character as u32 as f64)))
+    });
 }
 
 /// Is this a UTF-8 continuation byte -- the second or later of a sequence?
@@ -1799,25 +1897,9 @@ fn install_list_extras(vm: &mut Vm) {
         Ok(new_list(vm, kept))
     });
 
-    define(vm, class, "any(_)", |vm, at| {
-        let function = argument(vm, at, 1);
-        for element in list_elements(vm, receiver(vm, at)) {
-            if !vm.call_function(function, &[element])?.is_falsy() {
-                return Ok(Value::TRUE);
-            }
-        }
-        Ok(Value::FALSE)
-    });
-
-    define(vm, class, "all(_)", |vm, at| {
-        let function = argument(vm, at, 1);
-        for element in list_elements(vm, receiver(vm, at)) {
-            if vm.call_function(function, &[element])?.is_falsy() {
-                return Ok(Value::FALSE);
-            }
-        }
-        Ok(Value::TRUE)
-    });
+    // `all` and `any` are not defined here: `Sequence` has them, and its
+    // versions return the deciding element rather than a boolean. A direct
+    // copy on `List` would have been faster and wrong.
 
     define(vm, class, "reduce(_)", |vm, at| {
         let function = argument(vm, at, 1);
@@ -2506,7 +2588,14 @@ fn install_system(vm: &mut Vm) {
         Ok(value)
     });
 
+    // Both the getter and the zero-argument method: `System.print` and
+    // `System.print()` are different signatures in Wren and both print a
+    // newline.
     define(vm, metaclass, "print", |vm, _| {
+        vm.output.push(b'\n');
+        Ok(Value::NULL)
+    });
+    define(vm, metaclass, "print()", |vm, _| {
         vm.output.push(b'\n');
         Ok(Value::NULL)
     });
@@ -2568,6 +2657,8 @@ fn install_system(vm: &mut Vm) {
         ("MapKeySequence", vm.map_key_sequence_class),
         ("MapValueSequence", vm.map_value_sequence_class),
         ("ClassAttributes", vm.class_attributes_class),
+        ("StringByteSequence", vm.string_byte_sequence_class),
+        ("StringCodePointSequence", vm.string_code_point_sequence_class),
         ("String", vm.string_class),
     ] {
         vm.modules[0].define(name, Value::object(class));

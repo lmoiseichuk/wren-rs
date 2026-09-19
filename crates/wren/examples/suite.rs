@@ -260,8 +260,13 @@ fn check(source: &str, directory: &Path) -> Result<(), String> {
     let mut expected = Vec::new();
 
     for line in source.lines() {
-        if let Some(at) = line.find("// expect: ") {
-            expected.push(line[at + 11..].to_string());
+        // **`// expect:` with nothing after it expects an empty line.**
+        // Requiring the trailing space dropped those expectations entirely,
+        // so a test printing a blank line looked like it printed one line too
+        // many.
+        if let Some(at) = line.find("// expect:") {
+            let rest = &line[at + 10..];
+            expected.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
         }
     }
 

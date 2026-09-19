@@ -249,6 +249,10 @@ pub struct Vm {
     pub map_value_sequence_class: ObjectId,
     /// What `Class.attributes` returns: a `self` map and a `methods` map.
     pub class_attributes_class: ObjectId,
+    /// What `String.bytes` and `String.codePoints` return: views over the
+    /// string, not copies of it.
+    pub string_byte_sequence_class: ObjectId,
+    pub string_code_point_sequence_class: ObjectId,
 
     /// The fiber currently running. Its stack and frames are the VM's own,
     /// and are swapped back into it when control moves elsewhere.
@@ -334,6 +338,9 @@ impl Vm {
         let map_key_sequence_class = class_named(&mut heap, "MapKeySequence", iterable);
         let map_value_sequence_class = class_named(&mut heap, "MapValueSequence", iterable);
         let class_attributes_class = class_named(&mut heap, "ClassAttributes", root);
+        let string_byte_sequence_class = class_named(&mut heap, "StringByteSequence", iterable);
+        let string_code_point_sequence_class =
+            class_named(&mut heap, "StringCodePointSequence", iterable);
 
         let mut vm = Vm {
             heap,
@@ -365,6 +372,8 @@ impl Vm {
             map_key_sequence_class,
             map_value_sequence_class,
             class_attributes_class,
+            string_byte_sequence_class,
+            string_code_point_sequence_class,
             current_fiber: None,
             root_fiber: None,
             pending_switch: None,
@@ -803,7 +812,8 @@ impl Vm {
             self.random_class, self.sequence_class, self.map_sequence_class,
             self.where_sequence_class, self.take_sequence_class, self.skip_sequence_class,
             self.map_key_sequence_class, self.map_value_sequence_class,
-            self.class_attributes_class,
+            self.class_attributes_class, self.string_byte_sequence_class,
+            self.string_code_point_sequence_class,
         ] {
             roots.push(Value::object(class));
         }
@@ -1828,25 +1838,13 @@ impl Vm {
             return Err(RuntimeError::new("Method body is not a closure."));
         };
 
-        // **Where the field offset is filled in.** The compiler numbered this
-        // method's fields from zero; now that the class is known, so is how
-        // many fields the superclass already occupies.
-        let inherited = match self.heap.get(class_id) {
-            Some(Object::Class(class)) => match class.superclass {
-                Some(superclass) => match self.heap.get(superclass) {
-                    Some(Object::Class(superclass)) => superclass.num_fields.max(0) as usize,
-                    _ => 0,
-                },
-                None => 0,
-            },
-            _ => 0,
-        };
-        let superclass = match self.heap.get(class_id) {
-            Some(Object::Class(class)) => class.superclass,
-            _ => None,
-        };
-        self.set_field_offset(closure, inherited, superclass, class_id);
-
+        // **Which class the method lands on is decided first**, because
+        // everything else follows from it. A static method is installed on the
+        // metaclass, so its `super` must start from the *metaclass's*
+        // superclass -- `Class` -- and not from the class's. Deriving `super`
+        // from `class_id` sent `super.name` in a static method looking through
+        // `Object`, where `name` is not, rather than through `Class`, where it
+        // is.
         let target = if is_static {
             match self.heap.get(class_id) {
                 Some(Object::Class(class)) => class.metaclass.unwrap_or(class_id),
@@ -1855,6 +1853,23 @@ impl Vm {
         } else {
             class_id
         };
+
+        let superclass = match self.heap.get(target) {
+            Some(Object::Class(class)) => class.superclass,
+            _ => None,
+        };
+
+        // **Where the field offset is filled in.** The compiler numbered this
+        // method's fields from zero; now that the class is known, so is how
+        // many fields the superclass already occupies.
+        let inherited = match superclass {
+            Some(superclass) => match self.heap.get(superclass) {
+                Some(Object::Class(superclass)) => superclass.num_fields.max(0) as usize,
+                _ => 0,
+            },
+            None => 0,
+        };
+        self.set_field_offset(closure, inherited, superclass, class_id);
 
         if let Some(Object::Class(class)) = self.heap.get_mut(target) {
             class.define(symbol, Method::Closure(closure));
