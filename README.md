@@ -120,6 +120,7 @@ one has to provide.
 | — this crate's own tests | 193 |
 | **step 4 — bytecode** | **done, measured** |
 | — the suite, run from `.wrenc` | **829 of 829** |
+| — the suite in an `f32` build | 798 of 829 — *not Wren, and off by default* |
 
 ### Step 3: the language is complete
 
@@ -205,8 +206,9 @@ against 83,036 B is the figure that decides whether a part is usable at all.
 The speed result contradicts this repository's own design note, which put the
 cost of reaching objects by index rather than by pointer at "single-digit to
 low-double-digit percent". It was 4–8x on the first run and is 4–7x after the
-work described below, worst on `method_call`, which is almost pure dispatch. [`doc/wren-rs/design.md`](doc/wren-rs/design.md) is corrected and
-says why the estimate was wrong: it was reasoned about as one bounds check per
+work described below, worst on `method_call`, which is almost pure dispatch.
+[`doc/wren-rs/design.md`](doc/wren-rs/design.md) is corrected and says why the
+estimate was wrong: it was reasoned about as one bounds check per
 field access, and a single method call traverses six references — receiver to
 class, class through its box, class to method table, method to closure, closure
 to function, function to chunk. Upstream follows a pointer at each.
@@ -274,31 +276,45 @@ tools/build-bytecode.sh --check   # verify each against its source
 test compiled, written, re-loaded into a fresh VM and run. That is the claim
 that matters before any number below: the two paths produce the same program.
 
-**Speed, source against bytecode** — the same four programs, same board, same
-profiles. The only difference is whether the device compiled them.
+**Four builds, no compiler linked** — the configuration a device actually
+ships. Same board, same bytecode; the only differences are the optimiser and
+whether a number is a double or a single.
 
-*These were taken before the optimisation work above, so they do not match the
-step 3 tables. Both columns of each pair come from the same commit, which is
-what makes the comparison inside the table valid:*
-
-| benchmark | `speed` source | `speed` bytecode | `size` source | `size` bytecode |
+| | `-Os` f64 | `-Os` f32 | `-O3` f64 | `-O3` f32 |
 |---|---|---|---|---|
-| `binary_trees` depth 9 | 8.616 | 8.366 | 17.087 | 15.025 |
-| `fib(24)` x5 | 18.176 | 18.064 | 34.921 | 34.686 |
-| `list_build` 10,000 | 0.574 | 0.568 | 1.028 | 1.017 |
-| `method_call` | 2.766 | 2.750 | 4.810 | 4.782 |
+| `binary_trees` depth 9 | 14.172 s | 13.042 s | 7.882 s | **7.015 s** |
+| `fib(24)` x5 | 32.642 s | 29.739 s | 16.737 s | **14.638 s** |
+| `list_build` 10,000 | 0.992 s | 0.891 s | 0.570 s | **0.495 s** |
+| `method_call` | 4.183 s | 3.914 s | 2.382 s | **2.128 s** |
+| image | 244,416 B | **227,184 B** | 360,816 B | 341,056 B |
+| VM resident | 24,680 B | **23,880 B** | 24,680 B | **23,880 B** |
+| `binary_trees` heap | 155,676 B | **120,772 B** | 155,672 B | **120,772 B** |
+| `list_build` heap | 132,096 B | **66,508 B** | 132,096 B | **66,508 B** |
+| loading a program | 785–1,924 µs | 781–1,924 µs | 758–1,375 µs | 756–1,416 µs |
 
-These are the *same bytecode* executing either way, so the small spread is
-instruction-cache layout, not a property of the strategy. Loading a benchmark
-took 686–1,886 µs.
+**`f32` is 6–13% faster, 17–20 KB smaller, and takes a fifth to a half off the
+heap.** The part has neither the `F` nor the `D` extension, so both widths are
+software and the narrower one is simply less work; `list_build`'s heap halves
+because a list of 10,000 numbers is 10,000 `Value`s.
 
-**Footprint** — what the compiler was worth:
+**It is not Wren, and the cost is exact rather than vague.** An `f32` holds
+integers exactly only to 2^24, so `list_build` — which sums to 49,995,000 —
+prints **49,992,896**. Upstream's suite goes from 829 of 829 to 798, every
+failure a precision one. The feature is off by default and conformance runs and
+every other table here are `f64`.
 
-| | `size` | `speed` |
+**The compiler is a flat cost on top of any of these**, which is why it is out
+of the table rather than in it. One package built twice, with and without
+`wren/compiler`:
+
+| | `-Os` | `-O3` |
 |---|---|---|
-| benchmarks, compiler linked | 273,376 B | 428,144 B |
-| benchmarks, no compiler | **239,184 B** | **349,680 B** |
-| **the compiler** | **34,192 B** | **78,464 B** |
+| `f64` bytecode / with compiler | 244,960 B / 279,440 B | 363,568 B / 444,784 B |
+| `f32` bytecode / with compiler | 227,712 B / 262,256 B | 343,776 B / 425,104 B |
+| **the compiler** | **~34,500 B** | **~81,200 B** |
+
+It barely moves with the number width — 34,480 B against 34,544 B — because a
+lexer and a parser do not care how wide a double is.
 
 #### A node, not a harness
 
@@ -308,26 +324,27 @@ and runs that — MicroPython's convention, and a missing name is skipped rather
 than faulted. It is **one package built twice**, so the only difference between
 the two images is whether `wren/compiler` is on.
 
-| | `-Os` bytecode | `-Os` compiler | `-O3` bytecode | `-O3` compiler |
-|---|---|---|---|---|
-| image | **239,728 B** | 274,160 B | **352,544 B** | 431,744 B |
-| prepare, both files | **9,674 µs** | 66,158 µs | **6,297 µs** | 54,747 µs |
-| run, both files | 3,281,147 µs | 3,294,957 µs | 2,018,227 µs | 1,971,631 µs |
-| reset to idle | **3,308,789 µs** | 3,379,348 µs | 2,038,688 µs | 2,040,777 µs |
-| heap left | **170,820 B** | 160,332 B | **170,820 B** | 160,332 B |
+| `-Os` | bytecode | compiler |
+|---|---|---|
+| image | **244,960 B** | 279,440 B |
+| prepare, both files | **9,821 µs** | 64,154 µs |
+| run, both files | 3,196,086 µs | 3,211,906 µs |
+| reset to idle | **3,228,083 µs** | 3,298,642 µs |
+| heap left | **183,040 B** | 172,552 B |
 
-**The image is where it wins**: 34,432 B at `-Os`. Of that, 3,393 B is the
-programs being smaller as bytecode than as source and **31,039 B is the lexer
-and the parser**.
-
-**Preparation is 6.8–8.7x faster and here it barely matters** — 9.7 ms against
-66.2 ms, against programs that then run for two seconds. It becomes the
+**Preparation is 6.5x faster and here it barely matters** — 9.8 ms against
+64.2 ms, against programs that then run for three seconds. It becomes the
 dominant number on the duty cycle these parts are actually bought for: a node
-that wakes, samples and sleeps pays prepare on every wake.
+that wakes, samples and sleeps pays prepare on every wake and the run cost for
+a few milliseconds.
+
+**Running is a wash, as it should be.** Both builds execute the same bytecode
+through the same interpreter, and that the two agree is the evidence the
+comparison is sound.
 
 **What bytecode costs is everything a compiler would have allowed.** No REPL,
-no `eval`, no accepting a program that arrives over the air as text. 31 KB is
-what that is worth.
+no `eval`, no accepting a program that arrives over the air as text. That is
+the trade, and ~34,500 B is what it is worth.
 
 Details, and the programs themselves:
 **[`ports/esp32c6-wren-boot/README.md`](ports/esp32c6-wren-boot/README.md)**.

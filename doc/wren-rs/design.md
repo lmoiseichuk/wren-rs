@@ -100,7 +100,9 @@ for nothing.
 
 Getting below 24 needs the alignment gone, and that means `Value` no longer
 being 8-byte aligned. The only route to that is a 32-bit `Value`, which means
-32-bit floats -- see **Numbers as `f32`** below.
+32-bit floats. **That is built** -- the `f32` feature -- and it does reach
+20 bytes a slot, by removing the alignment rather than the payload. See
+**Numbers as `f32`** below.
 
 It is a floor that has to be defended, though. `ObjUpvalue` originally stored
 `Option<Value>` for "closed, and here is the value" — the obvious spelling, and
@@ -255,34 +257,66 @@ than a prediction about them.
 ### Numbers as `f32`
 
 Wren's `Num` is a double, and that is a language guarantee rather than an
-implementation choice — but on a part with no FPU it is an expensive one, and
-the question of a 32-bit build is open.
+implementation choice — but on a part with no FPU it is an expensive one. This
+is now built, behind the `f32` feature, off by default. **With it on, this is
+not Wren.**
 
-What it would buy, from the census numbers above:
+Measured on an ESP32-C6FH4 at 160 MHz, running bytecode with no compiler
+linked, `f64` against `f32`:
 
-- **`Value` becomes 4 bytes**, halving every instance field, list element, map
-  entry and stack slot. `list_build`'s single list goes from 131,072 B to
-  65,536 B.
-- **`ObjRange` becomes 12 B and the enum's alignment drops to 4**, so a heap
-  slot is 20 B instead of 24 — the only route past the floor described above.
-- Software `f32` arithmetic is cheaper than software `f64`, and on
-  `riscv32imac` both are software: the part has neither the `F` nor the `D`
-  extension.
+| | `-Os` | `-O3` |
+|---|---|---|
+| `binary_trees` | 14.172 → 13.042 s | 7.882 → 7.015 s |
+| `fib` | 32.642 → 29.739 s | 16.737 → 14.638 s |
+| `list_build` | 0.992 → 0.891 s | 0.570 → 0.495 s |
+| `method_call` | 4.183 → 3.914 s | 2.382 → 2.128 s |
+| image | 244,416 → 227,184 B | 360,816 → 341,056 B |
+| `binary_trees` heap | 155,676 → 120,772 B | same |
+| `list_build` heap | 132,096 → 66,508 B | same |
 
-What it costs, and why it can only ever be a feature that is off by default:
+Six to thirteen percent faster, 17–20 KB smaller, and a fifth to a half off the
+heap. `riscv32imac` has neither the `F` nor the `D` extension, so both widths
+are software and the narrower one is simply less work.
 
-- **NaN tagging has to be redesigned, not retyped.** The layout depends on a
-  double's 52-bit mantissa. An `f32` quiet NaN leaves the sign bit and 22
-  mantissa bits, which is enough — 22 bits addresses four million objects where
-  a 320 KB heap holds about sixteen thousand — but it is a different encoding
-  with different constants, not a `type Num = f32`.
-- **It changes answers.** An `f32` represents integers exactly only to
-  2^24 = 16,777,216. `list_build` sums to 49,995,000 and would print something
-  else. A good part of upstream's 829 tests assert double-precision output, so
-  conformance runs and every published benchmark have to stay on `f64`.
+**The layout, which is the part this document is for.** A `Value` is 4 bytes,
+so every stack slot, list element, instance field and map entry halves —
+`list_build`'s heap halving is a list of 10,000 numbers and nothing else.
+`ObjRange` becomes 12 B rather than 24, and the enum's alignment drops from 8
+to 4, so the largest payload of 16 plus a tag rounds to **20 bytes a slot
+instead of 24**. That is the floor this document said could only be reached
+this way, and it was.
 
-That is a legitimate feature for a part that cannot afford doubles, clearly
-labelled as not being Wren. It is not a default.
+**It is not a retype.** NaN tagging depends on the mantissa. A double leaves 52
+bits and a handle needs 32, so nothing is lost; a single leaves 23, of which
+`QNAN` spends two. So the encoding is redone at the narrower width and a handle
+gets **21 bits — 2,097,151 objects**, against the roughly sixteen thousand a
+320 KB heap holds at 20 bytes each. `Value::object` asserts it in debug builds
+rather than silently aliasing two objects onto one handle.
+
+**It changes answers, and the cost is exact rather than vague.** An `f32` holds
+integers exactly only to 2^24, so `list_build` — which sums to 49,995,000 —
+prints 49,992,896. Upstream's suite goes from 829 of 829 to **798**, every
+failure a precision one. Conformance runs and every published benchmark stay on
+`f64`.
+
+Three things needed real work rather than a type swap, and they are the ones
+worth knowing about before turning this on for something else:
+
+- **`Random` stored its four `u32` state words one per field.** A `Num` holds
+  one exactly only when it is a double, so at the narrow width the state would
+  have been rounded on every step and the generator would have collapsed. Each
+  word is now kept as two 16-bit halves, which both widths hold exactly.
+- **Two hash folds shifted a number's bits right by 32**, which is an overflow
+  when those bits are 32 wide. Both widen first, so the fold is a no-op rather
+  than a panic.
+- **Formatting drops from fourteen significant digits to eight.** Seven would
+  send any integer above 9,999,999 into exponential form while an `f32` still
+  holds integers exactly to 16,777,216; nine would stop `0.1` printing as
+  `0.1`. Eight is the value that keeps both.
+
+The `.wrenc` format is unchanged and stores a number as a double whatever the
+build is: bytecode is produced on a workstation and read on a part, and the two
+need not agree about the width.
 
 ### The alternative that has not been built
 

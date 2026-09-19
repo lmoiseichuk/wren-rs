@@ -56,6 +56,36 @@ is **2x**, where the C port's `-Os` against `-O2` is 13–20%. A VM written as
 many small Rust functions depends on inlining in a way a C switch loop does
 not, and `opt-level = "z"` declines to do it.
 
+### Numbers at 32 bits
+
+`crates/wren` has an `f32` feature. It is off by default and **with it on this
+is not Wren** — the language says `Num` is a double — but on a part with no FPU
+it is worth what it costs. Measured the same way, running bytecode with no
+compiler linked:
+
+| benchmark | `-Os` f64 | `-Os` f32 | `-O3` f64 | `-O3` f32 |
+|---|---|---|---|---|
+| `binary_trees` | 14.172 s | 13.042 s | 7.882 s | **7.015 s** |
+| `fib` | 32.642 s | 29.739 s | 16.737 s | **14.638 s** |
+| `list_build` | 0.992 s | 0.891 s | 0.570 s | **0.495 s** |
+| `method_call` | 4.183 s | 3.914 s | 2.382 s | **2.128 s** |
+| image | 244,416 B | **227,184 B** | 360,816 B | 341,056 B |
+| VM resident | 24,680 B | **23,880 B** | 24,680 B | **23,880 B** |
+| `binary_trees` heap | 155,676 B | **120,772 B** | 155,672 B | **120,772 B** |
+| `list_build` heap | 132,096 B | **66,508 B** | 132,096 B | **66,508 B** |
+
+Six to thirteen percent faster, 17–20 KB smaller, and a fifth to a half off the
+heap. `riscv32imac` has neither the `F` nor the `D` extension, so both widths
+are software and the narrower one is less work; `list_build`'s heap halves
+because a list of 10,000 numbers is 10,000 `Value`s and a `Value` is now four
+bytes rather than eight.
+
+**The cost is exact rather than vague.** An `f32` holds integers exactly only
+to 2^24, so `list_build` — which sums to 49,995,000 — prints **49,992,896**,
+and upstream's suite goes from 829 of 829 to 798, every failure a precision
+one. That is why the feature is off by default and why every other number on
+this page is `f64`.
+
 ## Memory
 
 The one clear win, and it is a large one:

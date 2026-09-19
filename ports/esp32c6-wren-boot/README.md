@@ -15,6 +15,7 @@ One package, one `main.rs`, two images. The only difference is a cargo feature:
 ```sh
 cargo build --profile size                      # looks for boot.wrenc, main.wrenc
 cargo build --profile size --features compiler  # looks for boot.wren,  main.wren
+cargo build --profile size --features f32       # ...and with 32-bit numbers
 ```
 
 Separate packages would have let the two drift apart in a dozen small ways that
@@ -32,34 +33,50 @@ two is the whole argument:
 
 ESP32-C6FH4 at 160 MHz, 320 KB heap, both programs run in one VM.
 
-| | `-Os` bytecode | `-Os` compiler | `-O3` bytecode | `-O3` compiler |
-|---|---|---|---|---|
-| image | **239,728 B** | 274,160 B | **352,544 B** | 431,744 B |
-| programs in image | 8,422 B | 11,815 B | 8,422 B | 11,815 B |
-| prepare, both files | **9,674 µs** | 66,158 µs | **6,297 µs** | 54,747 µs |
-| run, both files | 3,281,147 µs | 3,294,957 µs | 2,018,227 µs | 1,971,631 µs |
-| reset to idle | **3,308,789 µs** | 3,379,348 µs | 2,038,688 µs | 2,040,777 µs |
-| heap left | **170,820 B** | 160,332 B | **170,820 B** | 160,332 B |
-| VM resident | 45,676 B | 45,676 B | 45,676 B | 45,676 B |
+| `-Os` | bytecode | compiler |
+|---|---|---|
+| image | **244,960 B** | 279,440 B |
+| programs in image | 8,422 B | 11,815 B |
+| prepare, both files | **9,821 µs** | 64,154 µs |
+| run, both files | 3,196,086 µs | 3,211,906 µs |
+| reset to idle | **3,228,083 µs** | 3,298,642 µs |
+| heap left | **183,040 B** | 172,552 B |
+| VM resident | 24,680 B | 24,680 B |
+
+Images for the other three builds, which is the whole of what the two features
+are worth on flash:
+
+| | `-Os` | `-O3` |
+|---|---|---|
+| `f64` bytecode | 244,960 B | 363,568 B |
+| `f64` + compiler | 279,440 B | 444,784 B |
+| `f32` bytecode | 227,712 B | 343,776 B |
+| `f32` + compiler | 262,256 B | 425,104 B |
 
 Read across the rows rather than down the columns:
 
-**The image is where bytecode wins.** 34,432 B at `-Os` and 79,200 B at `-O3`.
+**The image is where bytecode wins.** 34,480 B at `-Os` and 81,216 B at `-O3`.
 Of the `-Os` saving, 3,393 B is the programs themselves being smaller as
-bytecode than as source; the remaining **31,039 B is the lexer and the parser**,
-which is what the feature actually removes.
+bytecode than as source; the rest is the lexer and the parser. It barely moves
+with the number width — 34,480 B against 34,544 B — because a lexer does not
+care how wide a double is. That is why the compiler is quoted as a flat cost
+rather than folded into a runtime comparison.
 
-**Preparation is 6.8× to 8.7× faster, and it does not matter much here.**
-Loading both files takes 9.7 ms against 66.2 ms to compile them — a real
-difference, and an irrelevant one against a program that then runs for two
-seconds. It is worth having when start-up latency is the thing being paid for:
-a node that wakes, samples and sleeps pays the prepare cost on every wake and
-the run cost for a few milliseconds. For that duty cycle the ratio inverts and
-this is the dominant number.
+**`f32` is worth 17,248 B at `-Os`** on top of whichever of those you pick, and
+it is a runtime saving rather than a static one: it also takes a fifth to a
+half off the heap. It is off by default and it is not Wren — see
+`crates/wren`'s own feature documentation.
+
+**Preparation is 6.5x faster, and it does not matter much here.** Loading both
+files takes 9.8 ms against 64.2 ms to compile them — a real difference, and an
+irrelevant one against programs that then run for three seconds. It is worth
+having when start-up latency is the thing being paid for: a node that wakes,
+samples and sleeps pays the prepare cost on every wake and the run cost for a
+few milliseconds. For that duty cycle the ratio inverts and this is the
+dominant number.
 
 **Running is a wash, as it should be.** Both builds execute the same bytecode
-through the same interpreter. At `-Os` the bytecode build came out 0.4% ahead
-and at `-O3` 2.4% behind; neither is a property of the strategy, both are
+through the same interpreter, and the half-percent between them is
 instruction-cache layout. That the two agree is the evidence the comparison is
 sound — a real difference here would mean the two builds were not running the
 same program.
