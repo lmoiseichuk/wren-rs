@@ -115,7 +115,7 @@ fn line_comments_end_at_the_newline_and_not_before() {
 #[test]
 fn numbers_are_doubles_including_the_hexadecimal_ones() {
     // Wren has one numeric type. `0xff` is 255.0, not an integer.
-    let source = "0 1 42 3.14 1e3 1e-3 0xff 0X10";
+    let source = "0 1 42 2.75 1e3 1e-3 0xff 0X10";
     let mut lexer = Lexer::new(source);
     let mut values = Vec::new();
     loop {
@@ -126,7 +126,7 @@ fn numbers_are_doubles_including_the_hexadecimal_ones() {
             other => panic!("expected a number, got {other:?}"),
         }
     }
-    assert_eq!(values, [0.0, 1.0, 42.0, 3.14, 1000.0, 0.001, 255.0, 16.0]);
+    assert_eq!(values, [0.0, 1.0, 42.0, 2.75, 1000.0, 0.001, 255.0, 16.0]);
 }
 
 #[test]

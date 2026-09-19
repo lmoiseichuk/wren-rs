@@ -85,13 +85,21 @@ one first.
 ## Layout
 
 ```
-src/            the Rust VM -- the crate a firmware depends on
+crates/wren/    the Rust VM -- the crate a firmware depends on
 vendor/wren/    upstream wren-lang/wren, submodule, unmodified
+benchmarks/     the same programs in both languages, same constants
+doc/wren/       what upstream Wren and MicroPython measured
+doc/wren-rs/    why the Rust implementation is built the way it is
 ports/          one directory per (board, implementation) pair
   esp32c6-wren/          step 1, the C reference
   esp32c6-micropython/   step 2, the baseline
   esp32c6-wren-rs/       step 3, the deliverable
 ```
+
+**`crates/wren` is a standalone package**, and the workspace root carries no
+code of its own. Somebody adding this to a firmware takes that crate and none of
+the rest: the vendored upstream, the harnesses and the ports all exist to
+measure it, not to ship with it.
 
 `ports/README.md` holds the rule that makes the three comparable, and what each
 one has to provide.
@@ -103,8 +111,10 @@ one has to provide.
 | upstream submodule | pinned at 0.4.0 |
 | **step 1 — C reference on the C6** | **done, measured** |
 | **step 2 — MicroPython baseline** | **done, measured** |
-| Rust lexer | first pass written, host-tested |
-| Rust compiler, VM, GC | not started |
+| **step 3 — the Rust VM** | **started** |
+| — lexer | written, 24 tests |
+| — values, objects, collector | written, 28 tests |
+| — compiler, interpreter loop | not started |
 
 ### Steps 1 and 2: the numbers to beat
 
@@ -128,6 +138,21 @@ the suite results are in [`doc/wren/README.md`](doc/wren/README.md).
 and paying for it in heap. The image comparison is against a stock
 `ESP32_GENERIC_C6` carrying networking and TLS, so it flatters Wren; the heap
 and speed figures are like for like.
+
+### Step 3 so far
+
+The lexer, the value representation, the object model and a mark-sweep collector
+over it — 52 tests, `#![forbid(unsafe_code)]`, and it builds for
+`riscv32imac-unknown-none-elf` with and without an allocator.
+
+**The central decision is the object representation**, because most of the rest
+follows from it. Values are NaN-tagged into 8 bytes as upstream does, but
+objects are reached by a 4-byte handle into one table rather than by pointer —
+which means an object carries **no header at all** where upstream spends 16
+bytes on one, the collector can be replaced without touching the rest of the VM,
+and none of it needs `unsafe`. What it costs is set out beside what it buys in
+[`crates/wren/README.md`](crates/wren/README.md), with the full argument and the
+measured layout in [`doc/wren-rs/design.md`](doc/wren-rs/design.md).
 
 ### What step 1 established about the small parts
 

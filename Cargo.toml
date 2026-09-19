@@ -1,30 +1,18 @@
-[package]
-name = "wren-rs"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-description = "Wren, re-implemented in Rust for microcontrollers"
-repository = "https://github.com/ldm/wren-rs"
-categories = ["no-std", "embedded", "compilers"]
-keywords = ["wren", "scripting", "embedded", "interpreter"]
+# The workspace root. **It carries no code of its own.**
+#
+# `crates/wren` is the deliverable: a standalone package somebody can depend on
+# without taking the rest of this repository with them. Everything else here --
+# the C reference port, the benchmark harnesses, the vendored upstream -- exists
+# to measure that crate, not to be shipped with it.
+[workspace]
+resolver = "2"
+members = ["crates/wren"]
 
-[lib]
-name = "wren"
-
-# **No dependencies, and that is a design constraint rather than an accident.**
-# The point of this crate is that a firmware can `cargo add` it without pulling a
-# C toolchain or a tree of crates behind it. Anything added here has to be paid
-# for in flash on a part with 62 KB of it.
-[dependencies]
-
-[features]
-default = ["std"]
-# `std` is for the host: tests, and eventually an ahead-of-time compiler that
-# runs on a workstation and emits bytecode for a part that cannot afford one.
-# Firmware builds turn it off.
-std = []
-
+# Applied to every member. A part with 62 KB of flash cannot afford the default
+# release profile's inlining, and `panic = "abort"` removes the unwinder, which
+# is several kilobytes that a microcontroller has no use for.
 [profile.release]
 opt-level = "z"
 lto = true
+codegen-units = 1
 panic = "abort"
