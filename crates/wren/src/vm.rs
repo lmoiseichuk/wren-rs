@@ -731,6 +731,13 @@ impl Vm {
     /// used when it has one.
     pub fn stringify(&mut self, value: Value) -> Result<String, RuntimeError> {
         let text = self.invoke(value, "toString")?;
+        // **A `toString` that returns something other than a string is not an
+        // error.** Wren prints a placeholder, because failing here would mean
+        // a debugging `System.print` could itself raise -- exactly when the
+        // program is already misbehaving.
+        if self.string_at(text).is_none() {
+            return Ok("[invalid toString]".to_string());
+        }
         Ok(self.to_string(text))
     }
 
@@ -1653,7 +1660,13 @@ impl Vm {
         };
 
         // A metaclass, so the class can carry static methods and a constructor.
-        let metaclass_name = self.heap.allocate(Object::String(ObjString::from_text("metaclass")));
+        let class_name = match self.heap.get(name_id) {
+            Some(Object::String(text)) => text.as_str().unwrap_or("?").to_string(),
+            _ => "?".to_string(),
+        };
+        let metaclass_name = self
+            .heap
+            .allocate(Object::String(ObjString::from_text(&format!("{class_name} metaclass"))));
         let metaclass = self.heap.allocate(Object::Class(Box::new(ObjClass::new(
             metaclass_name,
             Some(self.class_class),

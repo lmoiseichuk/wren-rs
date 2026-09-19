@@ -1038,3 +1038,107 @@ System.print([1, Named.new()])
 ";
     assert_eq!(run(source), "[1, named!]\n");
 }
+
+// --- the map's hash table ---------------------------------------------------
+
+#[test]
+fn a_map_finds_keys_after_many_insertions() {
+    // Enough entries to force several growths, each rehashing everything.
+    let source = "
+var m = {}
+for (i in 1..200) m[i] = i * 2
+var total = 0
+for (i in 1..200) total = total + m[i]
+System.print(m.count)
+System.print(total)
+";
+    assert_eq!(run(source), "200\n40200\n");
+}
+
+#[test]
+fn removing_an_entry_does_not_strand_the_ones_behind_it() {
+    // **The tombstone test.** A key that collided with the removed one probed
+    // past its slot on the way in. Blanking the slot rather than marking it
+    // would end that probe early and lose the later key entirely -- and only
+    // for keys that happened to collide, which is why it needs a lot of them
+    // rather than a hand-picked pair.
+    let source = "
+var m = {}
+for (i in 1..100) m[i] = i
+for (i in 1..100) {
+  if (i % 3 == 0) m.remove(i)
+}
+var found = 0
+for (i in 1..100) {
+  if (i % 3 != 0 && m[i] == i) found = found + 1
+}
+System.print(found)
+System.print(m.count)
+";
+    assert_eq!(run(source), "67\n67\n");
+}
+
+#[test]
+fn a_slot_can_be_reused_after_removal() {
+    let source = "
+var m = {}
+for (i in 1..50) {
+  m[\"key\"] = i
+  m.remove(\"key\")
+}
+m[\"key\"] = \"last\"
+System.print(m.count)
+System.print(m[\"key\"])
+";
+    assert_eq!(run(source), "1\nlast\n");
+}
+
+#[test]
+fn keys_of_every_value_type_work() {
+    let source = "
+var m = {}
+m[1] = \"num\"
+m[\"s\"] = \"string\"
+m[true] = \"bool\"
+m[null] = \"null\"
+m[1..2] = \"range\"
+System.print(m[1])
+System.print(m[\"s\"])
+System.print(m[true])
+System.print(m[null])
+System.print(m[1..2])
+System.print(m.count)
+";
+    assert_eq!(run(source), "num\nstring\nbool\nnull\nrange\n5\n");
+}
+
+#[test]
+fn negative_zero_and_zero_are_the_same_key() {
+    // They are `==`, so they must hash alike or one would be unreachable.
+    assert_eq!(run("var m = {}\nm[0] = \"a\"\nm[-0.0] = \"b\"\nSystem.print(m.count)\nSystem.print(m[0])"), "1\nb\n");
+}
+
+#[test]
+fn iterating_a_map_visits_every_entry_once() {
+    let source = "
+var m = {}
+for (i in 1..30) m[i] = i
+var seen = 0
+var total = 0
+for (entry in m) {
+  seen = seen + 1
+  total = total + entry.value
+}
+System.print(seen)
+System.print(total)
+";
+    assert_eq!(run(source), "30\n465\n");
+}
+
+#[test]
+fn an_invalid_map_iterator_is_an_error() {
+    assert_eq!(
+        error("var m = {}\nm[1] = 1\nm.iteratorValue(500)"),
+        "Invalid map iterator."
+    );
+}

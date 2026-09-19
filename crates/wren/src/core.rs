@@ -1074,6 +1074,18 @@ fn install_sequence(vm: &mut Vm) {
         Ok(total)
     });
 
+    define(vm, class, "count(_)", |vm, at| {
+        let sequence = receiver(vm, at);
+        let function = function_argument(vm, at, 1)?;
+        let mut count = 0.0;
+        for element in collect(vm, sequence)? {
+            if !vm.call_function(function, &[element])?.is_falsy() {
+                count += 1.0;
+            }
+        }
+        Ok(Value::num(count))
+    });
+
     define(vm, class, "join()", |vm, at| {
         let sequence = receiver(vm, at);
         let joined = join_sequence(vm, sequence, "")?;
@@ -1438,11 +1450,51 @@ fn install_list_extras(vm: &mut Vm) {
     define(vm, class, "+(_)", |vm, at| {
         let mut joined = list_elements(vm, receiver(vm, at));
         let other = argument(vm, at, 1);
-        if !matches!(other.as_object().and_then(|id| vm.heap.get(id)), Some(Object::List(_))) {
-            return Err(RuntimeError::new("Right operand must be a list."));
-        }
-        joined.extend(list_elements(vm, other));
+        // **Any sequence on the right**, not just a list: `[1, 2] + "abc"`
+        // appends the characters and `[1] + (2..3)` the numbers. Requiring a
+        // list would be a narrower language than Wren.
+        joined.extend(collect(vm, other)?);
         Ok(new_list(vm, joined))
+    });
+
+    define(vm, class, "addAll(_)", |vm, at| {
+        let list = receiver(vm, at);
+        let other = argument(vm, at, 1);
+        // Any sequence, not just a list: `list.addAll(1..3)` is ordinary Wren.
+        let added = collect(vm, other)?;
+        match vm.heap.get_mut(list.as_object().unwrap()) {
+            Some(Object::List(list)) => list.elements.extend(added),
+            _ => return Err(RuntimeError::new("Receiver must be a list.")),
+        }
+        Ok(other)
+    });
+
+    define(vm, class, "remove(_)", |vm, at| {
+        let list = receiver(vm, at);
+        let wanted = argument(vm, at, 1);
+        let found = list_elements(vm, list)
+            .iter()
+            .position(|element| values_equal(vm, *element, wanted));
+        match (found, vm.heap.get_mut(list.as_object().unwrap())) {
+            (Some(index), Some(Object::List(list))) => Ok(list.elements.remove(index)),
+            // Removing something that is not there answers null rather than
+            // failing, which is what makes `remove` usable without a
+            // `contains` in front of it.
+            _ => Ok(Value::NULL),
+        }
+    });
+
+    define(vm, class, "*(_)", |vm, at| {
+        let count = integer_argument(vm, at, 1, "Count")?;
+        if count < 0.0 {
+            return Err(RuntimeError::new("Count must be a non-negative integer."));
+        }
+        let elements = list_elements(vm, receiver(vm, at));
+        let mut repeated = Vec::with_capacity(elements.len() * count as usize);
+        for _ in 0..count as usize {
+            repeated.extend(elements.iter().copied());
+        }
+        Ok(new_list(vm, repeated))
     });
 
     define(vm, class, "removeAt(_)", |vm, at| {
@@ -1672,7 +1724,7 @@ fn install_map(vm: &mut Vm) {
     });
 
     define(vm, class, "count", |vm, at| {
-        Ok(Value::num(map_entries(vm, receiver(vm, at)).len() as f64))
+        Ok(Value::num(map_count(vm, receiver(vm, at)) as f64))
     });
 
     define(vm, class, "containsKey(_)", |vm, at| {
@@ -1689,7 +1741,15 @@ fn install_map(vm: &mut Vm) {
         };
         let found = map_index(vm, map, key);
         match (found, vm.heap.get_mut(id)) {
-            (Some(index), Some(Object::Map(map))) => Ok(map.entries.remove(index).value),
+            (Some(slot), Some(Object::Map(map))) => {
+                let removed = map.entries[slot].value;
+                // **A tombstone, not an empty slot.** A key that collided with
+                // this one probed past it on the way in; blanking the slot
+                // would end that probe early and lose the key entirely.
+                map.entries[slot] = MapEntry { key: Value::UNDEFINED, value: Value::TRUE };
+                map.count -= 1;
+                Ok(removed)
+            }
             _ => Ok(Value::NULL),
         }
     });
@@ -1698,6 +1758,7 @@ fn install_map(vm: &mut Vm) {
         if let Some(Object::Map(map)) = receiver(vm, at).as_object().and_then(|id| vm.heap.get_mut(id))
         {
             map.entries.clear();
+            map.count = 0;
         }
         Ok(Value::NULL)
     });
@@ -1731,26 +1792,35 @@ fn install_map(vm: &mut Vm) {
     // Iterating a map yields `MapEntry` objects, so `for (e in map)` can reach
     // both halves through `e.key` and `e.value`.
     define(vm, class, "iterate(_)", |vm, at| {
-        let count = map_entries(vm, receiver(vm, at)).len();
-        if count == 0 {
-            return Ok(Value::FALSE);
-        }
+        // **Slot indices, not entry numbers.** The table is sparse, so
+        // iterating means finding the next occupied slot -- which is exactly
+        // what a program sees, and what upstream's tests check.
+        let map = receiver(vm, at);
         let current = argument(vm, at, 1);
-        if current.is_null() {
-            return Ok(Value::num(0.0));
-        }
-        let index = integer_argument(vm, at, 1, "Iterator")?;
-        if index < 0.0 || index >= (count - 1) as f64 {
-            return Ok(Value::FALSE);
-        }
-        Ok(Value::num(index + 1.0))
+        let from = if current.is_null() {
+            0
+        } else {
+            let index = integer_argument(vm, at, 1, "Iterator")?;
+            if index < 0.0 {
+                return Ok(Value::FALSE);
+            }
+            index as usize + 1
+        };
+        let next = match map.as_object().and_then(|id| vm.heap.get(id)) {
+            Some(Object::Map(map)) => map.next_live(from),
+            _ => return Err(RuntimeError::new("Receiver must be a map.")),
+        };
+        Ok(next.map_or(Value::FALSE, |slot| Value::num(slot as f64)))
     });
 
     define(vm, class, "iteratorValue(_)", |vm, at| {
-        let entries = map_entries(vm, receiver(vm, at));
-        let index = number_argument(vm, at, 1)? as usize;
-        let Some(entry) = entries.get(index).copied() else {
-            return Err(RuntimeError::new("Index out of bounds."));
+        let map = receiver(vm, at);
+        let slot = integer_argument(vm, at, 1, "Iterator")? as usize;
+        let entry = match map.as_object().and_then(|id| vm.heap.get(id)) {
+            Some(Object::Map(map)) if map.is_live(slot) => map.entries[slot],
+            // Asking for a slot that holds nothing is a broken iterator rather
+            // than an out-of-range index, and upstream says so.
+            _ => return Err(RuntimeError::new("Invalid map iterator.")),
         };
         let class = vm.map_entry_class;
         let id = vm.heap.allocate(Object::Instance(ObjInstance {
@@ -1781,26 +1851,134 @@ fn instance_field(vm: &Vm, value: Value, index: usize) -> Value {
     }
 }
 
+/// The live entries of a map, in slot order.
 fn map_entries(vm: &Vm, map: Value) -> Vec<MapEntry> {
     match map.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::Map(map)) => map.entries.clone(),
+        Some(Object::Map(map)) => map.live().copied().collect(),
         _ => Vec::new(),
     }
 }
 
-/// Where `key` sits in the map, by Wren's equality rather than by identity.
+/// How many live entries a map has.
+fn map_count(vm: &Vm, map: Value) -> usize {
+    match map.as_object().and_then(|id| vm.heap.get(id)) {
+        Some(Object::Map(map)) => map.count,
+        _ => 0,
+    }
+}
+
+/// The hash of a value that may be used as a map key.
+///
+/// **Only the value types reach here**, which is what makes hashing by
+/// contents safe: a mutable object could change after insertion and be lost in
+/// its own table.
+fn hash_value(vm: &Vm, value: Value) -> u32 {
+    if let Some(number) = value.as_num() {
+        // Hash the bits, folded, so that nearby numbers do not all land in
+        // nearby slots. `0.0` and `-0.0` are equal under `==` and must hash
+        // alike, so the sign of zero is normalised away first.
+        let bits = if number == 0.0 { 0.0f64.to_bits() } else { number.to_bits() };
+        return (bits as u32) ^ ((bits >> 32) as u32);
+    }
+    if value.is_null() {
+        return 1;
+    }
+    if value.is_true() {
+        return 2;
+    }
+    if value.is_false() {
+        return 3;
+    }
+    match value.as_object().and_then(|id| vm.heap.get(id)) {
+        // The cached hash, which is the reason it is cached.
+        Some(Object::String(text)) => text.hash(),
+        Some(Object::Range(range)) => {
+            let from = range.from.to_bits();
+            let to = range.to.to_bits();
+            (from as u32)
+                ^ ((from >> 32) as u32)
+                ^ (to as u32).rotate_left(7)
+                ^ u32::from(range.is_inclusive)
+        }
+        // A class is identified by which object it is, so its handle is its
+        // identity and hashing it is enough.
+        _ => value.as_object().map_or(0, |id| id.raw()).wrapping_mul(2654435761),
+    }
+}
+
+/// Where `key` belongs in a table of this capacity.
+///
+/// Returns the slot holding the key if it is present, otherwise the first slot
+/// it could be inserted into. **The first tombstone seen is remembered and
+/// preferred**, so that repeated insert-and-remove cycles reuse slots instead
+/// of lengthening every probe behind them.
+fn probe(vm: &Vm, entries: &[MapEntry], key: Value) -> (usize, bool) {
+    let capacity = entries.len();
+    let mask = capacity - 1;
+    let mut slot = (hash_value(vm, key) as usize) & mask;
+    let mut tombstone: Option<usize> = None;
+
+    loop {
+        let entry = entries[slot];
+        if entry.key.is_undefined() {
+            // A false value marks a slot never used, so the probe ends: no key
+            // was ever placed beyond it by a collision.
+            if entry.value.is_falsy() {
+                return (tombstone.unwrap_or(slot), false);
+            }
+            if tombstone.is_none() {
+                tombstone = Some(slot);
+            }
+        } else if values_equal(vm, entry.key, key) {
+            return (slot, true);
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+/// Grow the table, rehashing every live entry into the new one.
+fn grow_map(vm: &mut Vm, id: crate::handle::ObjectId, wanted: usize) {
+    let mut capacity = 8;
+    while capacity < wanted {
+        capacity *= 2;
+    }
+
+    let old = match vm.heap.get(id) {
+        Some(Object::Map(map)) => map.entries.clone(),
+        _ => return,
+    };
+    let empty = MapEntry { key: Value::UNDEFINED, value: Value::FALSE };
+    let mut entries = alloc::vec![empty; capacity];
+
+    let mut count = 0;
+    for entry in old.iter().filter(|entry| !entry.key.is_undefined()) {
+        let (slot, _) = probe(vm, &entries, entry.key);
+        entries[slot] = *entry;
+        count += 1;
+    }
+
+    if let Some(Object::Map(map)) = vm.heap.get_mut(id) {
+        map.entries = entries;
+        map.count = count;
+    }
+}
+
+/// The slot holding `key`, if the map has it.
 fn map_index(vm: &Vm, map: Value, key: Value) -> Option<usize> {
     let entries = match map.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::Map(map)) => &map.entries,
+        Some(Object::Map(map)) if !map.entries.is_empty() => &map.entries,
         _ => return None,
     };
-    entries.iter().position(|entry| values_equal(vm, entry.key, key))
+    match probe(vm, entries, key) {
+        (slot, true) => Some(slot),
+        (_, false) => None,
+    }
 }
 
 fn map_get(vm: &Vm, map: Value, key: Value) -> Option<Value> {
-    let index = map_index(vm, map, key)?;
+    let slot = map_index(vm, map, key)?;
     match map.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::Map(map)) => map.entries.get(index).map(|entry| entry.value),
+        Some(Object::Map(map)) => map.entries.get(slot).map(|entry| entry.value),
         _ => None,
     }
 }
@@ -1809,17 +1987,31 @@ fn map_set(vm: &mut Vm, map: Value, key: Value, value: Value) -> Result<(), Runt
     let Some(id) = map.as_object() else {
         return Err(RuntimeError::new("Receiver must be a map."));
     };
-    let existing = map_index(vm, map, key);
-    match vm.heap.get_mut(id) {
-        Some(Object::Map(map)) => {
-            match existing {
-                Some(index) => map.entries[index].value = value,
-                None => map.entries.push(MapEntry { key, value }),
-            }
-            Ok(())
-        }
-        _ => Err(RuntimeError::new("Receiver must be a map.")),
+
+    // **Grown at three quarters full.** A linear-probing table degrades sharply
+    // as it fills: the probe length climbs with the square of the load, so the
+    // last few insertions into a full table cost more than all the rest.
+    let (count, capacity) = match vm.heap.get(id) {
+        Some(Object::Map(map)) => (map.count, map.entries.len()),
+        _ => return Err(RuntimeError::new("Receiver must be a map.")),
+    };
+    if capacity == 0 || (count + 1) * 4 > capacity * 3 {
+        grow_map(vm, id, (count + 1) * 2);
     }
+
+    let entries = match vm.heap.get(id) {
+        Some(Object::Map(map)) => map.entries.clone(),
+        _ => return Err(RuntimeError::new("Receiver must be a map.")),
+    };
+    let (slot, existing) = probe(vm, &entries, key);
+
+    if let Some(Object::Map(map)) = vm.heap.get_mut(id) {
+        map.entries[slot] = MapEntry { key, value };
+        if !existing {
+            map.count += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Wren's `==` for the types that can be map keys.
@@ -1991,6 +2183,25 @@ fn install_system(vm: &mut Vm) {
     define(vm, metaclass, "print", |vm, _| {
         vm.output.push(b'\n');
         Ok(Value::NULL)
+    });
+
+    define(vm, metaclass, "printAll(_)", |vm, at| {
+        let sequence = argument(vm, at, 1);
+        for element in collect(vm, sequence)? {
+            let text = vm.stringify(element)?;
+            vm.output.extend_from_slice(text.as_bytes());
+        }
+        vm.output.push(b'\n');
+        Ok(sequence)
+    });
+
+    define(vm, metaclass, "writeAll(_)", |vm, at| {
+        let sequence = argument(vm, at, 1);
+        for element in collect(vm, sequence)? {
+            let text = vm.stringify(element)?;
+            vm.output.extend_from_slice(text.as_bytes());
+        }
+        Ok(sequence)
     });
 
     define(vm, metaclass, "write(_)", |vm, at| {

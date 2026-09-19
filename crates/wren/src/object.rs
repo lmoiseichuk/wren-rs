@@ -341,24 +341,56 @@ pub struct MapEntry {
     pub value: Value,
 }
 
-/// A map.
+/// A map: open addressing with linear probing, as upstream.
 ///
-/// **The lookup here is a linear scan, and that is temporary.** Upstream uses
-/// open addressing with a power-of-two capacity, which needs a key's hash — and
-/// hashing a string key means reaching through the heap to its cached hash,
-/// which the heap cannot do from inside an object. That indirection is the VM's
-/// job and the table arrives with it. Until then this is correct and slow,
-/// which is the right way round.
+/// **The entry table is sparse, and that is observable.** An earlier version
+/// stored entries in a dense `Vec` and scanned it, which was correct for
+/// lookups and wrong for iteration: `map.iterate(n)` yields *slot* indices, and
+/// upstream's own tests assume the gaps a hash table leaves. A dense list
+/// numbers four entries 0..3 and reports no fifth; a table of capacity eight
+/// scatters them, which is what a program iterating a map actually sees.
+///
+/// Two sentinels live in the key, following upstream:
+///
+/// * **unused** -- key is `undefined`, value is `false`. A probe stops here,
+///   because nothing was ever inserted past it.
+/// * **tombstone** -- key is `undefined`, value is `true`. A probe continues,
+///   because a key inserted after a collision may lie beyond it. Removing an
+///   entry without leaving one of these would strand every key that probed
+///   past it.
 #[derive(Debug)]
 pub struct ObjMap {
+    /// Slots, and always a power of two of them, so the modulo is a mask.
+    /// Empty until the first insertion.
     pub entries: Vec<MapEntry>,
+    /// Live entries, which is what `count` reports. `entries.len()` is the
+    /// capacity, and the two are not the same number.
+    pub count: usize,
 }
 
 impl ObjMap {
     pub fn new() -> ObjMap {
-        ObjMap { entries: Vec::new() }
+        ObjMap { entries: Vec::new(), count: 0 }
+    }
+
+    /// Is this slot holding a real entry?
+    pub fn is_live(&self, slot: usize) -> bool {
+        self.entries
+            .get(slot)
+            .is_some_and(|entry| !entry.key.is_undefined())
+    }
+
+    /// The next live slot at or after `from`, for iteration.
+    pub fn next_live(&self, from: usize) -> Option<usize> {
+        (from..self.entries.len()).find(|slot| self.is_live(*slot))
+    }
+
+    /// Every live entry, in slot order.
+    pub fn live(&self) -> impl Iterator<Item = &MapEntry> {
+        self.entries.iter().filter(|entry| !entry.key.is_undefined())
     }
 }
+
 
 impl Default for ObjMap {
     fn default() -> ObjMap {
