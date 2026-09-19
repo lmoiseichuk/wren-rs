@@ -167,12 +167,15 @@ impl FnState {
     }
 }
 
+/// One attribute: its group (`None` when ungrouped), its key, and its value.
+type Attribute = (Option<String>, String, Value);
+
 /// The class whose body is being compiled.
 struct ClassState {
     /// The class's own name, for its error messages.
     name: String,
     /// Runtime attributes per method signature, in declaration order.
-    method_attributes: Vec<(String, Vec<(Option<String>, String, Value)>)>,
+    method_attributes: Vec<(String, Vec<Attribute>)>,
     /// Signatures already defined, so a duplicate is caught rather than
     /// silently replacing the first one -- which would look like the earlier
     /// definition simply never ran.
@@ -259,7 +262,7 @@ struct Compiler<'a> {
     /// Each entry is `(group, key, value)` with `None` for an ungrouped one.
     /// Only `#!` attributes land here: a plain `#` is parsed and discarded, so
     /// it costs a running program nothing.
-    pending_attributes: Vec<(Option<String>, String, Value)>,
+    pending_attributes: Vec<Attribute>,
     /// How many attributes have been seen since the last class or method,
     /// counted separately from the ones kept.
     ///
@@ -656,7 +659,7 @@ impl<'a> Compiler<'a> {
     ///
     /// The values accumulate into a list per key, which is what lets the same
     /// key appear more than once in a group and keep both.
-    fn build_attributes(&mut self, entries: &[(Option<String>, String, Value)]) -> Value {
+    fn build_attributes(&mut self, entries: &[Attribute]) -> Value {
         let table = crate::core::new_map(self.vm);
         for (group, key, value) in entries {
             let group_key = match group {
