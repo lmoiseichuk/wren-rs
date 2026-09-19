@@ -866,6 +866,28 @@ impl Heap {
         self.instance_fields(id).get(index).copied()
     }
 
+    /// Read one field, in a single lookup of the instance.
+    ///
+    /// `None` means the handle is not an instance at all, which is a runtime
+    /// error; an index past the instance's fields reads as null, which is what
+    /// the VM wants and not an error.
+    ///
+    /// **One lookup, because the caller used to make two.** It asked the heap
+    /// for the instance to find out whether the handle was one, threw the
+    /// answer away, and then called a reader that looked it up again --
+    /// on `LoadFieldThis`, which is 13% of `method_call`'s instructions.
+    pub fn field_read(&self, id: ObjectId, index: usize) -> Option<Value> {
+        let instance = self.instance(id)?;
+        if index >= instance.count() {
+            return Some(Value::NULL);
+        }
+        let (chunk, offset) = Self::field_place(instance.at());
+        Some(match self.chunks.get(chunk) {
+            Some(chunk) => chunk.get(offset + index).copied().unwrap_or(Value::NULL),
+            None => Value::NULL,
+        })
+    }
+
     /// Store one field, growing the instance if it is short.
     ///
     /// **Growing means relocating**, because the arena is packed: the run
@@ -873,9 +895,9 @@ impl Heap {
     /// compaction reclaims. It is a path that should not run -- an instance is
     /// created with the field count its class declares -- but the field index
     /// comes from bytecode, so it is handled rather than trusted.
-    pub fn set_instance_field(&mut self, id: ObjectId, index: usize, value: Value) {
+    pub fn set_instance_field(&mut self, id: ObjectId, index: usize, value: Value) -> bool {
         let Some(instance) = self.instance(id) else {
-            return;
+            return false;
         };
         let (at, count) = (instance.at(), instance.count());
         if index < count {
@@ -888,7 +910,7 @@ impl Heap {
                 *slot = value;
             }
             self.wrote(id, value);
-            return;
+            return true;
         }
 
         // Growing means relocating, because a run is packed against its
@@ -904,6 +926,7 @@ impl Heap {
         self.bytes += (wanted - count) * core::mem::size_of::<Value>();
         self.refresh_due();
         self.wrote(id, value);
+        true
     }
 
     /// A heap object's field now holds `new` where it held `old`.

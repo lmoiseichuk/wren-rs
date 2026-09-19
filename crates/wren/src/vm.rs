@@ -2451,11 +2451,8 @@ impl Vm {
                 "Cannot access a field outside of a class.",
             ));
         };
-        match self.heap.instance(id) {
-            Some(_) => Ok(self
-                .heap
-                .instance_field(id, offset + index)
-                .unwrap_or(Value::NULL)),
+        match self.heap.field_read(id, offset + index) {
+            Some(value) => Ok(value),
             None => Err(RuntimeError::new(
                 "Cannot access a field outside of a class.",
             )),
@@ -2475,14 +2472,12 @@ impl Vm {
                 "Cannot access a field outside of a class.",
             ));
         };
-        match self.heap.instance(id) {
-            Some(_) => {
-                // The store and the barrier both live in the heap now, because
-                // the fields do.
-                self.heap.set_instance_field(id, offset + index, value);
-                Ok(())
-            }
-            None => Err(RuntimeError::new(
+        // The store and the barrier both live in the heap now, because the
+        // fields do -- and it reports whether the handle was an instance, so
+        // this no longer looks the instance up once to ask and once to store.
+        match self.heap.set_instance_field(id, offset + index, value) {
+            true => Ok(()),
+            false => Err(RuntimeError::new(
                 "Cannot access a field outside of a class.",
             )),
         }
