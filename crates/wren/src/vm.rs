@@ -28,6 +28,7 @@ use crate::handle::ObjectId;
 use crate::heap::Heap;
 use crate::object::{
     Method, ObjClass, ObjClosure, ObjFiber, ObjFn, ObjInstance, ObjString, ObjUpvalue, Object,
+    ObjectType,
 };
 use crate::symbol::SymbolTable;
 use crate::value::Value;
@@ -625,20 +626,24 @@ impl Vm {
             return Some(self.null_class);
         }
         let id = value.as_object()?;
-        match self.heap.get(id)? {
-            Object::String(_) => Some(self.string_class),
-            Object::List(_) => Some(self.list_class),
-            Object::Map(_) => Some(self.map_class),
-            Object::Range(_) => Some(self.range_class),
+        // **Seven of these ten answers do not need the object at all.** A
+        // `List` is a `List` whatever is in it, so once the type is in the
+        // handle this whole path is a shift and a table lookup -- and this is
+        // the dispatch path, reached on every method call.
+        match self.heap.type_of(id)? {
+            ObjectType::String => Some(self.string_class),
+            ObjectType::List => Some(self.list_class),
+            ObjectType::Map => Some(self.map_class),
+            ObjectType::Range => Some(self.range_class),
+            ObjectType::Fn | ObjectType::Closure => Some(self.fn_class),
+            ObjectType::Fiber => Some(self.fiber_class),
             // A class's own class is its metaclass, which is what makes a
             // static call like `System.print` land on the right table.
-            Object::Class(class) => Some(class.metaclass.unwrap_or(self.class_class)),
-            Object::Instance(instance) => Some(instance.class),
-            Object::Fn(_) | Object::Closure(_) => Some(self.fn_class),
-            Object::Fiber(_) => Some(self.fiber_class),
+            ObjectType::Class => Some(self.heap.class(id)?.metaclass.unwrap_or(self.class_class)),
+            ObjectType::Instance => Some(self.heap.instance(id)?.class),
             // An upvalue is never a value a program can hold; it exists only
             // inside a closure.
-            Object::Upvalue(_) => None,
+            ObjectType::Upvalue => None,
         }
     }
 
@@ -839,23 +844,37 @@ impl Vm {
         let Some(id) = value.as_object() else {
             return "<invalid>".to_string();
         };
-        match self.heap.get(id) {
+        // **Dispatch on the handle's type, then fetch what that type needs.**
+        // A handle whose type says one thing and whose table has nothing under
+        // it cannot happen, but saying so with `unwrap` would be a panic in a
+        // printing routine, so each arm falls back to the placeholder it would
+        // have printed for a collected object.
+        match self.heap.type_of(id) {
             // Lossy, because this is for display: the bytes are kept intact
             // in the string itself, and printing is the one place where a
             // sequence that is not valid UTF-8 has to become *something*.
-            Some(Object::String(text)) => String::from_utf8_lossy(&text.bytes).into_owned(),
-            Some(Object::Range(range)) => {
-                let separator = if range.is_inclusive { ".." } else { "..." };
-                format!(
-                    "{}{}{}",
-                    self.to_string(Value::num(range.from)),
-                    separator,
-                    self.to_string(Value::num(range.to))
-                )
-            }
-            Some(Object::List(list)) => {
+            Some(ObjectType::String) => match self.heap.string(id) {
+                Some(text) => String::from_utf8_lossy(&text.bytes).into_owned(),
+                None => "<collected>".to_string(),
+            },
+            Some(ObjectType::Range) => match self.heap.range(id).copied() {
+                Some(range) => {
+                    let separator = if range.is_inclusive { ".." } else { "..." };
+                    format!(
+                        "{}{}{}",
+                        self.to_string(Value::num(range.from)),
+                        separator,
+                        self.to_string(Value::num(range.to))
+                    )
+                }
+                None => "<collected>".to_string(),
+            },
+            Some(ObjectType::List) => {
+                let Some(elements) = self.heap.list(id).map(|list| list.elements.clone()) else {
+                    return "<collected>".to_string();
+                };
                 let mut out = String::from("[");
-                for (at, element) in list.elements.iter().enumerate() {
+                for (at, element) in elements.iter().enumerate() {
                     if at > 0 {
                         out.push_str(", ");
                     }
@@ -867,9 +886,12 @@ impl Vm {
             // The dispatching version lives on `Map.toString`; this is the
             // fallback for a value printed without going through a method, and
             // it uses the same shape so the two cannot look different.
-            Some(Object::Map(map)) => {
+            Some(ObjectType::Map) => {
+                let Some(entries) = self.heap.map(id).map(|map| map.entries.clone()) else {
+                    return "<collected>".to_string();
+                };
                 let mut out = String::from("{");
-                for (index, entry) in map.entries.iter().enumerate() {
+                for (index, entry) in entries.iter().enumerate() {
                     if index > 0 {
                         out.push_str(", ");
                     }
@@ -880,16 +902,20 @@ impl Vm {
                 out.push('}');
                 out
             }
-            Some(Object::Class(class)) => match self.heap.string(class.name) {
-                Some(name) => name.as_str().unwrap_or("<class>").to_string(),
-                _ => "<class>".to_string(),
-            },
-            Some(Object::Instance(instance)) => {
-                format!("instance of {}", self.class_name(instance.class))
+            Some(ObjectType::Class) => {
+                let name = self.heap.class(id).map(|class| class.name);
+                match name.and_then(|name| self.heap.string(name)) {
+                    Some(name) => name.as_str().unwrap_or("<class>").to_string(),
+                    None => "<class>".to_string(),
+                }
             }
-            Some(Object::Fn(_)) | Some(Object::Closure(_)) => "<fn>".to_string(),
-            Some(Object::Fiber(_)) => "<fiber>".to_string(),
-            Some(Object::Upvalue(_)) => "<upvalue>".to_string(),
+            Some(ObjectType::Instance) => match self.heap.instance(id).map(|it| it.class) {
+                Some(class) => format!("instance of {}", self.class_name(class)),
+                None => "<collected>".to_string(),
+            },
+            Some(ObjectType::Fn | ObjectType::Closure) => "<fn>".to_string(),
+            Some(ObjectType::Fiber) => "<fiber>".to_string(),
+            Some(ObjectType::Upvalue) => "<upvalue>".to_string(),
             None => "<collected>".to_string(),
         }
     }
@@ -1278,7 +1304,7 @@ impl Vm {
         let Some(closure) = function.as_object() else {
             return Err(RuntimeError::new("Argument must be a function."));
         };
-        if !matches!(self.heap.get(closure), Some(Object::Closure(_))) {
+        if self.heap.closure(closure).is_none() {
             return Err(RuntimeError::new("Argument must be a function."));
         }
         let at = self.stack.len();

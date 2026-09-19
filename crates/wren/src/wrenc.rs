@@ -48,7 +48,7 @@ use alloc::vec::Vec;
 
 use crate::bytecode::{Chunk, Op};
 use crate::handle::ObjectId;
-use crate::object::{ObjClosure, ObjFn, ObjString, Object};
+use crate::object::{ObjClosure, ObjFn, ObjString, Object, ObjectType};
 use crate::value::Value;
 use crate::vm::Vm;
 
@@ -327,14 +327,26 @@ fn write_constant(
         out.extend_from_slice(&wide.to_bits().to_le_bytes());
         return Ok(());
     }
-    match value.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::String(text)) => {
+    let Some(id) = value.as_object() else {
+        // Nothing else reaches a constant table.
+        out.push(0);
+        return Ok(());
+    };
+    // Each arm copies what it needs out of the heap before recursing, because
+    // `write_constant` takes the VM again and a borrow could not outlive that.
+    match vm.heap.type_of(id) {
+        Some(ObjectType::String) => {
             out.push(4);
-            let bytes = text.bytes.clone();
+            let Some(bytes) = vm.heap.string(id).map(|text| text.bytes.clone()) else {
+                return Ok(());
+            };
             write_bytes(out, &bytes);
         }
-        Some(Object::Fn(function)) => {
+        Some(ObjectType::Fn) => {
             out.push(5);
+            let Some(function) = vm.heap.function(id) else {
+                return Ok(());
+            };
             let chunk = function.chunk.clone();
             let arity = function.arity;
             let upvalues = function.num_upvalues;
@@ -348,26 +360,36 @@ fn write_constant(
         // as null (the old fallback for "something else") lost every
         // attribute in a round trip, which showed up as five tests passing
         // from source and not from bytecode.
-        Some(Object::List(list)) => {
+        Some(ObjectType::List) => {
             out.push(6);
-            let elements = list.elements.clone();
+            let Some(elements) = vm.heap.list(id).map(|list| list.elements.clone()) else {
+                return Ok(());
+            };
             write_u32(out, elements.len() as u32);
             for element in elements {
                 write_constant(vm, out, element, names)?;
             }
         }
-        Some(Object::Map(map)) => {
+        Some(ObjectType::Map) => {
             out.push(7);
-            let entries: Vec<crate::object::MapEntry> = map.live().copied().collect();
+            let Some(entries) = vm.heap.map(id).map(|map| {
+                map.live()
+                    .copied()
+                    .collect::<Vec<crate::object::MapEntry>>()
+            }) else {
+                return Ok(());
+            };
             write_u32(out, entries.len() as u32);
             for entry in entries {
                 write_constant(vm, out, entry.key, names)?;
                 write_constant(vm, out, entry.value, names)?;
             }
         }
-        Some(Object::Instance(instance)) => {
+        Some(ObjectType::Instance) => {
             out.push(8);
-            let fields = instance.fields.clone();
+            let Some(fields) = vm.heap.instance(id).map(|it| it.fields.clone()) else {
+                return Ok(());
+            };
             write_u32(out, fields.len() as u32);
             for field in fields {
                 write_constant(vm, out, field, names)?;

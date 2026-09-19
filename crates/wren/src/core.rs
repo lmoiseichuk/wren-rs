@@ -194,7 +194,7 @@ fn install_object(vm: &mut Vm) {
         let Some(wanted) = argument(vm, at, 1).as_object() else {
             return Err(RuntimeError::new("Right operand must be a class."));
         };
-        if !matches!(vm.heap.get(wanted), Some(Object::Class(_))) {
+        if vm.heap.class(wanted).is_none() {
             return Err(RuntimeError::new("Right operand must be a class."));
         }
         let mut current = vm.class_of(receiver(vm, at));
@@ -2456,10 +2456,14 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
     if value.is_false() {
         return 3;
     }
-    match value.as_object().and_then(|id| vm.heap.get(id)) {
+    let Some(id) = value.as_object() else {
+        return 0;
+    };
+    match vm.heap.type_of(id) {
         // The cached hash, which is the reason it is cached.
-        Some(Object::String(text)) => text.hash(),
-        Some(Object::Range(range)) => {
+        Some(ObjectType::String) => vm.heap.string(id).map_or(0, ObjString::hash),
+        Some(ObjectType::Range) if vm.heap.range(id).is_some() => {
+            let range = vm.heap.range(id).copied().expect("just tested");
             // Widened before folding: the shift below is an overflow when a
             // `Num` is 32 bits, where the fold should simply do nothing.
             #[allow(clippy::unnecessary_cast)]
@@ -2473,10 +2477,7 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
         }
         // A class is identified by which object it is, so its handle is its
         // identity and hashing it is enough.
-        _ => value
-            .as_object()
-            .map_or(0, |id| id.raw())
-            .wrapping_mul(2654435761),
+        _ => id.raw().wrapping_mul(2654435761),
     }
 }
 
