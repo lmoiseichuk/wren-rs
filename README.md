@@ -66,10 +66,10 @@ identical constants on every implementation. Method and caveats:
 
 | benchmark | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| `binary_trees` depth 9 | 8.729 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 16.127 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.545 s | **0.130 s** | 0.154 s |
-| `method_call` | 2.382 s | **0.350 s** | 1.748 s |
+| `binary_trees` depth 9 | 8.558 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 15.611 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.541 s | **0.130 s** | 0.154 s |
+| `method_call` | 2.294 s | **0.350 s** | 1.748 s |
 | **VM resident** | **22,920 B** | 83,036 B | — |
 
 **Four to seven times slower than C, and 72% smaller resident.** The speed is
@@ -77,7 +77,13 @@ the honest cost of reaching objects by a bounds-checked index rather than a
 pointer, which is what lets the crate forbid `unsafe`; the memory is what
 compiling no core library at start-up buys.
 
-**Read these to about two percent.** The board is exact -- the same image gives
+**Judged by work, not only by time.** The chip's performance counter reports
+instructions retired, which does not move when the code moves — so a change
+that removes work can be told from one that merely landed better. This VM runs
+**112 machine instructions per bytecode instruction**; C Wren is near seventeen,
+and that ratio is the gap stated as work.
+
+**Read the seconds to about two percent.** The board is exact -- the same image gives
 the same time to the microsecond, three flashes running -- but *where the
 instructions land* is worth more than that: padding every branch target to eight
 bytes, with the source untouched, takes `fib` from 16.774 s to 16.127. So a
