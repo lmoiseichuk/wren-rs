@@ -70,6 +70,55 @@ fn main() {
         println!("  constant index{lookup:>8} B   (compile-time only, still held)");
         println!("  total         {:>8} B", code + lines + constants + lookup);
 
+        // **Static instruction lengths**, which is what a uniform encoding
+        // would have to pay for. Executed frequency is a different question
+        // and is the histogram above.
+        let mut by_length = std::collections::BTreeMap::new();
+        let mut instructions = 0usize;
+        // Against the bytes actually walked, not `code.capacity()` above --
+        // a `Vec` holds more than it uses and comparing with that flatters
+        // every alternative encoding.
+        let mut walked = 0usize;
+        for index in 0..vm.heap.function_count() {
+            let Some(chunk) = vm.heap.function_chunk(index) else {
+                continue;
+            };
+            let mut at = 0;
+            while at < chunk.code.len() {
+                let Some(len) = wren::bytecode::Chunk::instruction_len(&chunk.code, at) else {
+                    break;
+                };
+                *by_length.entry(len).or_insert(0usize) += 1;
+                instructions += 1;
+                walked += len;
+                at += len;
+            }
+        }
+        println!();
+        println!("instruction lengths, statically ({instructions} instructions, {walked} B)");
+        for (len, count) in by_length.iter() {
+            println!(
+                "  {len} byte{:<3} {count:>6}  {:>5.1}%   {:>6} B",
+                if *len == 1 { "" } else { "s" },
+                *count as f64 * 100.0 / instructions.max(1) as f64,
+                len * count
+            );
+        }
+        // A uniform 2 bytes cannot hold a `Call` (opcode, arity, u16 symbol),
+        // so the realistic uniform scheme is two widths, ARM-Thumb fashion:
+        // everything short in 2 bytes, everything else in 4.
+        let short: usize = by_length.iter().filter(|(len, _)| **len <= 2).map(|(_, n)| n).sum();
+        let long = instructions - short;
+        for (name, padded) in [
+            ("every instruction 4 bytes", instructions * 4),
+            ("2 bytes if it fits, else 4", short * 2 + long * 4),
+        ] {
+            println!(
+                "  {name:<28} {padded:>6} B ({:+.0}%)",
+                (padded as f64 - walked as f64) * 100.0 / walked.max(1) as f64
+            );
+        }
+
         let census = vm.heap.slot_census();
         let held: usize = census.iter().map(|(_, slots, _, size)| slots * size).sum();
         let live: usize = census
