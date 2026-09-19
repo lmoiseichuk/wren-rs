@@ -920,3 +920,121 @@ System.print(total)
 ";
     assert_eq!(run(source), "5\n15\n");
 }
+
+// --- sequences --------------------------------------------------------------
+
+#[test]
+fn a_class_answering_the_protocol_is_a_sequence() {
+    // **The whole contract is two methods.** A class that answers `iterate(_)`
+    // and `iteratorValue(_)` gets everything else from `Sequence`.
+    let source = "
+class Countdown is Sequence {
+  construct new(from) { _from = from }
+  iterate(i) {
+    if (i == null) return _from
+    if (i <= 1) return false
+    return i - 1
+  }
+  iteratorValue(i) { i }
+}
+System.print(Countdown.new(3).toList)
+System.print(Countdown.new(3).count)
+";
+    assert_eq!(run(source), "[3, 2, 1]\n3\n");
+}
+
+#[test]
+fn map_is_lazy() {
+    // The test that decides this cannot return a list: the source never ends,
+    // so anything eager would run until it ran out of memory.
+    let source = "
+class Naturals is Sequence {
+  construct new() {}
+  iterate(i) { i == null ? 1 : i + 1 }
+  iteratorValue(i) { i }
+}
+System.print(Naturals.new().map { |n| n * 2 }.take(4).toList)
+";
+    assert_eq!(run(source), "[2, 4, 6, 8]\n");
+}
+
+#[test]
+fn where_is_lazy_too() {
+    let source = "
+class Naturals is Sequence {
+  construct new() {}
+  iterate(i) { i == null ? 1 : i + 1 }
+  iteratorValue(i) { i }
+}
+System.print(Naturals.new().where { |n| n % 3 == 0 }.take(3).toList)
+";
+    assert_eq!(run(source), "[3, 6, 9]\n");
+}
+
+#[test]
+fn skip_and_take_compose() {
+    assert_eq!(run("System.print((1..10).skip(2).take(3).toList)"), "[3, 4, 5]\n");
+}
+
+#[test]
+fn sequence_methods_work_on_every_built_in_collection() {
+    // List, Range, Map and String all inherit from Sequence, so the same
+    // methods reach all of them.
+    assert_eq!(run("System.print([1, 2, 3].map { |x| x * 2 }.toList)"), "[2, 4, 6]\n");
+    assert_eq!(run("System.print((1..4).where { |x| x % 2 == 0 }.toList)"), "[2, 4]\n");
+    assert_eq!(run("System.print(\"abc\".toList)"), "[a, b, c]\n");
+    assert_eq!(run("System.print((1..3).reduce { |a, b| a + b })"), "6\n");
+    assert_eq!(run("System.print([1, 2, 3].join(\"-\"))"), "1-2-3\n");
+}
+
+#[test]
+fn a_map_is_a_sequence_of_entries() {
+    assert_eq!(run("var m = {\"a\": 1}\nSystem.print(m.count)"), "1\n");
+}
+
+#[test]
+fn sequence_predicates() {
+    assert_eq!(run("System.print((1..3).all { |x| x > 0 })"), "true\n");
+    assert_eq!(run("System.print((1..3).any { |x| x > 2 })"), "true\n");
+    assert_eq!(run("System.print((1..3).contains(2))"), "true\n");
+    assert_eq!(run("System.print([].isEmpty)"), "true\n");
+}
+
+#[test]
+fn take_and_skip_reject_a_bad_count() {
+    assert_eq!(error("(1..3).take(-1)"), "Count must be a non-negative integer.");
+    assert_eq!(error("(1..3).take(1.5)"), "Count must be an integer.");
+    assert_eq!(error("(1..3).skip(\"two\")"), "Count must be a number.");
+}
+
+#[test]
+fn a_map_key_must_be_a_value_type() {
+    // A list is excluded because a key is compared by contents, and a mutable
+    // key's contents can change after insertion.
+    assert_eq!(error("var m = {}\nm[[1]] = 2"), "Key must be a value type.");
+}
+
+#[test]
+fn ranges_work_as_map_keys() {
+    // Which needs range equality by value: two separately built `1..3` are the
+    // same key.
+    assert_eq!(run("var m = {}\nm[1..3] = \"yes\"\nSystem.print(m[1..3])"), "yes\n");
+}
+
+#[test]
+fn a_map_prints_as_a_literal() {
+    assert_eq!(run("System.print({})"), "{}\n");
+    assert_eq!(run("System.print({\"a\": 1})"), "{a: 1}\n");
+}
+
+#[test]
+fn a_list_prints_its_elements_with_their_own_tostring() {
+    let source = "
+class Named {
+  construct new() {}
+  toString { \"named!\" }
+}
+System.print([1, Named.new()])
+";
+    assert_eq!(run(source), "[1, named!]\n");
+}

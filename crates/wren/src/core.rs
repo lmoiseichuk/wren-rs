@@ -100,10 +100,10 @@ fn is_value_type(vm: &Vm, value: Value) -> bool {
     if value.is_num() || value.is_bool() || value.is_null() {
         return true;
     }
-    match value.as_object().and_then(|id| vm.heap.get(id)) {
-        Some(Object::String(_)) | Some(Object::Range(_)) | Some(Object::Class(_)) => true,
-        _ => false,
-    }
+    matches!(
+        value.as_object().and_then(|id| vm.heap.get(id)),
+        Some(Object::String(_) | Object::Range(_) | Object::Class(_))
+    )
 }
 
 fn value_type_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeError> {
@@ -156,6 +156,7 @@ pub fn install(vm: &mut Vm) {
     install_string(vm);
     install_string_extras(vm);
     install_num_extras(vm);
+    install_sequence(vm);
     install_list(vm);
     install_list_extras(vm);
     install_map(vm);
@@ -379,12 +380,12 @@ fn switch_into(
         Some(Object::Fiber(fiber)) if fiber.done => {
             return Err(RuntimeError::new("Cannot call a finished fiber."));
         }
-        // The root fiber is already running -- it is the one doing the
-        // calling -- so resuming it would be re-entering a live stack.
-        Some(Object::Fiber(fiber)) if fiber.caller.is_none() && Some(target) != vm.current_fiber => {
-            if vm.root_fiber == Some(target) {
-                return Err(RuntimeError::new("Cannot call root fiber."));
-            }
+        // **`call` and `try` only.** The root fiber is the one doing the
+        // calling, so resuming it that way would re-enter a live stack. But
+        // `transfer` to it is exactly how a fiber hands control back for good,
+        // and refusing that broke four tests that were right.
+        Some(Object::Fiber(_)) if set_caller && vm.root_fiber == Some(target) => {
+            return Err(RuntimeError::new("Cannot call root fiber."));
         }
         Some(Object::Fiber(_)) => {}
         _ => return Err(RuntimeError::new("Receiver must be a fiber.")),
@@ -913,6 +914,313 @@ fn string_bytes(vm: &Vm, value: Value) -> Vec<u8> {
 
 fn string_text(vm: &Vm, value: Value) -> alloc::string::String {
     alloc::string::String::from_utf8_lossy(&string_bytes(vm, value)).into_owned()
+}
+
+/// `Sequence`: everything that can be iterated, and everything that follows
+/// from being able to.
+///
+/// **The whole contract is `iterate(_)` and `iteratorValue(_)`.** A type that
+/// answers those two gets `count`, `map`, `where`, `reduce`, `join` and the
+/// rest for free, including a class written in Wren -- which is why these are
+/// built on [`Vm::invoke_with`] rather than on any particular representation.
+///
+/// `List` overrides several of them with direct versions, because going
+/// through the protocol to read an element it could index costs a method call
+/// per element and lists are where that shows.
+fn install_sequence(vm: &mut Vm) {
+    let class = vm.sequence_class;
+
+    define(vm, class, "count", |vm, at| {
+        let sequence = receiver(vm, at);
+        let mut count = 0.0;
+        let mut iterator = Value::NULL;
+        loop {
+            iterator = vm.invoke_with(sequence, "iterate(_)", &[iterator])?;
+            if iterator.is_falsy() {
+                return Ok(Value::num(count));
+            }
+            count += 1.0;
+        }
+    });
+
+    define(vm, class, "isEmpty", |vm, at| {
+        let sequence = receiver(vm, at);
+        let first = vm.invoke_with(sequence, "iterate(_)", &[Value::NULL])?;
+        Ok(Value::bool(first.is_falsy()))
+    });
+
+    define(vm, class, "each(_)", |vm, at| {
+        let sequence = receiver(vm, at);
+        let function = argument(vm, at, 1);
+        for element in collect(vm, sequence)? {
+            vm.call_function(function, &[element])?;
+        }
+        Ok(Value::NULL)
+    });
+
+    define(vm, class, "toList", |vm, at| {
+        let sequence = receiver(vm, at);
+        let elements = collect(vm, sequence)?;
+        Ok(new_list(vm, elements))
+    });
+
+    define(vm, class, "contains(_)", |vm, at| {
+        let sequence = receiver(vm, at);
+        let wanted = argument(vm, at, 1);
+        for element in collect(vm, sequence)? {
+            if values_equal(vm, element, wanted) {
+                return Ok(Value::TRUE);
+            }
+        }
+        Ok(Value::FALSE)
+    });
+
+    define(vm, class, "all(_)", |vm, at| {
+        let sequence = receiver(vm, at);
+        let function = function_argument(vm, at, 1)?;
+        for element in collect(vm, sequence)? {
+            if vm.call_function(function, &[element])?.is_falsy() {
+                return Ok(Value::FALSE);
+            }
+        }
+        Ok(Value::TRUE)
+    });
+
+    define(vm, class, "any(_)", |vm, at| {
+        let sequence = receiver(vm, at);
+        let function = function_argument(vm, at, 1)?;
+        for element in collect(vm, sequence)? {
+            if !vm.call_function(function, &[element])?.is_falsy() {
+                return Ok(Value::TRUE);
+            }
+        }
+        Ok(Value::FALSE)
+    });
+
+    define(vm, class, "reduce(_)", |vm, at| {
+        let sequence = receiver(vm, at);
+        let function = argument(vm, at, 1);
+        expect_arity(vm, function, 2)?;
+        let mut elements = collect(vm, sequence)?.into_iter();
+        let Some(mut total) = elements.next() else {
+            return Err(RuntimeError::new("Can't reduce an empty sequence."));
+        };
+        for element in elements {
+            total = vm.call_function(function, &[total, element])?;
+        }
+        Ok(total)
+    });
+
+    define(vm, class, "reduce(_,_)", |vm, at| {
+        let sequence = receiver(vm, at);
+        let mut total = argument(vm, at, 1);
+        let function = argument(vm, at, 2);
+        expect_arity(vm, function, 2)?;
+        for element in collect(vm, sequence)? {
+            total = vm.call_function(function, &[total, element])?;
+        }
+        Ok(total)
+    });
+
+    define(vm, class, "join()", |vm, at| {
+        let sequence = receiver(vm, at);
+        let joined = join_sequence(vm, sequence, "")?;
+        Ok(vm.new_string(&joined))
+    });
+    define(vm, class, "join(_)", |vm, at| {
+        let sequence = receiver(vm, at);
+        let separator = argument(vm, at, 1);
+        if vm.string_at(separator).is_none() {
+            return Err(RuntimeError::new("Right operand must be a string."));
+        }
+        let separator = vm.to_string(separator);
+        let joined = join_sequence(vm, sequence, &separator)?;
+        Ok(vm.new_string(&joined))
+    });
+
+    // **The lazy four.** `map` on an infinite sequence has to stay infinite,
+    // so these build a view rather than a list. Upstream's own test drives
+    // `map` with a Fibonacci iterator that never ends.
+    define(vm, class, "map(_)", |vm, at| {
+        let function = function_argument(vm, at, 1)?;
+        let class = vm.map_sequence_class;
+        Ok(new_view(vm, class, &[receiver(vm, at), function]))
+    });
+    define(vm, class, "where(_)", |vm, at| {
+        let function = function_argument(vm, at, 1)?;
+        let class = vm.where_sequence_class;
+        Ok(new_view(vm, class, &[receiver(vm, at), function]))
+    });
+    define(vm, class, "take(_)", |vm, at| {
+        let count = counting_argument(vm, at, 1)?;
+        let class = vm.take_sequence_class;
+        Ok(new_view(vm, class, &[receiver(vm, at), Value::num(count), Value::num(0.0)]))
+    });
+    define(vm, class, "skip(_)", |vm, at| {
+        let count = counting_argument(vm, at, 1)?;
+        let class = vm.skip_sequence_class;
+        Ok(new_view(vm, class, &[receiver(vm, at), Value::num(count)]))
+    });
+
+    install_lazy_sequences(vm);
+}
+
+/// The lazy views. Each holds its source and delegates the protocol to it.
+fn install_lazy_sequences(vm: &mut Vm) {
+    // `map`: same iteration, transformed values.
+    let class = vm.map_sequence_class;
+    define(vm, class, "iterate(_)", |vm, at| {
+        let source = instance_field(vm, receiver(vm, at), 0);
+        let iterator = argument(vm, at, 1);
+        vm.invoke_with(source, "iterate(_)", &[iterator])
+    });
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        let source = instance_field(vm, receiver(vm, at), 0);
+        let function = instance_field(vm, receiver(vm, at), 1);
+        let iterator = argument(vm, at, 1);
+        let value = vm.invoke_with(source, "iteratorValue(_)", &[iterator])?;
+        vm.call_function(function, &[value])
+    });
+
+    // `where`: same values, advancing past the ones that do not match.
+    let class = vm.where_sequence_class;
+    define(vm, class, "iterate(_)", |vm, at| {
+        let source = instance_field(vm, receiver(vm, at), 0);
+        let function = instance_field(vm, receiver(vm, at), 1);
+        let mut iterator = argument(vm, at, 1);
+        loop {
+            iterator = vm.invoke_with(source, "iterate(_)", &[iterator])?;
+            if iterator.is_falsy() {
+                return Ok(Value::FALSE);
+            }
+            let value = vm.invoke_with(source, "iteratorValue(_)", &[iterator])?;
+            if !vm.call_function(function, &[value])?.is_falsy() {
+                return Ok(iterator);
+            }
+        }
+    });
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        let source = instance_field(vm, receiver(vm, at), 0);
+        let iterator = argument(vm, at, 1);
+        vm.invoke_with(source, "iteratorValue(_)", &[iterator])
+    });
+
+    // `take`: stops after a count, which it has to remember between calls --
+    // hence the third field rather than deriving it from the iterator, which
+    // for an arbitrary sequence is not a number this can count with.
+    let class = vm.take_sequence_class;
+    define(vm, class, "iterate(_)", |vm, at| {
+        let this = receiver(vm, at);
+        let source = instance_field(vm, this, 0);
+        let limit = instance_field(vm, this, 1).as_num().unwrap_or(0.0);
+        let iterator = argument(vm, at, 1);
+
+        let taken = if iterator.is_null() {
+            1.0
+        } else {
+            instance_field(vm, this, 2).as_num().unwrap_or(0.0) + 1.0
+        };
+        set_instance_field(vm, this, 2, Value::num(taken));
+        if taken > limit {
+            return Ok(Value::FALSE);
+        }
+        vm.invoke_with(source, "iterate(_)", &[iterator])
+    });
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        let source = instance_field(vm, receiver(vm, at), 0);
+        let iterator = argument(vm, at, 1);
+        vm.invoke_with(source, "iteratorValue(_)", &[iterator])
+    });
+
+    // `skip`: burns through the first n on the first call only.
+    let class = vm.skip_sequence_class;
+    define(vm, class, "iterate(_)", |vm, at| {
+        let this = receiver(vm, at);
+        let source = instance_field(vm, this, 0);
+        let mut iterator = argument(vm, at, 1);
+
+        if !iterator.is_null() {
+            return vm.invoke_with(source, "iterate(_)", &[iterator]);
+        }
+        let mut remaining = instance_field(vm, this, 1).as_num().unwrap_or(0.0);
+        iterator = vm.invoke_with(source, "iterate(_)", &[iterator])?;
+        while remaining > 0.0 && !iterator.is_falsy() {
+            iterator = vm.invoke_with(source, "iterate(_)", &[iterator])?;
+            remaining -= 1.0;
+        }
+        Ok(iterator)
+    });
+    define(vm, class, "iteratorValue(_)", |vm, at| {
+        let source = instance_field(vm, receiver(vm, at), 0);
+        let iterator = argument(vm, at, 1);
+        vm.invoke_with(source, "iteratorValue(_)", &[iterator])
+    });
+}
+
+/// Walk a sequence into a list, through the protocol.
+///
+/// **This is what makes an infinite sequence hang**, which is correct: asking
+/// an endless sequence for its elements is a question with no answer, and the
+/// lazy views exist precisely so the question is not asked.
+fn collect(vm: &mut Vm, sequence: Value) -> Result<Vec<Value>, RuntimeError> {
+    let mut elements = Vec::new();
+    let mut iterator = Value::NULL;
+    loop {
+        iterator = vm.invoke_with(sequence, "iterate(_)", &[iterator])?;
+        if iterator.is_falsy() {
+            return Ok(elements);
+        }
+        elements.push(vm.invoke_with(sequence, "iteratorValue(_)", &[iterator])?);
+    }
+}
+
+fn join_sequence(
+    vm: &mut Vm,
+    sequence: Value,
+    separator: &str,
+) -> Result<alloc::string::String, RuntimeError> {
+    let mut out = alloc::string::String::new();
+    for (index, element) in collect(vm, sequence)?.into_iter().enumerate() {
+        if index > 0 {
+            out.push_str(separator);
+        }
+        out.push_str(&vm.stringify(element)?);
+    }
+    Ok(out)
+}
+
+fn new_view(vm: &mut Vm, class: crate::handle::ObjectId, fields: &[Value]) -> Value {
+    let id = vm.heap.allocate(Object::Instance(ObjInstance {
+        class,
+        fields: fields.to_vec(),
+    }));
+    Value::object(id)
+}
+
+fn set_instance_field(vm: &mut Vm, value: Value, index: usize, to: Value) {
+    if let Some(Object::Instance(instance)) = value.as_object().and_then(|id| vm.heap.get_mut(id)) {
+        if instance.fields.len() <= index {
+            instance.fields.resize(index + 1, Value::NULL);
+        }
+        instance.fields[index] = to;
+    }
+}
+
+fn function_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeError> {
+    let value = argument(vm, at, index);
+    match value.as_object().map(|id| vm.heap.get(id)) {
+        Some(Some(Object::Closure(_))) => Ok(value),
+        _ => Err(RuntimeError::new("Argument must be a function.")),
+    }
+}
+
+/// A count for `take` or `skip`: a non-negative whole number.
+fn counting_argument(vm: &Vm, at: usize, index: usize) -> Result<f64, RuntimeError> {
+    let count = integer_argument(vm, at, index, "Count")?;
+    if count < 0.0 {
+        return Err(RuntimeError::new("Count must be a non-negative integer."));
+    }
+    Ok(count)
 }
 
 fn install_list(vm: &mut Vm) {
@@ -1655,6 +1963,7 @@ fn install_system(vm: &mut Vm) {
         ("Num", vm.num_class),
         ("Fiber", vm.fiber_class),
         ("Range", vm.range_class),
+        ("Sequence", vm.sequence_class),
         ("String", vm.string_class),
     ] {
         vm.modules[0].define(name, Value::object(class));

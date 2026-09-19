@@ -219,6 +219,18 @@ pub struct Vm {
     /// `Random`, once the built-in module has been imported. Until then this
     /// points at `Object` and nothing refers to it.
     pub random_class: ObjectId,
+    /// The base class of everything iterable.
+    ///
+    /// `List`, `Map`, `Range` and `String` all inherit from it, and so can a
+    /// class written in Wren -- which is the point: answering `iterate(_)` and
+    /// `iteratorValue(_)` is the whole contract, and everything else comes
+    /// from here.
+    pub sequence_class: ObjectId,
+    /// The lazy views `map`, `where`, `take` and `skip` return.
+    pub map_sequence_class: ObjectId,
+    pub where_sequence_class: ObjectId,
+    pub take_sequence_class: ObjectId,
+    pub skip_sequence_class: ObjectId,
 
     /// The fiber currently running. Its stack and frames are the VM's own,
     /// and are swapped back into it when control moves elsewhere.
@@ -283,10 +295,19 @@ impl Vm {
         let list_class = class_named(&mut heap, "List", root);
         let map_class = class_named(&mut heap, "Map", root);
         let range_class = class_named(&mut heap, "Range", root);
+        // Reparented below, once `Sequence` exists -- the classes have to be
+        // created before it because `class_named` needs somewhere to put the
+        // name string first.
         let class_class = class_named(&mut heap, "Class", root);
         let fn_class = class_named(&mut heap, "Fn", root);
         let map_entry_class = class_named(&mut heap, "MapEntry", root);
         let fiber_class = class_named(&mut heap, "Fiber", root);
+        let sequence_class = class_named(&mut heap, "Sequence", root);
+        let iterable = Some(sequence_class);
+        let map_sequence_class = class_named(&mut heap, "MapSequence", iterable);
+        let where_sequence_class = class_named(&mut heap, "WhereSequence", iterable);
+        let take_sequence_class = class_named(&mut heap, "TakeSequence", iterable);
+        let skip_sequence_class = class_named(&mut heap, "SkipSequence", iterable);
 
         let mut vm = Vm {
             heap,
@@ -309,6 +330,11 @@ impl Vm {
             map_entry_class,
             fiber_class,
             random_class: object_class,
+            sequence_class,
+            map_sequence_class,
+            where_sequence_class,
+            take_sequence_class,
+            skip_sequence_class,
             current_fiber: None,
             root_fiber: None,
             pending_switch: None,
@@ -317,6 +343,13 @@ impl Vm {
             open_upvalues: Vec::new(),
             output: Vec::new(),
         };
+        // `List`, `Map`, `Range` and `String` are sequences.
+        for class in [list_class, map_class, range_class, string_class] {
+            if let Some(Object::Class(class)) = vm.heap.get_mut(class) {
+                class.superclass = Some(sequence_class);
+            }
+        }
+
         core::install(&mut vm);
         vm.core_variables = vm.modules[0].values.len();
         vm
@@ -677,7 +710,8 @@ impl Vm {
             self.num_class, self.bool_class, self.null_class, self.string_class,
             self.list_class, self.map_class, self.range_class, self.class_class,
             self.object_class, self.fn_class, self.map_entry_class, self.fiber_class,
-            self.random_class,
+            self.random_class, self.sequence_class, self.map_sequence_class,
+            self.where_sequence_class, self.take_sequence_class, self.skip_sequence_class,
         ] {
             roots.push(Value::object(class));
         }
@@ -805,6 +839,48 @@ impl Vm {
             current = fiber.caller;
         }
         None
+    }
+
+    /// Call a method with arguments on a value, from Rust.
+    ///
+    /// This is what lets the `Sequence` methods be written in Rust and still
+    /// work on any type that answers the iteration protocol -- including a
+    /// class defined in Wren, whose `iterate` is a closure this has to call.
+    pub fn invoke_with(
+        &mut self,
+        receiver: Value,
+        signature: &str,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        let Some(symbol) = self.method_names.find(signature) else {
+            return Err(RuntimeError::new(format!(
+                "{} does not implement '{signature}'.",
+                self.class_of(receiver)
+                    .map(|class| self.class_name(class))
+                    .unwrap_or_else(|| "null".to_string())
+            )));
+        };
+        let Some(class) = self.class_of(receiver) else {
+            return Err(RuntimeError::new("Receiver has no class."));
+        };
+        let Some(method) = self.find_method(class, symbol) else {
+            return Err(RuntimeError::new(format!(
+                "{} does not implement '{signature}'.",
+                self.class_name(class)
+            )));
+        };
+
+        let at = self.stack.len();
+        self.stack.push(receiver);
+        for argument in args {
+            self.stack.push(*argument);
+        }
+        let result = match method {
+            Method::Primitive(function) => function(self, at),
+            Method::Closure(closure) => self.call_closure(closure, at),
+        };
+        self.stack.truncate(at);
+        result
     }
 
     /// Call a Wren function with arguments, from Rust.
