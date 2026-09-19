@@ -1518,6 +1518,15 @@ impl<'a> Compiler<'a> {
     /// A bad escape is a compile error pointing at the string it is in, which
     /// is why this is a method: the free function has no token to blame.
     fn unescaped(&self, token: Token) -> Result<Vec<u8>, CompileError> {
+        // **A raw string has no escapes at all**, so its bytes are its
+        // contents: `"""raw [\]/"""` holds a backslash and a bracket, not an
+        // escape sequence. The token span covers the contents, so what
+        // precedes it says which kind it is -- the lexer gives both the same
+        // kind, and a flag on `Token` would cost a word on every token in the
+        // stream to distinguish a case this rare.
+        if token.start >= 3 && &self.source.as_bytes()[token.start - 3..token.start] == b"\"\"\"" {
+            return Ok(token.text(self.source).as_bytes().to_vec());
+        }
         unescape(token.text(self.source)).map_err(|message| CompileError {
             message,
             line: clamp_line(token.line),
@@ -1663,6 +1672,10 @@ impl<'a> Compiler<'a> {
             self.expression()?;
             self.emit_call("toString", 0, line)?;
             self.emit_call("+(_)", 1, line)?;
+            // A newline is allowed before the closing `)` of an
+            // interpolation, and the lexer emits it before resuming the
+            // string.
+            self.skip_newlines()?;
 
             // **No `)` to consume.** The lexer counts parentheses inside an
             // interpolation itself, and the one that closes it is swallowed

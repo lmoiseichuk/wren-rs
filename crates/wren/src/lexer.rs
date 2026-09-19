@@ -195,8 +195,18 @@ impl<'a> Lexer<'a> {
     /// valid program an error nobody can see.
     pub fn new(source: &'a str) -> Self {
         // U+FEFF encoded as UTF-8.
+        let bytes = source.as_bytes();
         let mark: &[u8] = &[0xef, 0xbb, 0xbf];
-        let skip = if source.as_bytes().starts_with(mark) { mark.len() } else { 0 };
+        let mut skip = if bytes.starts_with(mark) { mark.len() } else { 0 };
+
+        // **A `#!` on the very first line is a shebang**, not an attribute.
+        // Only there: `#!` anywhere else is a runtime attribute, and the
+        // position is the only thing that distinguishes them.
+        if bytes[skip..].starts_with(b"#!") {
+            while skip < bytes.len() && bytes[skip] != b'\n' {
+                skip += 1;
+            }
+        }
         Lexer {
             source,
             bytes: source.as_bytes(),

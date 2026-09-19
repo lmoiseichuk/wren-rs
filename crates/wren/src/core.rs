@@ -212,6 +212,19 @@ fn install_object(vm: &mut Vm) {
         Ok(Value::FALSE)
     });
 
+    // `Object.same(a, b)` is identity, ignoring any `==` a class defines --
+    // which is the point of having it.
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Object metaclass")));
+    let object_metaclass = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+    if let Some(Object::Class(object)) = vm.heap.get_mut(class) {
+        object.metaclass = Some(object_metaclass);
+    }
+    define(vm, object_metaclass, "same(_,_)", |vm, at| {
+        Ok(Value::bool(argument(vm, at, 1).is_same(argument(vm, at, 2))))
+    });
+
     define(vm, class, "type", |vm, at| match vm.class_of(receiver(vm, at)) {
         Some(class) => Ok(Value::object(class)),
         None => Ok(Value::NULL),
@@ -684,7 +697,13 @@ fn install_num_extras(vm: &mut Vm) {
     });
     define(vm, class, "fraction", |vm, at| {
         let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
-        Ok(Value::num(value - math::trunc(value)))
+        let fraction = value - math::trunc(value);
+        // `(-2).fraction` is `-0`, not `0`. The subtraction gives a positive
+        // zero, and Wren prints the sign, so it has to be put back.
+        if fraction == 0.0 && value.is_sign_negative() {
+            return Ok(Value::num(-0.0));
+        }
+        Ok(Value::num(fraction))
     });
     define(vm, class, "sign", |vm, at| {
         let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
@@ -781,6 +800,22 @@ fn install_num_extras(vm: &mut Vm) {
     if let Some(Object::Class(num)) = vm.heap.get_mut(class) {
         num.metaclass = Some(metaclass);
     }
+    define(vm, metaclass, "fromString(_)", |vm, at| {
+        let text = string_argument(vm, at, 1)?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(Value::NULL);
+        }
+        // Hexadecimal is written the same way a literal is.
+        let parsed = match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+            Some(digits) => u64::from_str_radix(digits, 16).ok().map(|value| value as f64),
+            None => trimmed.parse::<f64>().ok(),
+        };
+        // **Null rather than an error for junk.** The caller asked whether the
+        // text is a number, and "no" is an answer.
+        Ok(parsed.map_or(Value::NULL, Value::num))
+    });
+
     define(vm, metaclass, "pi", |_, _| Ok(Value::num(core::f64::consts::PI)));
     define(vm, metaclass, "e", |_, _| Ok(Value::num(core::f64::consts::E)));
     define(vm, metaclass, "infinity", |_, _| Ok(Value::num(f64::INFINITY)));
@@ -900,6 +935,28 @@ fn install_string_extras(vm: &mut Vm) {
     define(vm, class, "trimEnd()", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
         let trimmed = text.trim_end().to_string();
+        Ok(vm.new_string(&trimmed))
+    });
+
+    define(vm, class, "trim(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let set = string_argument(vm, at, 1)?;
+        let trimmed = text
+            .trim_start_matches(|c| set.contains(c))
+            .trim_end_matches(|c| set.contains(c))
+            .to_string();
+        Ok(vm.new_string(&trimmed))
+    });
+    define(vm, class, "trimStart(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let set = string_argument(vm, at, 1)?;
+        let trimmed = text.trim_start_matches(|c| set.contains(c)).to_string();
+        Ok(vm.new_string(&trimmed))
+    });
+    define(vm, class, "trimEnd(_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let set = string_argument(vm, at, 1)?;
+        let trimmed = text.trim_end_matches(|c| set.contains(c)).to_string();
         Ok(vm.new_string(&trimmed))
     });
 
@@ -1199,22 +1256,28 @@ fn install_sequence(vm: &mut Vm) {
     });
 
     define(vm, class, "all(_)", |vm, at| {
+        // **Returns the first falsy result, not `false`.** The value carries
+        // more than the verdict does -- it says *which* element failed -- and
+        // a program can still use it as a condition because it is falsy.
         let sequence = receiver(vm, at);
         let function = function_argument(vm, at, 1)?;
         for element in collect(vm, sequence)? {
-            if vm.call_function(function, &[element])?.is_falsy() {
-                return Ok(Value::FALSE);
+            let result = vm.call_function(function, &[element])?;
+            if result.is_falsy() {
+                return Ok(result);
             }
         }
         Ok(Value::TRUE)
     });
 
     define(vm, class, "any(_)", |vm, at| {
+        // The mirror of `all`: the first truthy result rather than `true`.
         let sequence = receiver(vm, at);
         let function = function_argument(vm, at, 1)?;
         for element in collect(vm, sequence)? {
-            if !vm.call_function(function, &[element])?.is_falsy() {
-                return Ok(Value::TRUE);
+            let result = vm.call_function(function, &[element])?;
+            if !result.is_falsy() {
+                return Ok(result);
             }
         }
         Ok(Value::FALSE)
@@ -2287,7 +2350,13 @@ fn install_range(vm: &mut Vm) {
         if current.is_null() {
             return Ok(Value::num(range.from));
         }
-        let mut iterator = integer_argument(vm, at, 1, "Iterator")?;
+        // **A fractional iterator is allowed**, and simply steps from where it
+        // is: `for (i in 1..3)` always passes integers, but a program may call
+        // `iterate` directly with anything, and upstream answers rather than
+        // refusing.
+        let mut iterator = argument(vm, at, 1)
+            .as_num()
+            .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?;
 
         if range.from < range.to {
             iterator += 1.0;
@@ -2311,6 +2380,34 @@ fn install_range(vm: &mut Vm) {
     // For a range the iterator *is* the value, which is why iterating one
     // allocates nothing at all.
     define(vm, class, "iteratorValue(_)", |vm, at| Ok(argument(vm, at, 1)));
+
+    define(vm, class, "isInclusive", |vm, at| {
+        Ok(Value::bool(range_of(vm, receiver(vm, at)).is_some_and(|r| r.is_inclusive)))
+    });
+
+    // **All three fields, so `2..5` and `2...5` are different ranges.** They
+    // cover different values, so comparing only the endpoints would make two
+    // ranges equal that iterate differently.
+    define(vm, class, "==(_)", |vm, at| {
+        let left = range_of(vm, receiver(vm, at));
+        let right = range_of(vm, argument(vm, at, 1));
+        Ok(Value::bool(match (left, right) {
+            (Some(a), Some(b)) => {
+                a.from == b.from && a.to == b.to && a.is_inclusive == b.is_inclusive
+            }
+            _ => false,
+        }))
+    });
+    define(vm, class, "!=(_)", |vm, at| {
+        let left = range_of(vm, receiver(vm, at));
+        let right = range_of(vm, argument(vm, at, 1));
+        Ok(Value::bool(match (left, right) {
+            (Some(a), Some(b)) => {
+                !(a.from == b.from && a.to == b.to && a.is_inclusive == b.is_inclusive)
+            }
+            _ => true,
+        }))
+    });
 
     define(vm, class, "toString", |vm, at| {
         let text = vm.to_string(receiver(vm, at));
@@ -2484,8 +2581,12 @@ fn install_system(vm: &mut Vm) {
 /// because only the ones with static methods had needed one -- which made
 /// their `type` fall back to `Class` and report the wrong name.
 fn install_metaclasses(vm: &mut Vm) {
+    // **`Class` is deliberately absent.** Its own metatype is itself: `class_of`
+    // falls back to `Class` for a class with no metaclass, so leaving it
+    // without one is what makes `Class.type == Class` and the chain of
+    // `.type.type.type` settle rather than growing a new metaclass each step.
     let classes = [
-        vm.object_class, vm.bool_class, vm.class_class, vm.fiber_class, vm.fn_class,
+        vm.object_class, vm.bool_class, vm.fiber_class, vm.fn_class,
         vm.list_class, vm.map_class, vm.map_entry_class, vm.null_class, vm.num_class,
         vm.range_class, vm.string_class, vm.sequence_class, vm.map_sequence_class,
         vm.where_sequence_class, vm.take_sequence_class, vm.skip_sequence_class,
