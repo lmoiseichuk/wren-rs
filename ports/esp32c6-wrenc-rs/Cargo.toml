@@ -1,4 +1,4 @@
-# The Rust VM on an ESP32-C6, for the measurement that matters.
+# The Rust VM on an ESP32-C6, running bytecode, with no compiler linked.
 #
 # **Bare metal, not ESP-IDF.** The C port in `../esp32c6-wren` is an ESP-IDF
 # application because upstream Wren is a C library that expects a libc; this
@@ -9,7 +9,7 @@
 # has none, which is the point -- a firmware takes the VM without taking a tree
 # of crates with it.
 [package]
-name = "esp32c6-wren-rs"
+name = "esp32c6-wrenc-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -21,8 +21,11 @@ publish = false
 [workspace]
 
 [dependencies]
-# This port compiles on the device, so it takes the compiler.
-wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "libm", "compiler"] }
+# **No `compiler` feature**, which is the whole point of this port: the device
+# is handed `.wrenc` built on a workstation, so the lexer and the parser are
+# never linked. What this package measures is how much of the firmware they
+# were.
+wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "libm"] }
 esp-hal = { version = "1.2", features = ["esp32c6", "unstable"] }
 esp-alloc = { version = "0.11", features = ["esp32c6"] }
 esp-println = { version = "0.16", features = ["esp32c6"] }

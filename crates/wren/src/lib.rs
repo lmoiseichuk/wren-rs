@@ -70,6 +70,7 @@
 #![deny(dead_code)]
 
 pub mod handle;
+#[cfg(feature = "compiler")]
 pub mod lexer;
 pub mod math;
 #[cfg(feature = "alloc")]
@@ -81,7 +82,7 @@ pub mod wrenc;
 // allocator at all still gets the lexer, and later the bytecode reader.
 #[cfg(feature = "alloc")]
 pub mod bytecode;
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "compiler"))]
 pub mod compiler;
 #[cfg(feature = "alloc")]
 pub mod core;
@@ -96,6 +97,7 @@ pub mod value;
 pub mod vm;
 
 pub use handle::ObjectId;
+#[cfg(feature = "compiler")]
 pub use lexer::{Lexer, Token, TokenKind};
 pub use value::Value;
 

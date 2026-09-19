@@ -21,6 +21,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::bytecode::{Chunk, Op};
+#[cfg(feature = "compiler")]
 use crate::compiler;
 use crate::core;
 use crate::handle::ObjectId;
@@ -412,6 +413,12 @@ impl Vm {
     }
 
     /// Compile `source` and run it.
+    ///
+    /// **Absent without the `compiler` feature**, which is the point of that
+    /// feature: a device running `.wrenc` has no use for a lexer and a parser,
+    /// and leaving them out is most of what makes the image fit. Use
+    /// [`Vm::run_closure`] with a loaded closure instead.
+    #[cfg(feature = "compiler")]
     pub fn interpret(&mut self, source: &str) -> Result<(), WrenError> {
         let chunk = compiler::compile(self, source)
             .map_err(|error| WrenError::Compile { message: error.message, line: error.line })?;
@@ -496,25 +503,42 @@ impl Vm {
         // the partially built one rather than looping forever.
         self.module_index.insert(name.to_string(), index);
 
-        let chunk = compiler::compile_in(self, &source, index).map_err(|error| RuntimeError {
-            message: error.message,
-            line: error.line,
-        })?;
+        // **A module can only be loaded where there is a compiler.** A build
+        // without one runs bytecode it was handed, and `import` of a source
+        // file is not a thing it can do -- saying so is better than a loader
+        // that silently finds nothing.
+        #[cfg(not(feature = "compiler"))]
+        {
+            let _ = source;
+            return Err(RuntimeError::new(alloc::format!(
+                "Cannot import '{name}': this build has no compiler."
+            )));
+        }
 
-        let function = self.heap.allocate(Object::Fn(Box::new(ObjFn {
-            chunk: Rc::new(chunk),
-            arity: 0,
-            num_upvalues: 0,
-            name: name.to_string(),
-            field_offset: 0,
-            super_class: None,
-            owner_class: None,
-            module: index,
-        })));
-        let closure = self
-            .heap
-            .allocate(Object::Closure(Box::new(ObjClosure { function, upvalues: Vec::new() })));
-        Ok((index, Some(closure)))
+        #[cfg(feature = "compiler")]
+        {
+            let chunk =
+                compiler::compile_in(self, &source, index).map_err(|error| RuntimeError {
+                    message: error.message,
+                    line: error.line,
+                })?;
+
+            let function = self.heap.allocate(Object::Fn(Box::new(ObjFn {
+                chunk: Rc::new(chunk),
+                arity: 0,
+                num_upvalues: 0,
+                name: name.to_string(),
+                field_offset: 0,
+                super_class: None,
+                owner_class: None,
+                module: index,
+            })));
+            let closure = self.heap.allocate(Object::Closure(Box::new(ObjClosure {
+                function,
+                upvalues: Vec::new(),
+            })));
+            Ok((index, Some(closure)))
+        }
     }
 
     /// What `System.print` has written so far.

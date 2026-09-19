@@ -32,7 +32,7 @@ name = "wren"
 libm = { version = "0.2", optional = true }
 
 [features]
-default = ["std"]
+default = ["std", "compiler"]
 # `std` is for the host: tests, and eventually an ahead-of-time compiler that
 # runs on a workstation and emits bytecode for a part that cannot afford one.
 # Firmware builds turn it off and usually turn `alloc` on instead.
@@ -44,3 +44,8 @@ alloc = []
 # simply not defined -- which reports "Num does not implement 'sin'" rather
 # than answering something wrong.
 libm = ["dep:libm"]
+# **The compiler, which a device running bytecode does not need.** This is
+# what step 4 of the plan is for: compile on a workstation, ship `.wrenc`, and
+# leave the lexer and parser out of the image entirely. Default on, because a
+# host almost always wants it.
+compiler = []

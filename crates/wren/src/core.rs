@@ -2773,6 +2773,8 @@ pub fn install_meta(vm: &mut Vm) -> usize {
         Ok(new_list(vm, elements))
     });
 
+    // `Meta.eval` compiles, so it exists only where a compiler does.
+    #[cfg(feature = "compiler")]
     define(vm, metaclass, "eval(_)", |vm, at| {
         let value = argument(vm, at, 1);
         if !vm.is_string(value) {
