@@ -2,6 +2,7 @@
 //!
 //!     cargo run -p wren --example wrenc -- <in.wren> <out.wrenc>
 //!     cargo run -p wren --example wrenc -- --check <in.wren> <out.wrenc>
+//!     cargo run -p wren --example wrenc -- --strip-lines <in.wren> <out.wrenc>
 //!
 //! **A build step, not a runtime one.** The point of the format is that the
 //! device never compiles; this is what does the compiling, on a machine that
@@ -15,11 +16,17 @@
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let check = arguments.first().map(String::as_str) == Some("--check");
-    let rest: Vec<&String> = arguments.iter().skip(usize::from(check)).collect();
+    let check = arguments.iter().any(|argument| argument == "--check");
+    let strip = arguments.iter().any(|argument| argument == "--strip-lines");
+    // Options anywhere, paths in order, so that `--strip-lines` can be added
+    // to an existing command without minding where.
+    let rest: Vec<&String> = arguments
+        .iter()
+        .filter(|argument| !argument.starts_with("--"))
+        .collect();
 
     let (Some(input), Some(output)) = (rest.first(), rest.get(1)) else {
-        eprintln!("usage: wrenc [--check] <in.wren> <out.wrenc>");
+        eprintln!("usage: wrenc [--check] [--strip-lines] <in.wren> <out.wrenc>");
         std::process::exit(2);
     };
 
@@ -60,7 +67,14 @@ fn main() {
         }
     };
 
-    let bytes = match wren::wrenc::write(&vm, &chunk, &source) {
+    // **A build that ships need not carry a map back to its source.** The
+    // line table is flash, the RAM it is read into, and the one part of the
+    // file that says which source line each instruction came from.
+    let lines = match strip {
+        true => wren::wrenc::Lines::Strip,
+        false => wren::wrenc::Lines::Keep,
+    };
+    let bytes = match wren::wrenc::write_with(&vm, &chunk, &source, lines) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("{input}: {}", error.message());

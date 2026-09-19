@@ -189,11 +189,37 @@ impl Names {
 
 // --- writing ----------------------------------------------------------------
 
+/// What to leave out of a written file.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum Lines {
+    /// Keep the line table, so a runtime error can say where it happened.
+    #[default]
+    Keep,
+    /// Leave it out.
+    ///
+    /// **For a build that ships.** The table costs flash, costs the RAM it is
+    /// read into, and is the one part of a `.wrenc` that maps the bytecode
+    /// back to the source someone wrote -- which is worth something to whoever
+    /// is reading the file and nothing to the program. What it buys back is an
+    /// error that reports line 0.
+    Strip,
+}
+
 /// Serialise a compiled chunk, stamped with the digest of its source.
 ///
 /// Takes the VM because the symbol and variable names live there, not in the
 /// chunk: what the chunk holds are indices into the VM's tables.
 pub fn write(vm: &Vm, chunk: &Chunk, source: &[u8]) -> Result<Vec<u8>, LoadError> {
+    write_with(vm, chunk, source, Lines::Keep)
+}
+
+/// As [`write`], choosing whether to keep the line table.
+pub fn write_with(
+    vm: &Vm,
+    chunk: &Chunk,
+    source: &[u8],
+    lines: Lines,
+) -> Result<Vec<u8>, LoadError> {
     let mut names = Names::default();
     names.gather(vm, chunk)?;
 
@@ -217,19 +243,36 @@ pub fn write(vm: &Vm, chunk: &Chunk, source: &[u8]) -> Result<Vec<u8>, LoadError
         );
     }
 
-    write_function(vm, &mut out, chunk, 0, 0, "(module)", &names)?;
+    let context = Writing {
+        vm,
+        names: &names,
+        lines,
+    };
+    write_function(&context, &mut out, chunk, 0, 0, "(module)")?;
     Ok(out)
 }
 
+/// What every part of the writer needs: where names come from, what they are
+/// renumbered to, and whether the line table is going in.
+///
+/// One struct rather than three arguments threaded through five functions --
+/// `write_function` had grown to eight parameters, which is the point at which
+/// adding the next one is somebody else's problem.
+struct Writing<'a> {
+    vm: &'a Vm,
+    names: &'a Names,
+    lines: Lines,
+}
+
 fn write_function(
-    vm: &Vm,
+    context: &Writing,
     out: &mut Vec<u8>,
     chunk: &Chunk,
     arity: usize,
     upvalues: usize,
     name: &str,
-    names: &Names,
 ) -> Result<(), LoadError> {
+    let Writing { names, lines, .. } = *context;
     out.push(arity as u8);
     out.push(upvalues as u8);
     write_bytes(out, name.as_bytes());
@@ -244,16 +287,15 @@ fn write_function(
     write_u32(out, code.len() as u32);
     out.extend_from_slice(&code);
 
-    // **The line table travels run-length encoded.** It holds one line number
-    // per *byte* of code, and a statement is many bytes, so stored flat it was
-    // half the file -- 400 bytes of line numbers for 200 bytes of code. Almost
-    // every entry equals the one before it, which is exactly what run-length
-    // encoding is for. A runtime error with no line number would be the
-    // cheaper trade and a much worse one.
-    // The chunk now holds this in the same shape the file does, so the run
-    // lengths are the gaps between entries rather than a count of repeats.
+    // **The line table travels run-length encoded**, in the same shape the
+    // chunk holds it: one entry per line, and the run lengths are the gaps
+    // between entries. `Lines::Strip` writes none of it, for a build that
+    // would rather not carry a map from its bytecode back to its source.
     let mut runs: Vec<(u16, u16)> = Vec::new();
     for (index, (start, line)) in chunk.lines.iter().enumerate() {
+        if lines == Lines::Strip {
+            break;
+        }
         let end = match chunk.lines.get(index + 1) {
             Some((next, _)) => *next as usize,
             None => chunk.code.len(),
@@ -273,17 +315,13 @@ fn write_function(
 
     write_u32(out, chunk.constants.len() as u32);
     for constant in &chunk.constants {
-        write_constant(vm, out, *constant, names)?;
+        write_constant(context, out, *constant)?;
     }
     Ok(())
 }
 
-fn write_constant(
-    vm: &Vm,
-    out: &mut Vec<u8>,
-    value: Value,
-    names: &Names,
-) -> Result<(), LoadError> {
+fn write_constant(context: &Writing, out: &mut Vec<u8>, value: Value) -> Result<(), LoadError> {
+    let Writing { vm, .. } = *context;
     if value.is_null() {
         out.push(0);
         return Ok(());
@@ -331,7 +369,7 @@ fn write_constant(
             let arity = function.arity;
             let upvalues = function.num_upvalues;
             let name = function.name.clone();
-            write_function(vm, out, &chunk, arity, upvalues, &name, names)?;
+            write_function(context, out, &chunk, arity, upvalues, &name)?;
         }
         // **Class attributes are built at compile time**, so a whole object
         // graph -- maps of lists, wrapped in a `ClassAttributes` -- can be a
@@ -347,7 +385,7 @@ fn write_constant(
             };
             write_u32(out, elements.len() as u32);
             for element in elements {
-                write_constant(vm, out, element, names)?;
+                write_constant(context, out, element)?;
             }
         }
         Some(ObjectType::Map) => {
@@ -361,8 +399,8 @@ fn write_constant(
             };
             write_u32(out, entries.len() as u32);
             for entry in entries {
-                write_constant(vm, out, entry.key, names)?;
-                write_constant(vm, out, entry.value, names)?;
+                write_constant(context, out, entry.key)?;
+                write_constant(context, out, entry.value)?;
             }
         }
         Some(ObjectType::Instance) => {
@@ -370,7 +408,7 @@ fn write_constant(
             let fields = vm.heap.instance_fields(id).to_vec();
             write_u32(out, fields.len() as u32);
             for field in fields {
-                write_constant(vm, out, field, names)?;
+                write_constant(context, out, field)?;
             }
         }
         // Nothing else reaches a constant table.

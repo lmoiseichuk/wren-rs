@@ -1639,3 +1639,32 @@ fn string_search_and_replace() {
         "a+b+c\n"
     );
 }
+
+/// **A shipped build need not carry a map back to its source.**
+/// `wrenc --strip-lines` leaves the line table out: the program runs the same
+/// and a runtime error reports line 0. See `wrenc::Lines`.
+#[test]
+fn stripped_bytecode_runs_the_same_and_reports_no_line() {
+    let source = "var a = 1\nvar b = 2\nSystem.print(a + b)\na.nope\n";
+
+    let run = |lines: wren::wrenc::Lines| {
+        let mut vm = Vm::new();
+        let chunk = wren::compiler::compile(&mut vm, source).expect("it compiles");
+        let bytes = wren::wrenc::write_with(&vm, &chunk, source.as_bytes(), lines)
+            .expect("it serialises");
+
+        let mut vm = Vm::new();
+        let loaded = wren::wrenc::load(&mut vm, &bytes).expect("it loads");
+        let error = vm
+            .run_closure(loaded.closure)
+            .expect_err("the last line fails");
+        (vm.output_str().to_string(), error.line)
+    };
+
+    let (kept_output, kept_line) = run(wren::wrenc::Lines::Keep);
+    let (stripped_output, stripped_line) = run(wren::wrenc::Lines::Strip);
+
+    assert_eq!(kept_output, stripped_output, "the program behaves the same");
+    assert_eq!(kept_line, 4, "with the table, the error knows its line");
+    assert_eq!(stripped_line, 0, "without it, there is no line to report");
+}
