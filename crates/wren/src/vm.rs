@@ -1047,7 +1047,28 @@ impl Vm {
     /// Called when a frame returns or a scope with captured locals ends: the
     /// slots are about to be reused, so anything still referring to them has to
     /// take its own copy first.
+    ///
+    /// **Almost every call has nothing to do.** This runs on every return, and
+    /// a program holds an open upvalue only while a closure that captured a
+    /// live local is reachable -- which for whole programs is never. The test
+    /// is one load and a branch; what it guards is a `Vec` taken, a list walked
+    /// and a `Vec` put back.
     fn close_upvalues(&mut self, from: usize) {
+        if self.open_upvalues.is_empty() {
+            return;
+        }
+        self.close_open_upvalues(from);
+    }
+
+    /// The part of closing upvalues that only runs when there are some.
+    ///
+    /// Split out and never inlined so that the caller keeps the test above and
+    /// nothing else: the return path is the hottest code in the interpreter
+    /// after dispatch itself, and it is instruction-fetch bound -- see
+    /// [`doc/wren-rs/profiling.md`]. Code that cannot run still costs, if it
+    /// sits between two instructions that do.
+    #[inline(never)]
+    fn close_open_upvalues(&mut self, from: usize) {
         let mut still_open = Vec::new();
         for id in ::core::mem::take(&mut self.open_upvalues) {
             let slot = match self.heap.upvalue(id) {
