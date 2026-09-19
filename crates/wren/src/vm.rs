@@ -550,6 +550,20 @@ impl Vm {
         Value::object(self.heap.allocate(Object::String(ObjString::new(bytes))))
     }
 
+    /// Is this value a string?
+    ///
+    /// **Separate from reading one**, because a Wren string may hold bytes
+    /// that are not valid UTF-8 and is a string all the same. Using "can I
+    /// read it as `&str`" as the type test made `"\xff"` report as a
+    /// non-string, which printed it as `[invalid toString]` and rejected it
+    /// wherever a string argument was required.
+    pub fn is_string(&self, value: Value) -> bool {
+        matches!(
+            value.as_object().and_then(|id| self.heap.get(id)),
+            Some(Object::String(_))
+        )
+    }
+
     /// Read a string object, for a primitive that needs its contents.
     pub fn string_at(&self, value: Value) -> Option<&str> {
         match self.heap.get(value.as_object()?)? {
@@ -580,7 +594,10 @@ impl Vm {
             return "<invalid>".to_string();
         };
         match self.heap.get(id) {
-            Some(Object::String(text)) => text.as_str().unwrap_or("<not utf-8>").to_string(),
+            // Lossy, because this is for display: the bytes are kept intact
+            // in the string itself, and printing is the one place where a
+            // sequence that is not valid UTF-8 has to become *something*.
+            Some(Object::String(text)) => String::from_utf8_lossy(&text.bytes).into_owned(),
             Some(Object::Range(range)) => {
                 let separator = if range.is_inclusive { ".." } else { "..." };
                 format!(
@@ -787,7 +804,7 @@ impl Vm {
         // error.** Wren prints a placeholder, because failing here would mean
         // a debugging `System.print` could itself raise -- exactly when the
         // program is already misbehaving.
-        if self.string_at(text).is_none() {
+        if !self.is_string(text) {
             return Ok("[invalid toString]".to_string());
         }
         Ok(self.to_string(text))

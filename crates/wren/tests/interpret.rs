@@ -1409,3 +1409,61 @@ System.print(kept.v)
 ";
     assert_eq!(run(source), "kept\n");
 }
+
+// --- strings are bytes, and are walked as UTF-8 where they can be -----------
+
+#[test]
+fn a_string_is_eight_bit_clean() {
+    // `\xff` is one byte, not the two bytes of U+00FF. Decoding escapes into a
+    // Rust String turned every high byte into its Latin-1 character, which is
+    // a different string from the one written.
+    assert_eq!(run("System.print(\"\\0\".bytes.count)"), "1\n");
+    assert_eq!(run("System.print(\"\\xff\".bytes.count)"), "1\n");
+    assert_eq!(run("System.print(\"\\xff\".bytes[0])"), "255\n");
+    assert_eq!(run("System.print(\"a\\0b\".bytes.count)"), "3\n");
+}
+
+#[test]
+fn count_is_code_points_and_bytes_is_bytes() {
+    // Two different questions. `count` treats a UTF-8 sequence as one item.
+    assert_eq!(run("System.print(\"søméஃthîng\".count)"), "10\n");
+    assert_eq!(run("System.print(\"søméஃthîng\".bytes.count)"), "15\n");
+}
+
+#[test]
+fn invalid_utf8_counts_one_byte_at_a_time() {
+    // `\xef` is a three-byte lead, but what follows are not continuation
+    // bytes, so there is no sequence there. Trusting the lead byte's implied
+    // length would step over the `o` and the `k`.
+    assert_eq!(run("System.print(\"\\xefok\\xf7\".count)"), "4\n");
+}
+
+#[test]
+fn iterating_a_string_yields_whole_characters() {
+    let source = "
+var out = []
+for (c in \"søm\") out.add(c)
+System.print(out.count)
+System.print(out[1])
+";
+    assert_eq!(run(source), "3\nø\n");
+}
+
+#[test]
+fn slicing_a_string_drops_partial_sequences() {
+    // **Byte positions in, whole characters out.** Upstream visits each
+    // selected byte and emits a code point only where one starts, so a range
+    // beginning or ending mid-sequence drops those bytes rather than
+    // producing half a character.
+    assert_eq!(run("System.print(\"søméஃthîng\"[0..3])"), "søm\n");
+    assert_eq!(run("System.print(\"søméஃthîng\"[2..6])"), "méஃ\n");
+    assert_eq!(run("System.print(\"søméஃthîng\"[2...6])"), "mé\n");
+}
+
+#[test]
+fn string_search_and_replace() {
+    assert_eq!(run("System.print(\"abcd\".indexOf(\"cd\", 0))"), "2\n");
+    assert_eq!(run("System.print(\"abcd\".indexOf(\"cd\", 3))"), "-1\n");
+    assert_eq!(run("System.print(\"aaaaa\".indexOf(\"aaaa\", 1))"), "1\n");
+    assert_eq!(run("System.print(\"a-b-c\".replace(\"-\", \"+\"))"), "a+b+c\n");
+}

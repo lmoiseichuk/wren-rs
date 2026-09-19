@@ -588,7 +588,7 @@ fn install_string(vm: &mut Vm) {
         // Upstream requires the right operand to be a string too, rather than
         // coercing it. `"a" + 1` is an error in Wren, and quietly making it
         // work here would be a different language.
-        if vm.string_at(right).is_none() {
+        if !vm.is_string(right) {
             return Err(RuntimeError::new("Right operand must be a string."));
         }
         let joined = alloc::format!("{}{}", left, vm.to_string(right));
@@ -596,14 +596,14 @@ fn install_string(vm: &mut Vm) {
     });
 
     define(vm, class, "count", |vm, at| {
-        // Bytes, as upstream's `count` is. A string's length in *characters*
-        // needs decoding and is a different method there.
-        let text = receiver(vm, at);
-        let length = match vm.heap.get(text.as_object().unwrap()) {
-            Some(Object::String(string)) => string.bytes.len(),
-            _ => 0,
-        };
-        Ok(Value::num(length as f64))
+        // **Code points, not bytes.** Upstream's own test says it: "treats a
+        // UTF-8 sequence as a single item", and "counts invalid UTF-8 one byte
+        // at a time". Both fall out of counting the bytes that are not
+        // continuations. The byte count is `.bytes.count`, a different
+        // question and a different method.
+        let bytes = string_bytes(vm, receiver(vm, at));
+        let count = bytes.iter().filter(|byte| !is_continuation(**byte)).count();
+        Ok(Value::num(count as f64))
     });
 
     define(vm, class, "toString", |vm, at| Ok(receiver(vm, at)));
@@ -786,19 +786,29 @@ fn install_string_extras(vm: &mut Vm) {
         let text = string_bytes(vm, receiver(vm, at));
         // A range subscript takes a substring, as it slices a list.
         if let Some(range) = range_of(vm, argument(vm, at, 1)) {
+            // **Byte positions in, whole characters out.** Upstream visits
+            // each selected byte, decodes a code point there, and emits it
+            // only if one starts at that byte -- so a range beginning or
+            // ending inside a sequence quietly drops the partial bytes rather
+            // than producing half a character. `"søméஃthîng"[2..6]` is "méஃ":
+            // five byte positions, two of them mid-sequence and skipped.
             let taken = slice_indices(&range, text.len())?;
-            let bytes: Vec<u8> = taken.into_iter().map(|index| text[index]).collect();
-            let sliced = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
-            return Ok(vm.new_string(&sliced));
+            let mut bytes = Vec::new();
+            for index in taken {
+                if let Some(character) = code_point_at(&text, index) {
+                    let mut buffer = [0u8; 4];
+                    bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                }
+            }
+            return Ok(vm.new_string_bytes(bytes));
         }
         let index = number_argument(vm, at, 1)?;
         let index = resolve_index(index, text.len())?;
         // **Indexing is by byte but yields a whole code point.** Upstream does
         // the same: a string is bytes, but `s[0]` of a multi-byte character is
-        // that character rather than half of it.
-        let rest = alloc::string::String::from_utf8_lossy(&text[index..]).into_owned();
-        let character: alloc::string::String = rest.chars().take(1).collect();
-        Ok(vm.new_string(&character))
+        // that character rather than half of it -- and a byte that starts no
+        // valid sequence is returned as itself rather than reinterpreted.
+        Ok(vm.new_string_bytes(character_bytes(&text, index)))
     });
 
     define(vm, class, "contains(_)", |vm, at| {
@@ -824,6 +834,36 @@ fn install_string_extras(vm: &mut Vm) {
 
     define(vm, class, "isEmpty", |vm, at| {
         Ok(Value::bool(string_bytes(vm, receiver(vm, at)).is_empty()))
+    });
+
+    define(vm, class, "indexOf(_,_)", |vm, at| {
+        // Byte-wise, so an index landing inside a multi-byte sequence is an
+        // ordinary answer rather than a panic.
+        let text = string_bytes(vm, receiver(vm, at));
+        let needle = string_bytes(vm, string_value_argument(vm, at, 1)?);
+        let start = integer_argument(vm, at, 2, "Start")?;
+        // Negative counts from the end, as every other index in the language
+        // does. Equal to the length is allowed -- searching an empty tail is a
+        // sensible question with the answer -1.
+        let resolved = if start < 0.0 { start + text.len() as f64 } else { start };
+        if resolved < 0.0 || resolved > text.len() as f64 {
+            return Err(RuntimeError::new("Start out of bounds."));
+        }
+        let start = resolved as usize;
+        Ok(Value::num(
+            find_bytes(&text[start..], &needle).map_or(-1.0, |index| (index + start) as f64),
+        ))
+    });
+
+    define(vm, class, "replace(_,_)", |vm, at| {
+        let text = string_text(vm, receiver(vm, at));
+        let from = string_argument(vm, at, 1)?;
+        let to = string_argument(vm, at, 2)?;
+        if from.is_empty() {
+            return Err(RuntimeError::new("Cannot replace an empty string."));
+        }
+        let replaced = text.replace(&from, &to);
+        Ok(vm.new_string(&replaced))
     });
 
     define(vm, class, "trim()", |vm, at| {
@@ -874,43 +914,54 @@ fn install_string_extras(vm: &mut Vm) {
         Ok(new_list(vm, values))
     });
     define(vm, class, "codePoints", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let values: Vec<Value> =
-            text.chars().map(|character| Value::num(character as u32 as f64)).collect();
+        // **-1 for an incomplete sequence**, which is upstream's answer: the
+        // bytes are there and are not a character, and reporting a
+        // substitution character would claim the string holds something it
+        // does not.
+        let bytes = string_bytes(vm, receiver(vm, at));
+        let mut values = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match code_point_at(&bytes, index) {
+                Some(character) => values.push(Value::num(character as u32 as f64)),
+                None => values.push(Value::num(-1.0)),
+            }
+            index += utf8_length(bytes[index]);
+        }
         Ok(new_list(vm, values))
     });
 
     // Iterating a string yields its characters, one code point at a time.
     define(vm, class, "iterate(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
+        let bytes = string_bytes(vm, receiver(vm, at));
         let current = argument(vm, at, 1);
         let start = if current.is_null() {
             0
         } else {
             let index = integer_argument(vm, at, 1, "Iterator")?;
-            if index < 0.0 || index as usize >= text.len() {
+            if index < 0.0 || index as usize >= bytes.len() {
                 return Ok(Value::FALSE);
             }
-            let index = index as usize;
-            // Step past the character that starts at this byte.
-            match text[index..].chars().next() {
-                Some(character) => index + character.len_utf8(),
-                None => return Ok(Value::FALSE),
-            }
+            // One byte on, then past any continuation bytes. This always
+            // advances, so a malformed string still terminates.
+            index as usize + 1
         };
-        if start >= text.len() {
+        let mut start = start;
+        while start < bytes.len() && is_continuation(bytes[start]) {
+            start += 1;
+        }
+        if start >= bytes.len() {
             return Ok(Value::FALSE);
         }
         Ok(Value::num(start as f64))
     });
     define(vm, class, "iteratorValue(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
+        let bytes = string_bytes(vm, receiver(vm, at));
         let index = integer_argument(vm, at, 1, "Iterator")?;
-        if index < 0.0 || index as usize >= text.len() {
+        if index < 0.0 || index as usize >= bytes.len() {
             return Err(RuntimeError::new("Iterator out of bounds."));
         }
-        let character: alloc::string::String = text[index as usize..].chars().take(1).collect();
-        Ok(vm.new_string(&character))
+        Ok(vm.new_string_bytes(character_bytes(&bytes, index as usize)))
     });
 
     define(vm, class, "<(_)", |vm, at| compare_strings(vm, at, |o| o < 0));
@@ -969,13 +1020,91 @@ fn compare_strings(
     Ok(Value::bool(accept(ordering)))
 }
 
+/// The first offset at which `needle` occurs in `haystack`.
+///
+/// Written out rather than borrowed from `str`, because both sides are bytes
+/// and may not be valid UTF-8 -- the point of doing this on bytes is that it
+/// works whatever they hold.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|at| &haystack[*at..at + needle.len()] == needle)
+}
+
+/// An argument that must be a string, returned as a value rather than as text.
+fn string_value_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeError> {
+    let value = argument(vm, at, index);
+    if !vm.is_string(value) {
+        return Err(RuntimeError::new("Argument must be a string."));
+    }
+    Ok(value)
+}
+
 /// An argument that must be a string, with upstream's wording.
 fn string_argument(vm: &Vm, at: usize, index: usize) -> Result<alloc::string::String, RuntimeError> {
     let value = argument(vm, at, index);
-    if vm.string_at(value).is_none() {
+    if !vm.is_string(value) {
         return Err(RuntimeError::new("Argument must be a string."));
     }
     Ok(string_text(vm, value))
+}
+
+/// How many bytes the UTF-8 sequence starting with this byte occupies.
+///
+/// **Returns 1 for a byte that cannot start a sequence**, which is the whole
+/// point: a Wren string may hold bytes that are not valid UTF-8 at all, and
+/// every operation on it still has to terminate and stay inside the string.
+/// Treating a stray byte as a one-byte unit is what makes that true.
+fn utf8_length(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
+
+/// The code point starting at `at`, or `None` if the bytes there are not a
+/// valid sequence.
+fn code_point_at(bytes: &[u8], at: usize) -> Option<char> {
+    let length = utf8_length(*bytes.get(at)?);
+    let end = at + length;
+    if end > bytes.len() {
+        return None;
+    }
+    core::str::from_utf8(&bytes[at..end]).ok()?.chars().next()
+}
+
+/// Is this a UTF-8 continuation byte -- the second or later of a sequence?
+///
+/// **This, not the lead byte's implied length, is how Wren walks a string.**
+/// A lead byte says how long its sequence *would* be, but the bytes after it
+/// may not be continuations at all, and trusting the length would step over
+/// real characters. Skipping continuations instead means a string holding
+/// arbitrary bytes is walked one byte at a time exactly where it has to be.
+fn is_continuation(byte: u8) -> bool {
+    byte & 0xc0 == 0x80
+}
+
+/// The bytes of one character at `at`, valid sequence or not.
+///
+/// An invalid byte comes back as itself, so indexing a string never fails and
+/// never reinterprets what it holds.
+fn character_bytes(bytes: &[u8], at: usize) -> Vec<u8> {
+    match code_point_at(bytes, at) {
+        Some(character) => {
+            let mut buffer = [0u8; 4];
+            character.encode_utf8(&mut buffer).as_bytes().to_vec()
+        }
+        // A byte that starts no valid sequence is returned as itself, so
+        // indexing a string never fails and never reinterprets what it holds.
+        None => alloc::vec![bytes[at]],
+    }
 }
 
 fn string_bytes(vm: &Vm, value: Value) -> Vec<u8> {
@@ -1115,7 +1244,7 @@ fn install_sequence(vm: &mut Vm) {
     define(vm, class, "join(_)", |vm, at| {
         let sequence = receiver(vm, at);
         let separator = argument(vm, at, 1);
-        if vm.string_at(separator).is_none() {
+        if !vm.is_string(separator) {
             return Err(RuntimeError::new("Right operand must be a string."));
         }
         let separator = vm.to_string(separator);
@@ -1637,7 +1766,7 @@ fn install_list_extras(vm: &mut Vm) {
 
     define(vm, class, "join(_)", |vm, at| {
         let separator = argument(vm, at, 1);
-        if vm.string_at(separator).is_none() {
+        if !vm.is_string(separator) {
             return Err(RuntimeError::new("Right operand must be a string."));
         }
         let separator = vm.to_string(separator);
