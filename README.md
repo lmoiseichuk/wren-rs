@@ -66,10 +66,10 @@ identical constants on every implementation. Method and caveats:
 
 | benchmark | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| `binary_trees` depth 9 | 9.104 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 16.966 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.579 s | **0.130 s** | 0.154 s |
-| `method_call` | 2.519 s | **0.350 s** | 1.748 s |
+| `binary_trees` depth 9 | 8.729 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 16.127 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.545 s | **0.130 s** | 0.154 s |
+| `method_call` | 2.382 s | **0.350 s** | 1.748 s |
 | **VM resident** | **22,920 B** | 83,036 B | — |
 
 **Four to seven times slower than C, and 72% smaller resident.** The speed is
@@ -91,6 +91,10 @@ moving the *data* changes nothing at all, is in
 
 `Num` is a double in Wren, and `--features f32` makes it a single. Same board,
 same commit, same programs:
+
+*Measured before branch-target padding was adopted, so the `f64` column reads
+3-4% slower than the table above; the comparison is between the two columns and
+is unaffected.*
 
 | | `f64` | `f32` | |
 |---|---|---|---|

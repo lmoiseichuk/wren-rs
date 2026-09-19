@@ -12,6 +12,27 @@ rustflags = [
     # drops it and the flashing tool then refuses the image for not having
     # one. Naming it as an undefined symbol keeps it.
     "-C", "link-arg=--undefined=esp_app_desc",
+    # **Pad every branch target to four bytes.** The interpreter's inner loop
+    # is instruction-fetch bound on this part, and this is the cheapest thing
+    # that relieves it: measured on an ESP32-C6FH4 at 160 MHz, `binary_trees`
+    # 9.007 -> 8.729 s and `fib` 16.774 -> 16.127 at `-O3`, and 17.189 ->
+    # 16.587 and 33.367 -> 32.448 at `-Os`. Three to four per cent on every
+    # benchmark, for 6,640 B of flash at `-O3` and 2,880 B at `-Os`, and no
+    # RAM at all -- which is the resource that decides what this project can
+    # run on.
+    #
+    # **Four bytes, not more.** 8 B and 16 B land within 0.3% of this for
+    # three and seven times the flash; 2 B is a no-op, because compressed
+    # instructions already force that alignment and the image comes out
+    # byte-identical.
+    #
+    # `-Cllvm-args` reaches into LLVM rather than going through a rustc option,
+    # because rustc has none for this -- and `#[repr(align)]` on a function,
+    # which would let it be aimed at `run_frames` alone, does not exist on
+    # stable. Aiming it there would not help much anyway: aligning function
+    # *entries* is worth 0.12%, because what matters is the branch targets
+    # inside the loop.
+    "-C", "llvm-args=-align-all-nofallthru-blocks=2",
 ]
 
 [env]

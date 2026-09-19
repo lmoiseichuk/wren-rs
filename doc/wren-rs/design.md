@@ -36,12 +36,27 @@ Shown directly, by changing *only* placement:
 `-Cllvm-args=-align-all-nofallthru-blocks=N` pads every branch target to a
 2^N-byte boundary and does nothing else to the program.
 
-| branch targets padded to | `binary_trees` | `fib` | `list_build` | `method_call` | image |
+| branch targets padded to | `binary_trees` | `fib` | `list_build` | `method_call` | flashed image |
 |---|---|---|---|---|---|
-| nothing *(as published)* | 9.007 s | 16.774 s | 0.5659 s | 2.4788 s | 800,664 B |
-| 8 B | 8.737 s | **16.127 s** | 0.5445 s | **2.3820 s** | 817,164 B |
-| 16 B | **8.725 s** | 16.137 s | 0.5446 s | 2.3837 s | 846,172 B |
-| 32 B | 8.751 s | 16.174 s | **0.5445 s** | 2.3901 s | 891,936 B |
+| nothing | 9.007 s | 16.774 s | 0.5659 s | 2.4788 s | 465,904 B |
+| 2 B | 9.007 s | 16.774 s | 0.5659 s | 2.4788 s | 465,904 B |
+| **4 B** *(now the default)* | 8.729 s | **16.127 s** | 0.5446 s | **2.3820 s** | **472,544 B** |
+| 8 B | 8.737 s | 16.127 s | **0.5445 s** | 2.3820 s | 484,832 B |
+| 16 B | **8.725 s** | 16.137 s | 0.5446 s | 2.3837 s | 511,232 B |
+| 32 B | 8.751 s | 16.174 s | 0.5445 s | 2.3901 s | 559,776 B |
+
+Two bytes is a no-op and the image comes out byte-identical, because RV32IMAC's
+compressed instructions already force that alignment. Four bytes takes the
+whole effect; past it the flash grows three and seven times as fast for less
+than half a per cent. `-Os` gains the same way -- `binary_trees` 17.189 ->
+16.587 s, `fib` 33.367 -> 32.448 -- for 2,880 B of a 291,200 B image, so
+`ports/esp32c6-wren-rs/.cargo/config.toml` now passes
+`-Cllvm-args=-align-all-nofallthru-blocks=2` on both profiles. **It costs no
+RAM**, which is the resource that decides what this VM can run on.
+
+*Flashed image, `-O3`, as `espflash` reports it -- not the ELF on disk, which
+carries symbols nothing loads and is 800 KB whatever the padding. The `-Os`
+image, which is the footprint figure this project leads with, is 291,200 B.*
 
 **It is the code's placement, not the data's.** The mirror experiment leaks a
 fixed number of bytes before the VM is built, so every allocation the VM makes
@@ -64,6 +79,37 @@ all four benchmarks is not evidence either*, because that is exactly what
 placement produces. Anything in that range has to be measured at several
 paddings, which holds placement roughly still while the source varies, or left
 unclaimed.
+
+**What that method then said about the obvious next optimisation.** The
+interpreter decodes each byte into an `Op` and matches on the `Op` -- a switch
+feeding a switch, which the sampling profiler put at 14% of `binary_trees` and
+which LLVM does not fuse on this target. Matching the raw byte instead, with
+`const u8` patterns, makes it one jump table. Measured at four placements, both
+variants built from the same commit:
+
+| | `binary_trees` | `fib` | `method_call` | flashed image |
+|---|---|---|---|---|
+| two tables, no padding | 9.007 s | 16.774 s | 2.479 s | 465,904 B |
+| one table, no padding | 8.787 s | 16.273 s | 2.395 s | 465,552 B |
+| two tables, 4 B padding | **8.729 s** | **16.127 s** | **2.382 s** | 472,544 B |
+| one table, 4 B padding | 8.824 s | 16.380 s | 2.422 s | 472,192 B |
+
+**The two are substitutes, and together they are worse than padding alone.**
+Rewriting the dispatch is worth 2.4-3.4% on an unpadded build and is a
+1.1-1.6% *regression* on a padded one. Both are treating the same bottleneck --
+the loop is instruction-fetch bound -- and once it is relieved the rewrite only
+adds code. So the rewrite is not in the tree: it would have to be re-argued
+against whatever placement ships, and it costs the exhaustiveness check that
+`match op` gives for free, where a new opcode with no arm becomes a runtime
+"bad opcode" instead of a compile error.
+
+The padding is cheap at four bytes and saturates there: 8 B and 16 B are within
+0.3% of it for three and seven times the flash. On `-Os` it costs 2,880 B of a
+291,200 B image.
+
+*This is the shape of the finding worth carrying forward: on this part, a
+source change to the interpreter competes with instruction placement rather
+than adding to it, and neither can be judged without the other.*
 
 ## Value: NaN tagging, as upstream, in safe Rust
 
