@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::value::Value;
@@ -50,7 +51,17 @@ pub enum ObjectType {
 /// measurement rather than an intuition; see `doc/wren-rs/design.md`.
 #[derive(Debug)]
 pub enum Object {
-    Class(ObjClass),
+    /// **Boxed, unlike the others.** A class carries a method table, which
+    /// makes `ObjClass` far larger than any other payload -- large enough to
+    /// set the size of every slot in the heap, since a slot is one `Object`.
+    /// Boxing it puts a pointer in the slot instead and leaves the other
+    /// objects at 24 bytes.
+    ///
+    /// The trade is one more indirection to reach a class. Classes are few and
+    /// long-lived where ranges and strings are many and short-lived, so this is
+    /// the right way round -- but it is a real cost on the dispatch path, which
+    /// reaches a class on every single method call.
+    Class(Box<ObjClass>),
     Instance(ObjInstance),
     List(ObjList),
     Map(ObjMap),
@@ -83,6 +94,12 @@ impl Object {
                 gray.push(class.name);
                 if let Some(superclass) = class.superclass {
                     gray.push(superclass);
+                }
+                // A class's metaclass holds its static methods, and nothing
+                // else refers to it. Forgetting this frees the metaclass out
+                // from under a class that is still in use.
+                if let Some(metaclass) = class.metaclass {
+                    gray.push(metaclass);
                 }
             }
             Object::Instance(instance) => {
@@ -126,7 +143,10 @@ impl Object {
     pub fn size_estimate(&self) -> usize {
         let slot = core::mem::size_of::<Object>();
         let inner = match self {
-            Object::Class(_) => 0,
+            Object::Class(class) => {
+                core::mem::size_of::<ObjClass>()
+                    + class.methods.capacity() * core::mem::size_of::<Option<Method>>()
+            }
             Object::Instance(instance) => {
                 instance.fields.capacity() * core::mem::size_of::<Value>()
             }
@@ -268,7 +288,79 @@ pub struct ObjClass {
     /// opaque host data rather than Wren fields. That convention is kept rather
     /// than replaced with an `Option`, so the two can be compared directly.
     pub num_fields: i32,
+    /// The class holding this class's *static* methods.
+    ///
+    /// **This is how `System.print` works.** `System` is a class object, and
+    /// calling a method on it dispatches to its metaclass, exactly as calling a
+    /// method on an instance dispatches to its class. Upstream reaches the same
+    /// place through every object's `classObj` header field; here only classes
+    /// need it, because every other built-in's class is implied by its variant.
+    ///
+    /// `None` for a metaclass itself, which stops the chain.
+    pub metaclass: Option<ObjectId>,
+    /// Methods, indexed by symbol.
+    ///
+    /// **Indexed, not searched** -- a method call is an array index, which is
+    /// what makes dispatch fast. The cost is that every class's table is as
+    /// long as the highest symbol it responds to, so a program with many
+    /// distinct method names pays for them in every class. Upstream has the
+    /// same shape and the same cost.
+    pub methods: Vec<Option<Method>>,
 }
+
+impl ObjClass {
+    /// A class with no methods yet.
+    pub fn new(name: ObjectId, superclass: Option<ObjectId>) -> ObjClass {
+        ObjClass {
+            name,
+            superclass,
+            num_fields: 0,
+            metaclass: None,
+            methods: Vec::new(),
+        }
+    }
+
+    /// Bind a method to a symbol, growing the table as needed.
+    pub fn define(&mut self, symbol: usize, method: Method) {
+        if self.methods.len() <= symbol {
+            self.methods.resize(symbol + 1, None);
+        }
+        self.methods[symbol] = Some(method);
+    }
+
+    /// The method bound to a symbol, if any.
+    pub fn method(&self, symbol: usize) -> Option<Method> {
+        self.methods.get(symbol).copied().flatten()
+    }
+}
+
+/// What a method call actually runs.
+///
+/// Only primitives so far. A method written in Wren is a closure, and closures
+/// arrive with the part of the compiler that can compile a function body.
+#[derive(Clone, Copy)]
+pub enum Method {
+    /// Implemented in Rust.
+    ///
+    /// Takes the stack index of the receiver rather than a slice of arguments.
+    /// A slice would mean either borrowing the VM's stack while the VM is
+    /// mutably borrowed -- which does not typecheck -- or copying arguments out
+    /// on every call, which on a hot dispatch path is up to 136 bytes of memcpy
+    /// per call. An index costs nothing and sidesteps both.
+    Primitive(Primitive),
+}
+
+impl core::fmt::Debug for Method {
+    fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Method::Primitive(_) => out.write_str("Primitive"),
+        }
+    }
+}
+
+/// A method implemented in Rust. See [`Method::Primitive`].
+pub type Primitive =
+    fn(&mut crate::vm::Vm, receiver: usize) -> Result<Value, crate::vm::RuntimeError>;
 
 /// An instance of a class.
 #[derive(Debug)]
@@ -304,7 +396,11 @@ mod layout {
     const _: () = assert!(core::mem::size_of::<ObjString>() == 16);
     const _: () = assert!(core::mem::size_of::<ObjList>() == 12);
     const _: () = assert!(core::mem::size_of::<ObjMap>() == 12);
-    const _: () = assert!(core::mem::size_of::<ObjClass>() == 16);
+    // `ObjClass` is boxed, so its size no longer sets the slot size -- only
+    // the pointer to it does. Checked so that the reason for boxing stays
+    // visible: it is well past `Range`'s 24 bytes.
+    const _: () = assert!(core::mem::size_of::<ObjClass>() > 24);
+    const _: () = assert!(core::mem::size_of::<Box<ObjClass>>() == 4);
     const _: () = assert!(core::mem::size_of::<ObjInstance>() == 16);
     const _: () = assert!(core::mem::size_of::<MapEntry>() == 16);
 }

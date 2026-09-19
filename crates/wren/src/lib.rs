@@ -75,10 +75,20 @@ pub mod lexer;
 // The heap and the objects in it need a growable allocation. A part with no
 // allocator at all still gets the lexer, and later the bytecode reader.
 #[cfg(feature = "alloc")]
+pub mod bytecode;
+#[cfg(feature = "alloc")]
+pub mod compiler;
+#[cfg(feature = "alloc")]
+pub mod core;
+#[cfg(feature = "alloc")]
 pub mod heap;
 #[cfg(feature = "alloc")]
 pub mod object;
+#[cfg(feature = "alloc")]
+pub mod symbol;
 pub mod value;
+#[cfg(feature = "alloc")]
+pub mod vm;
 
 pub use handle::ObjectId;
 pub use lexer::{Lexer, Token, TokenKind};
@@ -88,6 +98,8 @@ pub use value::Value;
 pub use heap::Heap;
 #[cfg(feature = "alloc")]
 pub use object::{ObjClass, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object};
+#[cfg(feature = "alloc")]
+pub use vm::{Vm, WrenError};
 
 /// The version of Wren this implementation targets.
 ///

@@ -149,11 +149,9 @@ fn a_reachable_cycle_survives() {
 fn an_instance_keeps_its_class_and_fields() {
     let mut heap = Heap::new();
     let name = string(&mut heap, "Point");
-    let class = heap.allocate(Object::Class(ObjClass {
-        name: name.as_object().unwrap(),
-        superclass: None,
-        num_fields: 2,
-    }));
+    let mut object_class = ObjClass::new(name.as_object().unwrap(), None);
+    object_class.num_fields = 2;
+    let class = heap.allocate(Object::Class(Box::new(object_class)));
     let field = string(&mut heap, "origin");
     let instance = Value::object(heap.allocate(Object::Instance(ObjInstance {
         class,
