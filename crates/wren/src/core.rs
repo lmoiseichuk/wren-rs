@@ -46,8 +46,8 @@ use alloc::vec::Vec;
 use crate::handle::ObjectId;
 use crate::math;
 use crate::object::{
-    MapEntry, Method, ObjClass, ObjFiber, ObjInstance, ObjList, ObjMap, ObjRange, ObjString,
-    Object, Primitive,
+    MapEntry, ObjClass, ObjFiber, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object,
+    Primitive,
 };
 use crate::value::Value;
 use crate::vm::{RuntimeError, Switch, Vm};
@@ -55,9 +55,7 @@ use crate::vm::{RuntimeError, Switch, Vm};
 /// Bind a primitive to a signature on a class.
 fn define(vm: &mut Vm, class: ObjectId, signature: &str, function: Primitive) {
     let symbol = vm.method_names.ensure(signature);
-    if let Some(Object::Class(class)) = vm.heap.get_mut(class) {
-        class.define(symbol, Method::Primitive(function));
-    }
+    vm.bind_primitive(class, symbol, function);
 }
 
 /// The receiver of the call in progress.

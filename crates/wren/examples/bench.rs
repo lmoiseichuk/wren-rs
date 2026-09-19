@@ -155,50 +155,51 @@ fn report_census(vm: &wren::Vm) {
     // per-block cost; it is an estimate and labelled as one.
     const HEADER: usize = 8;
 
-    let mut counts: Vec<(ObjectType, usize, usize, usize)> = Vec::new();
+    let mut counts: Vec<(ObjectType, usize, usize, usize, usize)> = Vec::new();
     for id in vm.heap.ids() {
         let Some(object) = vm.heap.get(id) else {
             continue;
         };
         let kind = object.object_type();
-        let (contents, blocks) = contents_of(object);
+        let (used, contents, blocks) = contents_detail(object);
         match counts.iter_mut().find(|(seen, ..)| *seen == kind) {
-            Some((_, count, bytes, allocations)) => {
+            Some((_, count, bytes, allocations, wanted)) => {
                 *count += 1;
                 *bytes += contents;
                 *allocations += blocks;
+                *wanted += used;
             }
-            None => counts.push((kind, 1, contents, blocks)),
+            None => counts.push((kind, 1, contents, blocks, used)),
         }
     }
     counts.sort_by_key(|(_, count, ..)| std::cmp::Reverse(*count));
 
     println!(
-        "    {:<10} {:>6} {:>9} {:>9} {:>10} {:>7} {:>9}",
-        "type", "live", "slots B", "own B", "contents B", "blocks", "header B"
+        "    {:<10} {:>6} {:>9} {:>10} {:>9} {:>7}",
+        "type", "live", "slots B", "contents B", "slack B", "blocks"
     );
     let (mut live, mut typed, mut contents, mut blocks) = (0usize, 0usize, 0usize, 0usize);
-    for (kind, count, bytes, allocations) in &counts {
+    let mut slack = 0usize;
+    for (kind, count, bytes, allocations, wanted) in &counts {
         live += count * SLOT;
         typed += count * own_size(*kind);
         contents += bytes;
         blocks += allocations;
+        slack += bytes.saturating_sub(*wanted);
         println!(
-            "    {:<10} {count:>6} {:>9} {:>9} {bytes:>10} {allocations:>7} {:>9}",
+            "    {:<10} {count:>6} {:>9} {bytes:>10} {:>9} {allocations:>7}",
             format!("{kind:?}"),
             count * SLOT,
-            count * own_size(*kind),
-            allocations * HEADER
+            bytes.saturating_sub(*wanted)
         );
     }
     let saved = live.saturating_sub(typed);
     let percent = (saved * 100).checked_div(live).unwrap_or(0);
     let total = live + contents + blocks * HEADER;
     println!(
-        "    {:<10} {:>6} {live:>9} {typed:>9} {blocks:>7} {:>9}",
+        "    {:<10} {:>6} {live:>9} {contents:>10} {slack:>9} {blocks:>7}",
         "total",
-        counts.iter().map(|(_, count, ..)| count).sum::<usize>(),
-        blocks * HEADER
+        counts.iter().map(|(_, count, ..)| count).sum::<usize>()
     );
     println!(
         "    live heap {total} B = {live} slots + {contents} contents + {} allocator headers",
@@ -212,7 +213,14 @@ fn report_census(vm: &wren::Vm) {
 ///
 /// Counted with `capacity`, not `len`: a `Vec` that grew and shrank is still
 /// holding the memory, and the allocator has not heard otherwise.
-fn contents_of(object: &wren::Object) -> (usize, usize) {
+/// The same accounting, split into what is used and what is reserved.
+///
+/// The gap between the two is memory the allocator has handed out and nobody
+/// is using -- the thing that turned out to be 14,560 B of the method tables.
+/// Worth knowing per type rather than in total, because the fix differs: a
+/// class can be shrunk once and never grows again, where a list being built
+/// would only buy a realloc on its next push.
+fn contents_detail(object: &wren::Object) -> (usize, usize, usize) {
     use wren::Object;
 
     const VALUE: usize = 8;
@@ -223,27 +231,44 @@ fn contents_of(object: &wren::Object) -> (usize, usize) {
         }
     }
 
+    fn pair(used: usize, capacity: usize, element: usize) -> (usize, usize, usize) {
+        let (bytes, blocks) = block(capacity, element);
+        (used * element, bytes, blocks)
+    }
+
     match object {
-        Object::Instance(instance) => block(instance.fields.capacity(), VALUE),
-        Object::List(list) => block(list.elements.capacity(), VALUE),
-        Object::String(string) => block(string.bytes.capacity(), 1),
+        Object::Instance(instance) => {
+            pair(instance.fields.len(), instance.fields.capacity(), VALUE)
+        }
+        Object::List(list) => pair(list.elements.len(), list.elements.capacity(), VALUE),
+        Object::String(string) => pair(string.bytes.len(), string.bytes.capacity(), 1),
         // A method table is one block; the class itself is a second, because
         // it is boxed.
         Object::Class(class) => {
-            let (bytes, blocks) = block(class.methods.capacity(), 8);
-            (bytes + 40, blocks + 1)
+            let (used, bytes, blocks) = pair(class.methods.len(), class.methods.capacity(), 4);
+            (used + 40, bytes + 40, blocks + 1)
         }
-        Object::Map(map) => block(map.entries.capacity(), 16),
+        Object::Map(map) => pair(map.entries.len(), map.entries.capacity(), 16),
         Object::Closure(closure) => {
-            let (bytes, blocks) = block(closure.upvalues.capacity(), 4);
-            (bytes + 8, blocks + 1)
+            let (used, bytes, blocks) =
+                pair(closure.upvalues.len(), closure.upvalues.capacity(), 4);
+            (used + 8, bytes + 8, blocks + 1)
         }
-        Object::Fn(_) => (28, 1),
+        Object::Fn(_) => (28, 28, 1),
         Object::Fiber(fiber) => {
-            let (bytes, blocks) = block(fiber.stack.capacity(), VALUE);
-            (bytes + 40, blocks + 1)
+            // A fiber's stack reaches a high-water mark and stays there; the
+            // frame vector does the same. Both are slack once the deep call
+            // that needed them has returned.
+            let (used, bytes, blocks) = pair(fiber.stack.len(), fiber.stack.capacity(), VALUE);
+            let frames_used = fiber.frames.len() * 24;
+            let frames_held = fiber.frames.capacity() * 24;
+            (
+                used + frames_used + 40,
+                bytes + frames_held + 40,
+                blocks + 2,
+            )
         }
-        Object::Range(_) | Object::Upvalue(_) => (0, 0),
+        Object::Range(_) | Object::Upvalue(_) => (0, 0, 0),
     }
 }
 
@@ -259,7 +284,7 @@ fn report_method_tables(vm: &wren::Vm) {
     use wren::Object;
 
     // What one entry costs today: `Option<Method>`, 8 bytes on a 32-bit part.
-    const ENTRY: usize = 8;
+    const ENTRY: usize = 4;
 
     let mut classes = 0usize;
     let mut today = 0usize;
@@ -280,7 +305,11 @@ fn report_method_tables(vm: &wren::Vm) {
         longest = longest.max(length);
         today += length * ENTRY;
         reserved += class.methods.capacity() * ENTRY;
-        defined += class.methods.iter().filter(|slot| slot.is_some()).count();
+        defined += class
+            .methods
+            .iter()
+            .filter(|slot| **slot != wren::object::NO_METHOD)
+            .count();
 
         for (which, size) in pages.iter().enumerate() {
             let directory = length.div_ceil(*size);
@@ -288,7 +317,10 @@ fn report_method_tables(vm: &wren::Vm) {
             for page in 0..directory {
                 let from = page * size;
                 let to = (from + size).min(length);
-                if class.methods[from..to].iter().any(|slot| slot.is_some()) {
+                if class.methods[from..to]
+                    .iter()
+                    .any(|slot| *slot != wren::object::NO_METHOD)
+                {
                     occupied += 1;
                 }
             }
@@ -303,7 +335,11 @@ fn report_method_tables(vm: &wren::Vm) {
             let Some(Object::Class(class)) = vm.heap.get(id) else {
                 continue;
             };
-            let count = class.methods.iter().filter(|slot| slot.is_some()).count();
+            let count = class
+                .methods
+                .iter()
+                .filter(|slot| **slot != wren::object::NO_METHOD)
+                .count();
             let mut capacity = 8usize;
             while capacity < count * 2 {
                 capacity *= 2;

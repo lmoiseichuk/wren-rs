@@ -220,6 +220,14 @@ pub struct Vm {
     /// The value stack. Locals live here too, indexed from the frame base —
     /// which is zero, there being one frame.
     pub stack: Vec<Value>,
+    /// Every Rust-implemented method, indexed by the number a packed method
+    /// table entry carries.
+    ///
+    /// **A function pointer does not fit in a packed entry beside its tag**,
+    /// so the table holds the pointers and the entry holds an index. The
+    /// indirection is one load from a small, hot vector and it falls only on
+    /// primitive calls; a closure decodes straight to its handle.
+    pub primitives: Vec<crate::object::Primitive>,
     /// Method signatures, interned. `Op::Call` carries an index into this.
     pub method_names: SymbolTable,
     /// Every module that has been loaded, main first.
@@ -393,6 +401,7 @@ impl Vm {
             heap,
             stack: Vec::new(),
             method_names: SymbolTable::new(),
+            primitives: Vec::new(),
             modules: alloc::vec![Module::new()],
             module_index: BTreeMap::new(),
             module_loader: None,
@@ -643,9 +652,29 @@ impl Vm {
     /// The chain is still walked for `is` and for `super`, which are about the
     /// hierarchy rather than about finding a method in it.
     fn find_method(&self, class: ObjectId, symbol: usize) -> Option<Method> {
-        match self.heap.get(class) {
-            Some(Object::Class(class)) => class.method(symbol),
-            _ => None,
+        let Some(Object::Class(class)) = self.heap.get(class) else {
+            return None;
+        };
+        let entry = class.method_entry(symbol);
+        if let Some(closure) = crate::object::entry_closure(entry) {
+            return Some(Method::Closure(closure));
+        }
+        let index = crate::object::entry_primitive(entry)?;
+        let function = self.primitives.get(index)?;
+        Some(Method::Primitive(*function))
+    }
+
+    /// Bind a Rust-implemented method, interning the function pointer.
+    pub fn bind_primitive(
+        &mut self,
+        class: ObjectId,
+        symbol: usize,
+        function: crate::object::Primitive,
+    ) {
+        let index = self.primitives.len();
+        self.primitives.push(function);
+        if let Some(Object::Class(class)) = self.heap.get_mut(class) {
+            class.define(symbol, crate::object::primitive_entry(index));
         }
     }
 
@@ -671,11 +700,13 @@ impl Vm {
             return;
         };
         if child.methods.len() < inherited.len() {
-            child.methods.resize(inherited.len(), None);
+            child
+                .methods
+                .resize(inherited.len(), crate::object::NO_METHOD);
         }
-        for (symbol, method) in inherited.iter().enumerate() {
-            if child.methods[symbol].is_none() {
-                child.methods[symbol] = *method;
+        for (symbol, entry) in inherited.iter().enumerate() {
+            if child.methods[symbol] == crate::object::NO_METHOD {
+                child.methods[symbol] = *entry;
             }
         }
     }
@@ -2228,7 +2259,7 @@ impl Vm {
         self.set_field_offset(closure, inherited, superclass, class_id);
 
         if let Some(Object::Class(class)) = self.heap.get_mut(target) {
-            class.define(symbol, Method::Closure(closure));
+            class.define(symbol, crate::object::closure_entry(closure));
         }
         Ok(())
     }

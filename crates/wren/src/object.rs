@@ -142,12 +142,11 @@ impl Object {
                         gray.push(id);
                     }
                 }
-                for method in class.methods.iter().flatten() {
-                    match method {
-                        Method::Closure(closure) => gray.push(*closure),
-                        // A primitive is a Rust function pointer with no heap
-                        // object behind it, so there is nothing to keep alive.
-                        Method::Primitive(_) => {}
+                // A primitive is a Rust function pointer with no heap object
+                // behind it, so only the closures are worth following.
+                for entry in &class.methods {
+                    if let Some(closure) = entry_closure(*entry) {
+                        gray.push(closure);
                     }
                 }
             }
@@ -238,7 +237,7 @@ impl Object {
         let inner = match self {
             Object::Class(class) => {
                 core::mem::size_of::<ObjClass>()
-                    + class.methods.capacity() * core::mem::size_of::<Option<Method>>()
+                    + class.methods.capacity() * core::mem::size_of::<u32>()
             }
             Object::Instance(instance) => {
                 instance.fields.capacity() * core::mem::size_of::<Value>()
@@ -441,14 +440,28 @@ pub struct ObjClass {
     ///
     /// `None` for a metaclass itself, which stops the chain.
     pub metaclass: Option<ObjectId>,
-    /// Methods, indexed by symbol.
+    /// Methods, indexed by symbol, **four bytes each**.
     ///
     /// **Indexed, not searched** -- a method call is an array index, which is
     /// what makes dispatch fast. The cost is that every class's table is as
     /// long as the highest symbol it responds to, so a program with many
     /// distinct method names pays for them in every class. Upstream has the
     /// same shape and the same cost.
-    pub methods: Vec<Option<Method>>,
+    ///
+    /// That cost is why an entry is a packed `u32` rather than an
+    /// `Option<Method>`. A `Method` is one of a 4-byte handle or a 4-byte
+    /// function pointer, but the discriminant and its alignment push
+    /// `Option<Method>` to eight -- and since the tables are mostly `None`,
+    /// half of every class's table was padding for a tag. Measured across
+    /// `binary_trees`, the tables were 26,592 B; packed they are 13,296 B.
+    ///
+    /// The encoding is [`method_entry`] and its companions: `u32::MAX` for an
+    /// empty slot, the top bit for "this is a primitive", and the remaining 31
+    /// bits for either an [`ObjectId`] or an index into the VM's primitive
+    /// table. **Closures decode with no extra load**, which is what makes this
+    /// preferable to paging the symbol space -- that would have saved slightly
+    /// more and put a second dependent load on every single call.
+    pub methods: Vec<u32>,
     /// The class's attributes, or null when it has none the runtime can see.
     ///
     /// Built at compile time and attached when the class is created. Only
@@ -484,18 +497,69 @@ impl ObjClass {
         }
     }
 
-    /// Bind a method to a symbol, growing the table as needed.
-    pub fn define(&mut self, symbol: usize, method: Method) {
+    /// Bind a packed entry to a symbol, growing the table as needed.
+    ///
+    /// Takes the packed form rather than a `Method` because packing a
+    /// primitive needs the VM's primitive table, which a class cannot see.
+    /// [`Vm::bind_primitive`](crate::vm::Vm) and `core::define` do the packing.
+    pub fn define(&mut self, symbol: usize, entry: u32) {
         if self.methods.len() <= symbol {
-            self.methods.resize(symbol + 1, None);
+            self.methods.resize(symbol + 1, NO_METHOD);
         }
-        self.methods[symbol] = Some(method);
+        self.methods[symbol] = entry;
     }
 
-    /// The method bound to a symbol, if any.
-    pub fn method(&self, symbol: usize) -> Option<Method> {
-        self.methods.get(symbol).copied().flatten()
+    /// The packed entry bound to a symbol; `NO_METHOD` when there is none.
+    ///
+    /// Out of range counts as absent rather than as an error: a class's table
+    /// stops at the highest symbol it answers to, and every symbol past that
+    /// is a method it does not have.
+    pub fn method_entry(&self, symbol: usize) -> u32 {
+        match self.methods.get(symbol) {
+            Some(entry) => *entry,
+            None => NO_METHOD,
+        }
     }
+}
+
+/// A method table slot holding nothing.
+///
+/// `u32::MAX` rather than a separate presence bitmap: it costs one comparison
+/// on a value already loaded, where a bitmap costs a second load.
+pub const NO_METHOD: u32 = u32::MAX;
+
+/// Set in a packed entry when it names a primitive rather than a closure.
+const PRIMITIVE_BIT: u32 = 1 << 31;
+
+/// Pack a Wren-implemented method.
+///
+/// The handle keeps its own value, so decoding is a comparison and a
+/// construction rather than any arithmetic. A heap of 2^31 objects is not
+/// reachable on a part this size -- it would need 48 GB of slots -- so the
+/// stolen bit costs nothing real.
+pub fn closure_entry(closure: ObjectId) -> u32 {
+    closure.raw() & !PRIMITIVE_BIT
+}
+
+/// Pack a Rust-implemented method, by its index in the VM's primitive table.
+pub fn primitive_entry(index: usize) -> u32 {
+    PRIMITIVE_BIT | (index as u32 & !PRIMITIVE_BIT)
+}
+
+/// The closure a packed entry names, or `None` if it is empty or a primitive.
+pub fn entry_closure(entry: u32) -> Option<ObjectId> {
+    if entry == NO_METHOD || entry & PRIMITIVE_BIT != 0 {
+        return None;
+    }
+    Some(ObjectId::new(entry))
+}
+
+/// The primitive index a packed entry names, if it names one.
+pub fn entry_primitive(entry: u32) -> Option<usize> {
+    if entry == NO_METHOD || entry & PRIMITIVE_BIT == 0 {
+        return None;
+    }
+    Some((entry & !PRIMITIVE_BIT) as usize)
 }
 
 /// What a method call actually runs.
