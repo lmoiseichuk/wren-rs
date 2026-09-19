@@ -157,10 +157,15 @@ caveats: **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
 
 | benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython |
 |---|---|---|---|---|---|
-| `binary_trees` depth 9 | 8.616 | 17.087 | **2.160** | 2.440 | 4.729 |
-| `fib(24)` x5 | 18.176 | 34.921 | **3.250** | 3.710 | 7.109 |
-| `list_build` 10,000 | 0.574 | 1.028 | **0.130** | 0.150 | 0.154 |
-| `method_call` | 2.766 | 4.810 | **0.350** | 0.420 | 1.748 |
+| `binary_trees` depth 9 | 8.268 | 15.371 | **2.160** | 2.440 | 4.729 |
+| `fib(24)` x5 | 16.601 | 33.669 | **3.250** | 3.710 | 7.109 |
+| `list_build` 10,000 | 0.568 | 1.028 | **0.130** | 0.150 | 0.154 |
+| `method_call` | 2.356 | 4.326 | **0.350** | 0.420 | 1.748 |
+
+The first run on hardware was slower than this — `binary_trees` 8.616,
+`fib` 18.176, `list_build` 0.574, `method_call` 2.766 at `speed`. What moved
+them is in **[what optimisation was worth](#what-optimisation-was-worth)**
+below.
 
 **Memory** — VM resident before any user code, and heap consumed per program
 (free before minus free after, no forced collection, measured the same way on
@@ -168,12 +173,12 @@ both):
 
 | | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| **VM resident** | **45,676 B** | 83,036 B | — |
-| free to a program | ~282,000 B | ~227,000 B | 333,344 B |
-| `binary_trees` | 160,244 B | 78,812 B | 76,512 B |
-| `fib` | **4,120 B** | 6,612 B | 800 B |
-| `list_build` | **132,412 B** | 134,712 B | 65,440 B |
-| `method_call` | **9,800 B** | 15,080 B | 1,616 B |
+| **VM resident** | **24,680 B** | 83,036 B | — |
+| free to a program | ~303,000 B | ~227,000 B | 333,344 B |
+| `binary_trees` | 158,124 B | 78,812 B | 76,512 B |
+| `fib` | **3,888 B** | 6,612 B | 800 B |
+| `list_build` | 132,460 B | 134,712 B | 65,440 B |
+| `method_call` | **7,948 B** | 15,080 B | 1,616 B |
 
 **Footprint** — and these do *not* compare across implementations, because the
 platforms differ: the C port is an ESP-IDF application carrying FreeRTOS and
@@ -182,25 +187,25 @@ build with networking and TLS in it.
 
 | | `size` | `speed` |
 |---|---|---|
-| wren-rs full image | 273,376 B | 428,144 B |
+| wren-rs full image | 278,144 B | 440,576 B |
 | the same firmware with no VM | 111,728 B | 113,472 B |
-| **wren-rs VM contribution** | **161,648 B** | **314,672 B** |
+| **wren-rs VM contribution** | **166,416 B** | **327,104 B** |
 | C Wren full ESP-IDF image | 272,736 B | 301,888 B |
 | MicroPython full image | 1,902,128 B | — |
 
 #### What these say
 
-**The VM is 45% smaller resident and four to eight times slower.** Both halves
+**The VM is 70% smaller resident and three to seven times slower.** Both halves
 are the same design, and only one of them was predicted.
 
 The memory result is what compiling no core library at start-up buys: upstream
-builds `wren_core.wren` every time a VM is created, and this does not. 45,676 B
+builds `wren_core.wren` every time a VM is created, and this does not. 24,680 B
 against 83,036 B is the figure that decides whether a part is usable at all.
 
 The speed result contradicts this repository's own design note, which put the
 cost of reaching objects by index rather than by pointer at "single-digit to
-low-double-digit percent". It is 4–8x, worst on `method_call`, which is almost
-pure dispatch. [`doc/wren-rs/design.md`](doc/wren-rs/design.md) is corrected and
+low-double-digit percent". It was 4–8x on the first run and is 4–7x after the
+work described below, worst on `method_call`, which is almost pure dispatch. [`doc/wren-rs/design.md`](doc/wren-rs/design.md) is corrected and
 says why the estimate was wrong: it was reasoned about as one bounds check per
 field access, and a single method call traverses six references — receiver to
 class, class through its box, class to method table, method to closure, closure
@@ -211,8 +216,47 @@ object here occupies 24 bytes before its contents, the size of the largest
 variant of one enum, where upstream allocates each type at its own size. A tree
 of instances is exactly the workload that pays for it.
 
-Nothing here is tuned. It is the first run on hardware, published because a
-result that contradicts the design is worth more than a flattering one.
+#### What optimisation was worth
+
+The first run on hardware was published untuned, because a result that
+contradicts the design is worth more than a flattering one. Acting on it since:
+
+| | first run | now |
+|---|---|---|
+| VM resident | 45,676 B | **24,680 B** |
+| `method_call` | 2.766 s | **2.356 s** |
+| `fib` | 18.176 s | **16.601 s** |
+| `binary_trees` | 8.616 s | **8.268 s** |
+| `binary_trees` heap | 160,244 B | 158,124 B |
+| `method_call` heap | 9,800 B | **7,948 B** |
+
+Three changes, each measured on the board:
+
+**The six indirections were partly redundant.** Entering a call asked the heap
+for the same two objects three times over — once for the arity, once for the
+code, once for the module — and returning did the walk again for the caller's
+chunk. Field access fetched its offset through closure and function on every
+read and every write. Method lookup walked the superclass chain where upstream
+copies a parent's methods down at class creation. Four lookups per call now,
+where there were ten.
+
+**The method tables were the largest thing on the heap**, not the instances: a
+class's table is indexed by global method symbol, so it is as long as the
+highest symbol that class answers to and almost all of it is empty. Handing back
+the `Vec` slack and packing an entry from 8 bytes to 4 took VM resident from
+49,004 B to 24,680 B.
+
+**The host measured none of the speed work.** Every one of those changes was
+inside the noise on a workstation, because an out-of-order core hides a
+dependent load that an in-order RISC-V pays for in full. The board is the only
+place a change like this can be judged.
+
+What is left is the two levers with numbers but no implementation:
+`binary_trees` peaks at 158 KB against 77 KB live, so **half of peak is still
+floating garbage** — which is what refcounting in front of the tracing collector
+would recover, and what `Heap::set_growth` trades for time today.
+[`doc/wren-rs/design.md`](doc/wren-rs/design.md) carries the measurements and
+what each would cost.
 
 ### Step 4 measured: shipping bytecode
 
@@ -231,7 +275,11 @@ test compiled, written, re-loaded into a fresh VM and run. That is the claim
 that matters before any number below: the two paths produce the same program.
 
 **Speed, source against bytecode** — the same four programs, same board, same
-profiles. The only difference is whether the device compiled them:
+profiles. The only difference is whether the device compiled them.
+
+*These were taken before the optimisation work above, so they do not match the
+step 3 tables. Both columns of each pair come from the same commit, which is
+what makes the comparison inside the table valid:*
 
 | benchmark | `speed` source | `speed` bytecode | `size` source | `size` bytecode |
 |---|---|---|---|---|
