@@ -246,7 +246,10 @@ pub fn compile_in(vm: &mut Vm, source: &str, module: usize) -> Result<Chunk, Com
 
     let line = clamp_line(compiler.current.line);
     compiler.chunk_mut().emit_op(Op::End, line);
-    Ok(compiler.states.pop().expect("the module's own state").chunk)
+    // The module body is a function like any other.
+    let mut chunk = compiler.states.pop().expect("the module's own state").chunk;
+    chunk.fuse();
+    Ok(chunk)
 }
 
 struct Compiler<'a> {
@@ -1874,8 +1877,12 @@ impl<'a> Compiler<'a> {
         let state = self.states.pop().expect("a function being compiled");
         let upvalues = state.upvalues;
 
+        // Nothing more will be emitted into it, so adjacent pairs can be
+        // replaced by the single opcode that does both. See `Chunk::fuse`.
+        let mut chunk = state.chunk;
+        chunk.fuse();
         let function = self.vm.heap.allocate(Object::Fn(Box::new(ObjFn {
-            chunk: Rc::new(state.chunk),
+            chunk: Rc::new(chunk),
             arity: state.arity,
             num_upvalues: upvalues.len(),
             name: state.name,

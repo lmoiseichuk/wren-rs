@@ -158,6 +158,30 @@ pub enum Op {
     /// the method is bound. Here it is recorded on the function instead, which
     /// needs no mutation of a chunk shared through an `Rc`.
     Super = 29,
+
+    // **Fused pairs.** An opcode costs about thirty-one machine instructions
+    // on an ESP32-C6 and nearly all of that is dispatch rather than work, so
+    // running two as one saves a whole dispatch. Which pairs are worth having
+    // was counted rather than guessed -- see `Vm::op_pairs` and
+    // `doc/wren-rs/profiling.md`.
+    //
+    // **Each is laid out as the two instructions it replaces, byte for byte.**
+    // Only the first opcode byte changes; the second stays where it is and is
+    // never executed. That is what makes the pass safe to run on finished
+    // code: nothing moves, so every jump offset in the chunk still means what
+    // it meant, and a jump that lands *between* the two is the only case the
+    // pass has to refuse. The dead byte costs one byte of image per fusion.
+    /// `LoadLocal` then `Constant`. Operands: `u8` slot, a dead byte, `u16`
+    /// constant. 18% of the adjacent pairs in `fib`.
+    LoadLocalConstant = 35,
+    /// `LoadLocal` twice. Operands: `u8` slot, a dead byte, `u8` slot.
+    LoadLocalPair = 36,
+    /// `LoadLocal` then `Return`. Operands: `u8` slot, a dead byte.
+    LoadLocalReturn = 37,
+    /// `StoreFieldThis` then `Pop`. Operands: `u8` field, a dead byte.
+    StoreFieldThisPop = 38,
+    /// `LoadFieldThis` then `Return`. Operands: `u8` field, a dead byte.
+    LoadFieldThisReturn = 39,
 }
 
 impl Op {
@@ -202,6 +226,11 @@ impl Op {
             32 => Op::LoadStaticField,
             33 => Op::StoreStaticField,
             34 => Op::SetAttributes,
+            35 => Op::LoadLocalConstant,
+            36 => Op::LoadLocalPair,
+            37 => Op::LoadLocalReturn,
+            38 => Op::StoreFieldThisPop,
+            39 => Op::LoadFieldThisReturn,
             _ => return None,
         };
         Some(op)
@@ -253,12 +282,19 @@ impl Chunk {
     /// added. Writing it to the file would cost bytes for a table nothing
     /// reads.
     pub fn from_parts(code: Vec<u8>, constants: Vec<Value>, lines: Vec<u16>) -> Chunk {
-        Chunk {
+        let mut chunk = Chunk {
             code,
             constants,
             lookup: BTreeMap::new(),
             lines,
-        }
+        };
+        // **Fused on the way in, not only on the way out.** A `.wrenc` written
+        // before the fused opcodes existed carries the pairs unfused, and a
+        // file written after carries them fused; running the pass here makes
+        // both run the same. It is idempotent -- a fused pair no longer
+        // matches anything it looks for.
+        chunk.fuse();
+        chunk
     }
 
     pub fn emit_op(&mut self, op: Op, line: u16) {
@@ -343,6 +379,128 @@ impl Chunk {
     /// Read a big-endian `u16` at `offset`.
     pub fn read_short(&self, offset: usize) -> u16 {
         ((self.code[offset] as u16) << 8) | self.code[offset + 1] as u16
+    }
+
+    /// How many bytes the instruction at `at` occupies, opcode included.
+    ///
+    /// `None` when the byte is not an opcode or the instruction runs off the
+    /// end, which for a chunk this crate compiled cannot happen.
+    pub fn instruction_len(code: &[u8], at: usize) -> Option<usize> {
+        let op = Op::from_byte(*code.get(at)?)?;
+        let operands = match op {
+            Op::Call | Op::Super => 3,
+            Op::ImportVariable => 4,
+            Op::Closure => 3 + *code.get(at + 3)? as usize * 2,
+            Op::Constant
+            | Op::LoadModuleVar
+            | Op::StoreModuleVar
+            | Op::MethodInstance
+            | Op::MethodStatic
+            | Op::ImportModule
+            | Op::Jump
+            | Op::Loop
+            | Op::JumpIf
+            | Op::And
+            | Op::Or => 2,
+            Op::LoadLocal
+            | Op::StoreLocal
+            | Op::LoadUpvalue
+            | Op::StoreUpvalue
+            | Op::LoadFieldThis
+            | Op::StoreFieldThis
+            | Op::LoadField
+            | Op::StoreField
+            | Op::LoadStaticField
+            | Op::StoreStaticField
+            | Op::Class => 1,
+            Op::LoadLocalReturn | Op::StoreFieldThisPop | Op::LoadFieldThisReturn => 2,
+            Op::LoadLocalPair => 3,
+            Op::LoadLocalConstant => 4,
+            Op::Null
+            | Op::False
+            | Op::True
+            | Op::Pop
+            | Op::CloseUpvalue
+            | Op::Construct
+            | Op::Return
+            | Op::End
+            | Op::SetAttributes => 0,
+        };
+        Some(1 + operands)
+    }
+
+    /// Every offset in `code` that some jump can land on.
+    ///
+    /// **The one thing fusing has to respect.** Rewriting a pair in place
+    /// moves nothing, so every offset in the chunk stays correct -- unless a
+    /// jump lands on the *second* instruction of the pair, which after fusing
+    /// is a byte that is no longer an instruction.
+    fn jump_targets(code: &[u8]) -> Vec<bool> {
+        let mut targets = alloc::vec![false; code.len() + 1];
+        let mut at = 0;
+        while at < code.len() {
+            let Some(len) = Chunk::instruction_len(code, at) else {
+                break;
+            };
+            if let Some(op) = Op::from_byte(code[at]) {
+                let after = at + 3;
+                let offset = match op {
+                    Op::Jump | Op::JumpIf | Op::And | Op::Or | Op::Loop => {
+                        ((code[at + 1] as usize) << 8) | code[at + 2] as usize
+                    }
+                    _ => 0,
+                };
+                let target = match op {
+                    Op::Jump | Op::JumpIf | Op::And | Op::Or => Some(after + offset),
+                    Op::Loop => after.checked_sub(offset),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    if let Some(slot) = targets.get_mut(target) {
+                        *slot = true;
+                    }
+                }
+            }
+            at += len;
+        }
+        targets
+    }
+
+    /// Replace adjacent pairs of instructions with the single opcode that
+    /// does both, where there is one.
+    ///
+    /// Run once, on a finished chunk. See the note on the fused variants of
+    /// [`Op`] for why this can be done in place.
+    pub fn fuse(&mut self) {
+        let targets = Chunk::jump_targets(&self.code);
+        let mut at = 0;
+        while at < self.code.len() {
+            let Some(first_len) = Chunk::instruction_len(&self.code, at) else {
+                return;
+            };
+            let second = at + first_len;
+            let fused = match (Op::from_byte(self.code[at]), self.code.get(second).copied()) {
+                (Some(first), Some(byte)) => match (first, Op::from_byte(byte)) {
+                    (Op::LoadLocal, Some(Op::Constant)) => Some(Op::LoadLocalConstant),
+                    (Op::LoadLocal, Some(Op::LoadLocal)) => Some(Op::LoadLocalPair),
+                    (Op::LoadLocal, Some(Op::Return)) => Some(Op::LoadLocalReturn),
+                    (Op::StoreFieldThis, Some(Op::Pop)) => Some(Op::StoreFieldThisPop),
+                    (Op::LoadFieldThis, Some(Op::Return)) => Some(Op::LoadFieldThisReturn),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            // A jump landing on the second half would land on a byte that is
+            // no longer an instruction.
+            match fused {
+                Some(fused) if !targets.get(second).copied().unwrap_or(true) => {
+                    self.code[at] = fused as u8;
+                    at = second + Chunk::instruction_len(&self.code, second).unwrap_or(1);
+                }
+                _ => at += first_len,
+            }
+        }
     }
 
     /// The source line for the instruction at `offset`, for an error message.
@@ -441,6 +599,30 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                 // be consumed or every later offset is wrong -- which is
                 // exactly the sort of thing this exists to catch.
                 offset += count * 2;
+            }
+            // The fused pairs, whose second operand sits past the dead byte
+            // where the second opcode used to be.
+            Op::LoadLocalConstant => {
+                let _ = write!(
+                    operand,
+                    " {} then constant {}",
+                    chunk.code[offset],
+                    chunk.read_short(offset + 2)
+                );
+                offset += 4;
+            }
+            Op::LoadLocalPair => {
+                let _ = write!(
+                    operand,
+                    " {} then {}",
+                    chunk.code[offset],
+                    chunk.code[offset + 2]
+                );
+                offset += 3;
+            }
+            Op::LoadLocalReturn | Op::StoreFieldThisPop | Op::LoadFieldThisReturn => {
+                let _ = write!(operand, " {}", chunk.code[offset]);
+                offset += 2;
             }
             _ => {}
         }

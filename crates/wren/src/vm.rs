@@ -1618,6 +1618,34 @@ impl Vm {
                     ip += 1;
                     self.stack.push(self.stack[base + slot]);
                 }
+                // **The fused pairs.** Each occupies exactly the bytes of the
+                // two instructions it replaces, so the operands sit where they
+                // always did and there is a dead byte where the second
+                // opcode was. See the note on them in `bytecode.rs`.
+                Op::LoadLocalConstant => {
+                    let slot = chunk.code[ip] as usize;
+                    let index = chunk.read_short(ip + 2) as usize;
+                    ip += 4;
+                    self.stack.push(self.stack[base + slot]);
+                    self.stack.push(chunk.constants[index]);
+                }
+                Op::LoadLocalPair => {
+                    let first = chunk.code[ip] as usize;
+                    let second = chunk.code[ip + 2] as usize;
+                    ip += 3;
+                    self.stack.push(self.stack[base + first]);
+                    self.stack.push(self.stack[base + second]);
+                }
+                Op::StoreFieldThisPop => {
+                    let index = chunk.code[ip] as usize;
+                    ip += 2;
+                    // Popping first rather than storing and then popping: the
+                    // value is an argument to `set_field`, not something it
+                    // reads off the stack.
+                    let value = self.stack.pop().unwrap_or(Value::NULL);
+                    let receiver = self.stack[base];
+                    self.set_field(receiver, base, index, value)?;
+                }
                 Op::StoreLocal => {
                     let slot = chunk.code[ip] as usize;
                     ip += 1;
@@ -1992,11 +2020,24 @@ impl Vm {
                     };
                     self.stack.push(value);
                 }
-                Op::Return | Op::End => {
-                    let result = if op == Op::End {
-                        Value::NULL
-                    } else {
-                        self.stack.pop().unwrap_or(Value::NULL)
+                Op::Return | Op::End | Op::LoadLocalReturn | Op::LoadFieldThisReturn => {
+                    // **The fused returns skip the stack entirely.** Pushing a
+                    // value so that the next instruction can pop it is what
+                    // the pair did; having one instruction, the value goes
+                    // straight into the result.
+                    let result = match op {
+                        Op::End => Value::NULL,
+                        Op::LoadLocalReturn => {
+                            let slot = chunk.code[ip] as usize;
+                            ip += 2;
+                            self.stack[base + slot]
+                        }
+                        Op::LoadFieldThisReturn => {
+                            let index = chunk.code[ip] as usize;
+                            ip += 2;
+                            self.field_of(self.stack[base], base, index)?
+                        }
+                        _ => self.stack.pop().unwrap_or(Value::NULL),
                     };
 
                     self.close_upvalues(base);

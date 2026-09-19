@@ -108,52 +108,24 @@ fn table_operands(code: &[u8]) -> Result<Vec<(Table, usize)>, LoadError> {
     let mut found = Vec::new();
     let mut at = 0;
 
+    // **One length table, in `Chunk::instruction_len`.** This used to carry
+    // its own copy of how long each instruction is, which is a second thing to
+    // update whenever an opcode is added -- and the fused pairs were added
+    // without it, so the walk misaligned and every file failed to load.
     while at < code.len() {
         let Some(op) = Op::from_byte(code[at]) else {
             return Err(LoadError::Malformed("unknown opcode"));
         };
-        at += 1;
-
         match op {
-            Op::Call | Op::Super => {
-                at += 1; // arity
-                found.push((Table::Symbol, at));
-                at += 2;
-            }
-            Op::MethodInstance | Op::MethodStatic => {
-                found.push((Table::Symbol, at));
-                at += 2;
-            }
-            Op::LoadModuleVar | Op::StoreModuleVar => {
-                found.push((Table::Variable, at));
-                at += 2;
-            }
-            // Two constant indices, neither of which indexes a VM table.
-            Op::ImportVariable => at += 4,
-            Op::Closure => {
-                let count = *code.get(at + 2).ok_or(LoadError::Truncated)? as usize;
-                at += 3 + count * 2;
-            }
-            Op::Constant
-            | Op::ImportModule
-            | Op::Jump
-            | Op::Loop
-            | Op::JumpIf
-            | Op::And
-            | Op::Or => at += 2,
-            Op::LoadLocal
-            | Op::StoreLocal
-            | Op::LoadUpvalue
-            | Op::StoreUpvalue
-            | Op::LoadFieldThis
-            | Op::StoreFieldThis
-            | Op::LoadField
-            | Op::StoreField
-            | Op::LoadStaticField
-            | Op::StoreStaticField
-            | Op::Class => at += 1,
+            Op::Call | Op::Super => found.push((Table::Symbol, at + 2)),
+            Op::MethodInstance | Op::MethodStatic => found.push((Table::Symbol, at + 1)),
+            Op::LoadModuleVar | Op::StoreModuleVar => found.push((Table::Variable, at + 1)),
             _ => {}
         }
+        let Some(len) = Chunk::instruction_len(code, at) else {
+            return Err(LoadError::Truncated);
+        };
+        at += len;
     }
 
     if at != code.len() {
