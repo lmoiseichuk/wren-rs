@@ -2711,6 +2711,100 @@ fn install_metaclasses(vm: &mut Vm) {
     }
 }
 
+/// Build the built-in `meta` module and return its index.
+///
+/// **Only `eval` and `getModuleVariables`**, which is what the suite asks for.
+/// Upstream splits each into a Wren wrapper that validates its argument and a
+/// foreign leaf that does the work; written as primitives the two collapse
+/// into one each, and the wrapper's error messages are kept because they are
+/// what a program sees.
+pub fn install_meta(vm: &mut Vm) -> usize {
+    let name = vm.heap.allocate(Object::String(ObjString::from_text("Meta")));
+    let class = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(name, Some(vm.object_class)))));
+
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Meta metaclass")));
+    let metaclass = vm
+        .heap
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
+    if let Some(Object::Class(meta)) = vm.heap.get_mut(class) {
+        meta.metaclass = Some(metaclass);
+    }
+
+    define(vm, metaclass, "getModuleVariables(_)", |vm, at| {
+        let value = argument(vm, at, 1);
+        if !vm.is_string(value) {
+            return Err(RuntimeError::new("Module name must be a string."));
+        }
+        let name = vm.to_string(value);
+        let Some(index) = vm.module_index.get(&name).copied() else {
+            return Err(RuntimeError::new(alloc::format!(
+                "Could not find a module named '{name}'."
+            )));
+        };
+        // The names are collected first as owned strings: allocating the Wren
+        // strings needs the VM mutably, and the symbol table is borrowed out
+        // of it.
+        let names: Vec<alloc::string::String> = (0..vm.modules[index].names.len())
+            .filter_map(|slot| vm.modules[index].names.name(slot).map(ToString::to_string))
+            .collect();
+        let elements = names.iter().map(|name| vm.new_string(name)).collect();
+        Ok(new_list(vm, elements))
+    });
+
+    define(vm, metaclass, "eval(_)", |vm, at| {
+        let value = argument(vm, at, 1);
+        if !vm.is_string(value) {
+            return Err(RuntimeError::new("Source code must be a string."));
+        }
+        let source = vm.to_string(value);
+
+        // **Compiled into the caller's module**, so `y = 2` assigns the `y`
+        // the caller declared rather than one in a namespace of its own. A
+        // primitive pushes no frame, so the top frame is still the caller's.
+        let module = vm.current_module();
+        let chunk = match crate::compiler::compile_in(vm, &source, module) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return Err(RuntimeError::new(alloc::format!(
+                    "Could not compile source code: {}",
+                    error.message
+                )))
+            }
+        };
+
+        let function = vm.heap.allocate(Object::Fn(Box::new(crate::object::ObjFn {
+            chunk: alloc::rc::Rc::new(chunk),
+            arity: 0,
+            num_upvalues: 0,
+            name: "(eval)".into(),
+            field_offset: 0,
+            super_class: None,
+            owner_class: None,
+            module,
+        })));
+        let closure = vm.heap.allocate(Object::Closure(Box::new(
+            crate::object::ObjClosure { function, upvalues: Vec::new() },
+        )));
+
+        let base = vm.stack.len();
+        vm.stack.push(Value::object(closure));
+        let outcome = vm.call_closure(closure, base);
+        vm.stack.truncate(base);
+        outcome?;
+        Ok(Value::NULL)
+    });
+
+    let mut module = crate::vm::Module::new();
+    module.name = alloc::string::String::from("meta");
+    module.define("Meta", Value::object(class));
+    vm.modules.push(module);
+    let index = vm.modules.len() - 1;
+    vm.module_index.insert(alloc::string::String::from("meta"), index);
+    index
+}
+
 /// Build the built-in `random` module and return its index.
 ///
 /// **A native module rather than Wren source.** Upstream ships `random` as a

@@ -734,6 +734,8 @@ impl<'a> Compiler<'a> {
     /// copy of the value, not a link, which is why reassigning an imported
     /// variable does not affect the module it came from.
     fn import_statement(&mut self) -> Result<(), CompileError> {
+        // A newline between `import` and its path is insignificant.
+        self.skip_newlines()?;
         self.consume(TokenKind::String, "Expect a string after 'import'.")?;
         let path = self.unescaped(self.previous)?;
         let line = self.line();
@@ -1576,7 +1578,7 @@ impl<'a> Compiler<'a> {
         // kind, and a flag on `Token` would cost a word on every token in the
         // stream to distinguish a case this rare.
         if token.start >= 3 && &self.source.as_bytes()[token.start - 3..token.start] == b"\"\"\"" {
-            return Ok(token.text(self.source).as_bytes().to_vec());
+            return Ok(trim_raw_string(token.text(self.source).as_bytes()).to_vec());
         }
         unescape(token.text(self.source)).map_err(|message| CompileError {
             message,
@@ -2366,6 +2368,40 @@ fn tighter(precedence: Precedence) -> Precedence {
         Precedence::Unary => Precedence::Call,
         Precedence::Call => Precedence::Call,
     }
+}
+
+/// Drop the newline that follows an opening `\"\"\"` and the one before the
+/// closing `\"\"\"`, when nothing but blanks surrounds them.
+///
+/// **This is what lets a raw string be laid out readably.** Writing the
+/// delimiters on their own lines is the whole point of the form, and without
+/// this the string would begin and end with the newlines that made it legible.
+/// Upstream trims exactly the same way, counting only spaces and tabs as
+/// blank -- a stray character on the opening line is content, not decoration.
+fn trim_raw_string(text: &[u8]) -> &[u8] {
+    fn blank(byte: &u8) -> bool {
+        *byte == b' ' || *byte == b'\t'
+    }
+
+    let mut start = 0;
+    if let Some(first) = text.iter().position(|byte| *byte == b'\n') {
+        if text[..first].iter().all(blank) {
+            start = first + 1;
+        }
+    }
+
+    let mut end = text.len();
+    if let Some(last) = text.iter().rposition(|byte| *byte == b'\n') {
+        if text[last + 1..].iter().all(blank) {
+            end = last;
+        }
+    }
+
+    // A string that is nothing but its own delimiters and blanks.
+    if end < start {
+        end = start;
+    }
+    &text[start..end]
 }
 
 /// Decode the escapes in a string literal.

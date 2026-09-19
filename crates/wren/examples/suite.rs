@@ -115,12 +115,16 @@ fn main() {
                 }
             }
             let Ok(source) = std::fs::read_to_string(&outcome.path) else { continue };
-            let expected: Vec<String> = source
-                .lines()
-                .filter_map(|line| line.find("// expect: ").map(|at| line[at + 11..].to_string()))
-                .collect();
+            let expected: Vec<String> = source.lines().filter_map(expectation).collect();
             let directory = outcome.path.parent().map(Path::to_path_buf).unwrap_or_default();
             let mut vm = wren::Vm::new();
+            let name = {
+                let text = outcome.path.display().to_string();
+                let text = text.strip_prefix("vendor/wren/").unwrap_or(&text);
+                let text = text.strip_suffix(".wren").unwrap_or(text);
+                format!("./{text}")
+            };
+            vm.set_main_module_name(&name);
             let base = directory.clone();
             vm.set_module_loader(move |name| {
                 std::fs::read_to_string(base.join(format!("{}.wren", name.trim_start_matches("./")))).ok()
@@ -220,7 +224,17 @@ fn one(path: &Path, root: &str) -> Option<Outcome> {
     // is the thing worth knowing.
     let started = std::time::Instant::now();
     let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let result = std::panic::catch_unwind(|| check(&source, &directory))
+    // **Upstream names the main module after the file it was given**, turning
+    // `test/meta/x.wren` into `./test/meta/x` (test/test.c). A program can ask
+    // `Meta.getModuleVariables` about itself, so it needs to be findable under
+    // that name.
+    let module_name = {
+        let text = path.display().to_string();
+        let text = text.strip_prefix("vendor/wren/").unwrap_or(&text);
+        let text = text.strip_suffix(".wren").unwrap_or(text);
+        format!("./{text}")
+    };
+    let result = std::panic::catch_unwind(|| check(&source, &directory, &module_name))
         .unwrap_or_else(|_| Err(format!("PANIC in {}", path.display())));
     let elapsed = started.elapsed();
 
@@ -256,17 +270,12 @@ fn group_of(path: &Path, root: &str) -> String {
 }
 
 /// Run one file and decide whether it did what its comments say it should.
-fn check(source: &str, directory: &Path) -> Result<(), String> {
+fn check(source: &str, directory: &Path, module_name: &str) -> Result<(), String> {
     let mut expected = Vec::new();
 
     for line in source.lines() {
-        // **`// expect:` with nothing after it expects an empty line.**
-        // Requiring the trailing space dropped those expectations entirely,
-        // so a test printing a blank line looked like it printed one line too
-        // many.
-        if let Some(at) = line.find("// expect:") {
-            let rest = &line[at + 10..];
-            expected.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        if let Some(text) = expectation(line) {
+            expected.push(text);
         }
     }
 
@@ -278,16 +287,19 @@ fn check(source: &str, directory: &Path) -> Result<(), String> {
 
     let mut vm = wren::Vm::new();
 
-    // **Modules resolve relative to the importing file.** Upstream's tests say
-    // `import "./module"` and expect the file beside them, so the loader has
-    // to know where the test lives -- which is why it is built per file rather
-    // than once for the run.
-    let directory = directory.to_path_buf();
+    // **The VM resolves relative imports itself**, against the importing
+    // module's name, so what reaches the loader is already a full path from
+    // the test root -- `./test/language/module/x/module`. The loader's job is
+    // only to turn that into a file. It was joining against the test's own
+    // directory, which double-counted the path once the main module had a
+    // name to resolve against.
+    let _ = directory;
     vm.set_module_loader(move |name| {
         let relative = name.trim_start_matches("./");
-        let candidate = directory.join(format!("{relative}.wren"));
-        std::fs::read_to_string(candidate).ok()
+        std::fs::read_to_string(format!("vendor/wren/{relative}.wren")).ok()
     });
+
+    vm.set_main_module_name(module_name);
 
     let result = vm.interpret(source);
 
@@ -316,6 +328,19 @@ fn check(source: &str, directory: &Path) -> Result<(), String> {
             }
         }
     }
+}
+
+/// The text a `// expect:` comment asks for, if the line carries one.
+///
+/// **The space after the colon is optional**, as it is in upstream's own
+/// runner (`util/test.py`, `// expect: ?(.*)`), so a bare `// expect:` asks
+/// for an *empty* line. Requiring the space dropped that expectation and
+/// scored a correct blank line as a surplus one. Both places that read
+/// expectations go through here, because they disagreed once already.
+fn expectation(line: &str) -> Option<String> {
+    let at = line.find("// expect:")?;
+    let rest = &line[at + "// expect:".len()..];
+    Some(rest.strip_prefix(' ').unwrap_or(rest).to_string())
 }
 
 /// Does this file expect to fail?

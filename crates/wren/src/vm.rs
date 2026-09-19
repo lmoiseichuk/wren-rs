@@ -136,6 +136,13 @@ pub struct Switch {
 
 /// A module's variables: names and values, in parallel.
 pub struct Module {
+    /// The resolved name this module was loaded under, empty for the main one.
+    ///
+    /// **Kept because a relative import resolves against its importer**, not
+    /// against the program's entry point: `sub/module.wren` saying
+    /// `import "./module_2"` means `sub/module_2`. Without the importer's own
+    /// name there is nothing to resolve against.
+    pub name: String,
     pub names: SymbolTable,
     pub values: Vec<Value>,
 }
@@ -148,7 +155,7 @@ impl Default for Module {
 
 impl Module {
     pub fn new() -> Module {
-        Module { names: SymbolTable::new(), values: Vec::new() }
+        Module { name: String::new(), names: SymbolTable::new(), values: Vec::new() }
     }
 
     /// The value of a variable by name.
@@ -421,6 +428,16 @@ impl Vm {
         self.heap.collect(roots);
     }
 
+    /// Name the module a program itself is compiled into.
+    ///
+    /// **`Meta.getModuleVariables` can be asked about the main module**, which
+    /// means it needs a name to be found under. A host that runs a file names
+    /// it after the file; one evaluating a string may leave it unnamed.
+    pub fn set_main_module_name(&mut self, name: &str) {
+        self.modules[0].name = name.to_string();
+        self.module_index.insert(name.to_string(), 0);
+    }
+
     /// Tell the VM how to read a clock, for `System.clock`.
     pub fn set_clock(&mut self, clock: impl Fn() -> f64 + 'static) {
         self.clock = Some(Box::new(clock));
@@ -450,6 +467,9 @@ impl Vm {
         if name == "random" {
             return Ok((core::install_random(self), None));
         }
+        if name == "meta" {
+            return Ok((core::install_meta(self), None));
+        }
 
         let Some(loader) = self.module_loader.as_ref() else {
             return Err(RuntimeError::new(format!("Could not load module '{name}'.")));
@@ -460,6 +480,7 @@ impl Vm {
 
         // A fresh namespace seeded with the core library.
         let mut module = Module::new();
+        module.name = name.to_string();
         for index in 0..self.core_variables {
             let variable = self.modules[0]
                 .names
@@ -711,7 +732,7 @@ impl Vm {
     }
 
     /// The module of whatever frame is on top.
-    fn current_module(&self) -> usize {
+    pub(crate) fn current_module(&self) -> usize {
         self.frames
             .last()
             .map_or(0, |frame| self.module_of(frame.closure))
@@ -1382,6 +1403,8 @@ impl Vm {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
                     let name = self.to_string(chunk.constants[index]);
+                    // Resolved against the module doing the importing.
+                    let name = resolve_module(&self.modules[module].name, &name);
 
                     match self.load_module(&name) {
                         Ok((_, None)) => {
@@ -1428,6 +1451,10 @@ impl Vm {
                     ip += 4;
 
                     let module_name = self.to_string(chunk.constants[module_name]);
+                    // The same resolution, or the `for` clause would look the
+                    // module up under the name as written rather than the one
+                    // it was loaded under.
+                    let module_name = resolve_module(&self.modules[module].name, &module_name);
                     let variable = self.to_string(chunk.constants[variable_name]);
 
                     let Some(from) = self.module_index.get(&module_name).copied() else {
@@ -1583,11 +1610,29 @@ impl Vm {
         };
 
         let message = self.new_string(&error.message);
-        if let Some(id) = self.current_fiber {
-            if let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) {
-                fiber.error = message;
-                fiber.done = true;
+
+        // **Every fiber between the one that failed and the one entered with
+        // `try` is aborted too, carrying the same error.** A fiber that was
+        // only passed through is as dead as the one that raised: it can never
+        // be resumed, because the frame it was waiting on is gone. Marking
+        // only the innermost left the intermediates reporting `null` from
+        // `fiber.error` while also claiming not to be done.
+        let mut current = self.current_fiber;
+        while let Some(id) = current {
+            let Some(Object::Fiber(fiber)) = self.heap.get_mut(id) else {
+                break;
+            };
+            fiber.error = message;
+            fiber.done = true;
+            let caller = fiber.caller;
+            if fiber.catching {
+                // This one's caller is where control is going; it keeps its
+                // link so the hand-back lands there.
+                break;
             }
+            // Never resumed, so unhook it.
+            fiber.caller = None;
+            current = caller;
         }
 
         self.perform_switch(
@@ -1960,6 +2005,69 @@ impl Default for Vm {
     fn default() -> Vm {
         Vm::new()
     }
+}
+
+/// Resolve an import against the module doing the importing.
+///
+/// A name starting with `./` or `../` is relative; anything else -- `random`,
+/// `meta` -- is a logical name and passes through untouched. **This cannot be
+/// left to the host loader**, because the loader is handed one name and never
+/// learns which module asked for it.
+///
+/// A leading `..` that cannot be resolved is kept rather than discarded, so an
+/// import reaching above the root fails to load with the name it asked for
+/// instead of quietly becoming something else.
+pub fn resolve_module(importer: &str, name: &str) -> String {
+    if !name.starts_with("./") && !name.starts_with("../") {
+        return name.to_string();
+    }
+
+    let directory = match importer.rfind('/') {
+        Some(at) => &importer[..at],
+        None => "",
+    };
+    let joined = if directory.is_empty() {
+        name.to_string()
+    } else {
+        format!("{directory}/{name}")
+    };
+
+    let mut parts: Vec<&str> = Vec::new();
+    let mut above = 0usize;
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    above += 1;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+
+    let mut resolved = String::new();
+    for _ in 0..above {
+        if !resolved.is_empty() {
+            resolved.push('/');
+        }
+        resolved.push_str("..");
+    }
+    // A path that stayed inside its own directory keeps the leading `./` it
+    // was written with, which is what the host loader expects to strip.
+    if above == 0 && joined.starts_with("./") {
+        resolved.push('.');
+    }
+    for part in parts {
+        if !resolved.is_empty() {
+            resolved.push('/');
+        }
+        resolved.push_str(part);
+    }
+    if resolved.is_empty() {
+        resolved.push('.');
+    }
+    resolved
 }
 
 /// Format a number the way Wren does.
