@@ -7,10 +7,22 @@ otherwise reach for. A Rust VM that is smaller and faster than a C VM is
 interesting; one that is smaller and faster than the thing people actually
 deploy is useful.
 
-It is equally possible that MicroPython wins on some axis — start-up, or breadth
-of library, or sheer maturity. That is a finding and it goes in the table like
-any other. A comparison arranged so that only one answer can come out is not a
+It was equally possible that MicroPython would win on some axis, and it does —
+see the results below. That is a finding and it goes in the table like any
+other. A comparison arranged so that only one answer can come out is not a
 comparison.
+
+## Status
+
+**Done.** MicroPython 1.29.0, `ESP32_GENERIC_C6`, built 2026-08-24, `_mpy`
+12038 — the released
+`ESP32_GENERIC_C6-20260824-v1.29.0.bin`, not vendored here because it is a
+third-party 1.9 MB binary that micropython.org already serves. Results are in **[`doc/wren/benchmarks.md`](../../doc/wren/benchmarks.md)**
+— that is the only place the numbers live.
+
+The short version: Wren is **1.19x to 4.99x faster** on all four benchmarks and
+its image is **7.0x smaller**, while MicroPython leaves a program **~106 KB more
+heap** and uses **2x to 9x less heap per benchmark**.
 
 ## What it needs
 
@@ -20,7 +32,7 @@ Less than the others, because nothing is built here:
   [micropython.org/download](https://micropython.org/download/ESP32_GENERIC_C6/).
 * **`esptool`** to flash it — `pip install esptool`, or the one ESP-IDF already
   provides if it is installed.
-* **`python3-serial`** for `tools/run-python.py`.
+* **`python3-serial`** for the runners in `tools/`.
 
 ```sh
 esptool.py --chip esp32c6 -p <by-id path> erase_flash
@@ -30,47 +42,45 @@ esptool.py --chip esp32c6 -p <by-id path> --baud 460800 \
 
 **Use a released build, not one compiled here.** The point of this port is to
 measure what somebody would actually deploy; a locally built MicroPython with
-different options would be measuring our build choices rather than theirs.
+different options would be measuring our build choices rather than theirs. It is
+also why the image-size comparison is noted as unfair to MicroPython in the
+report — a stock build carries networking, TLS, `framebuf` and `btree` that a
+Wren port carrying a console does not.
 
-## Status
+## Running it
 
-Waiting on a flash. This one is a flashing exercise rather than a port to write:
-a released MicroPython build for `ESP32_GENERIC_C6`, from micropython.org.
-
+```sh
+tools/run-micropython.py <by-id path> 3      # three runs of each benchmark
 ```
-# flash whatever release is current, then:
-tools/run-python.py <by-id path> ports/esp32c6-micropython/bench.py
-```
 
-`bench.py` carries the three benchmarks translated from Wren, and
-`tools/run-python.py` sends it over the **raw** REPL rather than paste mode —
-paste mode echoes every line, which fills the board's transmit buffer, blocks
-its reader and truncates the file. That is the same failure the Wren console hit
-from the other direction, and it cost a debugging round there.
+The benchmarks are `benchmarks/python/*.py`, beside their Wren counterparts in
+`benchmarks/wren/` with identical constants. **They are not kept here.** An
+earlier copy in this directory drifted from the Wren originals and from the
+runner, and produced two numbers that had to be withdrawn.
 
-## What to measure
+Two things the runner does deliberately, both learned the hard way:
 
-* **Image size** on flash, and static RAM at rest.
-* **Free heap after start-up** — the memory a user program actually gets.
-* **Start-up time** to a usable prompt.
-* **The shared benchmark set**, translated to Python with as little cleverness as
-  possible, because a benchmark tuned for one language and transliterated into
-  another measures the translation.
+**Raw REPL, not paste mode.** Paste mode echoes every line, which fills the
+board's transmit buffer, blocks its reader and truncates the file — the same
+failure the Wren console hit from the other direction.
 
-## How this differs
+**A soft reset before every run, and no forced collection inside the measured
+window.** `list_build` leaves a 10,000-element list alive at module scope, which
+would otherwise be charged against the next benchmark's baseline; and a
+`gc.collect()` before the final reading would answer a different question from
+the one the Wren port answers. Getting this wrong the first time reported 192 B
+against Wren's 134,712 B for the same program.
+
+## How this differs from Wren
 
 Python is not Wren, and the benchmark translation is the weak joint in the whole
-comparison. `bench.py` notes each divergence at the point it occurs; two are
-worth knowing before reading any number:
+comparison. **Each divergence is noted in the benchmark file at the point it
+occurs** — `benchmarks/python/*.py` — rather than restated here, where it would
+be free to drift from the code it describes.
 
-**`loop` is not doing the same arithmetic.** Wren has a single numeric type and
-every value in that benchmark is a double — so on a part with no hardware
-floating point it is soft-float. MicroPython uses small integers, which are far
-cheaper. The comparison is still worth making, because it is what each language
-actually does with the same program, but the gap there is a *representation*
-difference and reading it as an interpreter difference would be wrong.
-
-**`fib` uses a classmethod and `tree` avoids `__slots__`**, both deliberately.
-A module-level function and slotted objects would be measurably faster and would
-stop measuring the thing Wren is being compared on — method dispatch, and
-instances with fields.
+The one worth knowing before reading any number: **Wren has a single numeric
+type**, so every value in `fib` is a double, and on a part with no hardware
+floating point that is soft-float. MicroPython uses small integers, which are
+far cheaper. Wren wins that benchmark anyway, which makes the result stronger
+rather than weaker — but the gap is a *representation* difference as much as an
+interpreter one.

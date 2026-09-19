@@ -101,23 +101,45 @@ one has to provide.
 | | |
 |---|---|
 | upstream submodule | pinned at 0.4.0 |
-| **step 1 — C reference on the C6** | **running, measured** |
-| step 2 — MicroPython baseline | not started |
+| **step 1 — C reference on the C6** | **done, measured** |
+| **step 2 — MicroPython baseline** | **done, measured** |
 | Rust lexer | first pass written, host-tested |
 | Rust compiler, VM, GC | not started |
 
-### What step 1 already established
+### Steps 1 and 2: the numbers to beat
 
-Upstream Wren runs on an ESP32-C6, and getting it there produced four findings
-that the Rust implementation inherits as requirements — see
+Upstream Wren 0.4.0 runs on an ESP32-C6 and passes **821 of 846** of its own
+language tests there (97.0%). It was then measured against MicroPython 1.29.0
+on the same board, running the same four programs with the same constants.
+Full method and caveats in **[`doc/wren/benchmarks.md`](doc/wren/benchmarks.md)**;
+the suite results are in [`doc/wren/README.md`](doc/wren/README.md).
+
+| | Wren `-O2` | MicroPython | |
+|---|---|---|---|
+| `fib(24)` x5 | **3.250 s** | 7.109 s | Wren 2.19x faster |
+| `binary_trees` depth 9 | **2.160 s** | 4.729 s | Wren 2.19x faster |
+| `method_call` | **0.350 s** | 1.748 s | Wren 4.99x faster |
+| `list_build` 10,000 | **0.130 s** | 0.154 s | Wren 1.19x faster |
+| app image (`-Os`) | **272,736 B** | 1,902,128 B | Wren 7.0x smaller |
+| free to a program | 227,000 B | **333,344 B** | MicroPython 1.5x roomier |
+| heap for `list_build` | 134,712 B | **65,440 B** | MicroPython 2.1x leaner |
+
+**Wren buys speed with memory**: faster on all four, in a seventh of the flash,
+and paying for it in heap. The image comparison is against a stock
+`ESP32_GENERIC_C6` carrying networking and TLS, so it flatters Wren; the heap
+and speed figures are like for like.
+
+### What step 1 established about the small parts
+
+Four findings the Rust implementation inherits as requirements — see
 [`ports/esp32c6-wren`](ports/esp32c6-wren) for the detail.
 
 | | |
 |---|---|
-| image | 274 KB |
-| **VM resident** | **83 KB** |
-| **compiler stack** | **33 KB** |
-| `fib` / `tree` / `loop` | 752 / 1,898 / 1,901 ms |
+| app image, `-Os` | 272,736 B |
+| **VM resident** | **83,036 B** |
+| **compiler stack** | **33,552 B** |
+| live-object ceiling on this part | ~200 KB |
 
 **Two of them bear on whether the small parts are reachable at all.** The
 compiler needs 33 KB of stack, which is four times a CH32V006's entire RAM — the

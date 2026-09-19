@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send a Python file to a MicroPython board and print what it says.
 
-    tools/run-python.py <by-id path> ports/esp32c6-micropython/bench.py
+    tools/run-python.py <by-id path> benchmarks/python/fib.py
 
 **Raw REPL, not paste mode.** Paste mode echoes every line back, which on a
 board reading character by character fills its transmit buffer, blocks its

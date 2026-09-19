@@ -1,0 +1,74 @@
+{
+ "meta": {
+  "board": "ESP32-C6FH4 rev v0.2 @ 160 MHz",
+  "implementation": "(name='micropython', version=(1, 29, 0, ''), _machine='ESP32C6 module with ESP32-C6', _mpy=12038, _build='ESP32_GENERIC_C6', _thread='GIL')",
+  "free_at_boot": "(None, 333344)",
+  "alloc_at_boot": "(None, 992)",
+  "repeats": 3,
+  "benchmarks": "benchmarks/python -- identical constants to benchmarks/wren",
+  "run": "2026-09-19 01:19:04 UTC",
+  "note": "heap_bytes is gc.mem_free() before minus after with no forced collection, matching what the Wren port measures; live_bytes is the same after a gc.collect() and has no Wren counterpart"
+ },
+ "results": [
+  {
+   "benchmark": "binary_trees",
+   "self_seconds": 4.729332,
+   "self_runs": [
+    4.729332,
+    4.729263,
+    4.730232
+   ],
+   "spread_percent": 0.0,
+   "heap_bytes": 76512,
+   "live_bytes": 50512,
+   "runs": 3,
+   "failures": 0,
+   "errors": []
+  },
+  {
+   "benchmark": "fib",
+   "self_seconds": 7.109166,
+   "self_runs": [
+    7.109166,
+    7.109125,
+    7.109178
+   ],
+   "spread_percent": 0.0,
+   "heap_bytes": 800,
+   "live_bytes": 336,
+   "runs": 3,
+   "failures": 0,
+   "errors": []
+  },
+  {
+   "benchmark": "list_build",
+   "self_seconds": 0.1541,
+   "self_runs": [
+    0.154097,
+    0.1541,
+    0.154101
+   ],
+   "spread_percent": 0.0,
+   "heap_bytes": 65440,
+   "live_bytes": 65200,
+   "runs": 3,
+   "failures": 0,
+   "errors": []
+  },
+  {
+   "benchmark": "method_call",
+   "self_seconds": 1.747991,
+   "self_runs": [
+    1.74801,
+    1.747988,
+    1.747991
+   ],
+   "spread_percent": 0.0,
+   "heap_bytes": 1616,
+   "live_bytes": 768,
+   "runs": 3,
+   "failures": 0,
+   "errors": []
+  }
+ ]
+}
