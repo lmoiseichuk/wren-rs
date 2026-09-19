@@ -173,7 +173,8 @@ fn one(path: &Path, root: &str) -> Option<Outcome> {
     // program must not take the harness down with it, and the file that did it
     // is the thing worth knowing.
     let started = std::time::Instant::now();
-    let result = std::panic::catch_unwind(|| check(&source))
+    let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let result = std::panic::catch_unwind(|| check(&source, &directory))
         .unwrap_or_else(|_| Err(format!("PANIC in {}", path.display())));
     let elapsed = started.elapsed();
 
@@ -209,7 +210,7 @@ fn group_of(path: &Path, root: &str) -> String {
 }
 
 /// Run one file and decide whether it did what its comments say it should.
-fn check(source: &str) -> Result<(), String> {
+fn check(source: &str, directory: &Path) -> Result<(), String> {
     let mut expected = Vec::new();
     let mut expects_error = false;
 
@@ -223,6 +224,18 @@ fn check(source: &str) -> Result<(), String> {
     }
 
     let mut vm = wren::Vm::new();
+
+    // **Modules resolve relative to the importing file.** Upstream's tests say
+    // `import "./module"` and expect the file beside them, so the loader has
+    // to know where the test lives -- which is why it is built per file rather
+    // than once for the run.
+    let directory = directory.to_path_buf();
+    vm.set_module_loader(move |name| {
+        let relative = name.trim_start_matches("./");
+        let candidate = directory.join(format!("{relative}.wren"));
+        std::fs::read_to_string(candidate).ok()
+    });
+
     let result = vm.interpret(source);
 
     if expects_error {

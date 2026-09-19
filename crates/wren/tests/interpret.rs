@@ -635,3 +635,117 @@ fn negative_zero_keeps_its_sign() {
     assert_eq!(run("System.print(-0.0)"), "-0\n");
     assert_eq!(run("System.print((-0.5).truncate)"), "-0\n");
 }
+
+// --- modules ----------------------------------------------------------------
+
+/// Run a program with a set of modules served from memory.
+fn run_with_modules(source: &str, modules: &[(&'static str, &'static str)]) -> String {
+    let mut vm = Vm::new();
+    let table: Vec<(String, String)> = modules
+        .iter()
+        .map(|(name, body)| ((*name).to_string(), (*body).to_string()))
+        .collect();
+    vm.set_module_loader(move |wanted| {
+        table
+            .iter()
+            .find(|(name, _)| name == wanted)
+            .map(|(_, body)| body.clone())
+    });
+    match vm.interpret(source) {
+        Ok(()) => vm.output_str().to_string(),
+        Err(error) => panic!("line {}: {}", error.line(), error.message()),
+    }
+}
+
+#[test]
+fn a_bare_import_runs_the_module() {
+    assert_eq!(
+        run_with_modules("import \"m\"\nSystem.print(\"after\")", &[("m", "System.print(\"ran\")")]),
+        "ran\nafter\n"
+    );
+}
+
+#[test]
+fn import_for_binds_named_variables() {
+    assert_eq!(
+        run_with_modules(
+            "import \"m\" for Greeting\nSystem.print(Greeting)",
+            &[("m", "var Greeting = \"hello\"")]
+        ),
+        "hello\n"
+    );
+}
+
+#[test]
+fn import_as_renames() {
+    // Which is what lets two modules exporting the same name both be used.
+    assert_eq!(
+        run_with_modules(
+            "import \"m\" for Thing as Other\nSystem.print(Other)",
+            &[("m", "var Thing = 7")]
+        ),
+        "7\n"
+    );
+}
+
+#[test]
+fn a_module_runs_only_once_however_often_it_is_imported() {
+    let source = "
+import \"m\" for A
+import \"m\" for B
+System.print(A)
+System.print(B)
+";
+    assert_eq!(
+        run_with_modules(source, &[("m", "var A = 1\nvar B = 2\nSystem.print(\"ran\")")]),
+        "ran\n1\n2\n"
+    );
+}
+
+#[test]
+fn a_module_has_its_own_namespace() {
+    // The point of modules: the same name in two files is two variables, and
+    // the importer sees only what it asked for.
+    let source = "
+var name = \"main\"
+import \"m\" for exported
+System.print(name)
+System.print(exported)
+";
+    assert_eq!(
+        run_with_modules(source, &[("m", "var name = \"module\"\nvar exported = name")]),
+        "main\nmodule\n"
+    );
+}
+
+#[test]
+fn a_module_gets_the_core_library_without_importing_it() {
+    assert_eq!(
+        run_with_modules(
+            "import \"m\" for Answer\nSystem.print(Answer)",
+            &[("m", "var Answer = [1, 2].count + 40")]
+        ),
+        "42\n"
+    );
+}
+
+#[test]
+fn importing_a_name_the_module_does_not_have_is_an_error() {
+    let mut vm = Vm::new();
+    vm.set_module_loader(|_| Some("var Real = 1".to_string()));
+    let result = vm.interpret("import \"m\" for Absent");
+    assert_eq!(
+        result.unwrap_err().message(),
+        "Could not find a variable named 'Absent' in module 'm'."
+    );
+}
+
+#[test]
+fn importing_with_no_loader_fails_rather_than_panics() {
+    // The default for a firmware with no filesystem.
+    let mut vm = Vm::new();
+    assert_eq!(
+        vm.interpret("import \"m\"").unwrap_err().message(),
+        "Could not load module 'm'."
+    );
+}

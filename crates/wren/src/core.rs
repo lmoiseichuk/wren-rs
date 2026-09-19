@@ -861,7 +861,7 @@ fn install_list(vm: &mut Vm) {
     define(vm, metaclass, "new()", |vm, _| {
         Ok(new_list(vm, Vec::new()))
     });
-    vm.module.define("List", Value::object(class));
+    vm.modules[0].define("List", Value::object(class));
 
     // Like `add(_)`, but returns the *list* rather than the element, so a list
     // literal can add each element without reloading the list between them.
@@ -1538,7 +1538,7 @@ fn install_system(vm: &mut Vm) {
         Ok(value)
     });
 
-    vm.module.define("System", Value::object(system));
+    vm.modules[0].define("System", Value::object(system));
 
     // **The core classes have to be reachable by name.** `class Foo {}` with no
     // `is` clause compiles to a load of `Object`, and `x is Num` needs `Num`.
@@ -1555,7 +1555,7 @@ fn install_system(vm: &mut Vm) {
         ("Range", vm.range_class),
         ("String", vm.string_class),
     ] {
-        vm.module.define(name, Value::object(class));
+        vm.modules[0].define(name, Value::object(class));
     }
 }
 

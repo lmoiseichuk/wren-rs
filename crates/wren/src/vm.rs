@@ -14,6 +14,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -141,6 +142,11 @@ impl Module {
         Module { names: SymbolTable::new(), values: Vec::new() }
     }
 
+    /// The value of a variable by name.
+    pub fn get(&self, name: &str) -> Option<Value> {
+        self.values.get(self.names.find(name)?).copied()
+    }
+
     /// Define a variable, or return its existing slot.
     pub fn define(&mut self, name: &str, value: Value) -> usize {
         let index = self.names.ensure(name);
@@ -160,7 +166,30 @@ pub struct Vm {
     pub stack: Vec<Value>,
     /// Method signatures, interned. `Op::Call` carries an index into this.
     pub method_names: SymbolTable,
-    pub module: Module,
+    /// Every module that has been loaded, main first.
+    ///
+    /// **A module is a namespace, not a file.** Two files that import each
+    /// other see different sets of names, and a variable defined in one is not
+    /// visible in the other unless it is imported -- which is the whole point
+    /// of the chapter. One flat namespace would pass most of the suite and get
+    /// the interesting half wrong.
+    pub modules: Vec<Module>,
+    /// Module name to index, so an import can find one already loaded.
+    pub module_index: BTreeMap<String, usize>,
+    /// How to find a module's source, if the host can.
+    ///
+    /// `None` means imports fail, which is right for a firmware with no
+    /// filesystem. The host sets one; see `Vm::set_module_loader`.
+    #[allow(clippy::type_complexity)]
+    pub module_loader: Option<Box<dyn Fn(&str) -> Option<String>>>,
+    /// How many of the main module's variables are the core library.
+    ///
+    /// Every module implicitly gets the core classes -- `Num`, `List`,
+    /// `System` and the rest -- without importing them, so a new module starts
+    /// as a copy of these and nothing else. Recorded once after the core is
+    /// installed, because anything defined later is the *program's* and must
+    /// not leak into a module that did not ask for it.
+    core_variables: usize,
 
     /// The built-in classes, held so that [`Vm::class_of`] can answer without
     /// a lookup. Upstream keeps exactly the same set on its `WrenVM`.
@@ -251,7 +280,10 @@ impl Vm {
             heap,
             stack: Vec::new(),
             method_names: SymbolTable::new(),
-            module: Module::new(),
+            modules: alloc::vec![Module::new()],
+            module_index: BTreeMap::new(),
+            module_loader: None,
+            core_variables: 0,
             num_class,
             bool_class,
             null_class,
@@ -272,6 +304,7 @@ impl Vm {
             output: Vec::new(),
         };
         core::install(&mut vm);
+        vm.core_variables = vm.modules[0].values.len();
         vm
     }
 
@@ -280,6 +313,68 @@ impl Vm {
         let chunk = compiler::compile(self, source)
             .map_err(|error| WrenError::Compile { message: error.message, line: error.line })?;
         self.run(Rc::new(chunk)).map_err(WrenError::Runtime)
+    }
+
+    /// Tell the VM how to find a module's source.
+    ///
+    /// Without one, `import` fails -- which is the right default for a
+    /// firmware with no filesystem to read from.
+    pub fn set_module_loader(&mut self, loader: impl Fn(&str) -> Option<String> + 'static) {
+        self.module_loader = Some(Box::new(loader));
+    }
+
+    /// Find a module by name, loading and running it if this is the first time.
+    ///
+    /// Returns its index, and whether it had to be run -- the caller needs the
+    /// second because running it means continuing in a new frame rather than
+    /// falling through.
+    fn load_module(&mut self, name: &str) -> Result<(usize, Option<ObjectId>), RuntimeError> {
+        if let Some(index) = self.module_index.get(name) {
+            return Ok((*index, None));
+        }
+
+        let Some(loader) = self.module_loader.as_ref() else {
+            return Err(RuntimeError::new(format!("Could not load module '{name}'.")));
+        };
+        let Some(source) = loader(name) else {
+            return Err(RuntimeError::new(format!("Could not load module '{name}'.")));
+        };
+
+        // A fresh namespace seeded with the core library.
+        let mut module = Module::new();
+        for index in 0..self.core_variables {
+            let variable = self.modules[0]
+                .names
+                .name(index)
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let value = self.modules[0].values[index];
+            module.define(&variable, value);
+        }
+        self.modules.push(module);
+        let index = self.modules.len() - 1;
+        // Registered *before* compiling, so a module that imports itself finds
+        // the partially built one rather than looping forever.
+        self.module_index.insert(name.to_string(), index);
+
+        let chunk = compiler::compile_in(self, &source, index).map_err(|error| RuntimeError {
+            message: error.message,
+            line: error.line,
+        })?;
+
+        let function = self.heap.allocate(Object::Fn(Box::new(ObjFn {
+            chunk: Rc::new(chunk),
+            arity: 0,
+            num_upvalues: 0,
+            name: name.to_string(),
+            field_offset: 0,
+            super_class: None,
+            module: index,
+        })));
+        let closure = self
+            .heap
+            .allocate(Object::Closure(Box::new(ObjClosure { function, upvalues: Vec::new() })));
+        Ok((index, Some(closure)))
     }
 
     /// What `System.print` has written so far.
@@ -441,6 +536,18 @@ impl Vm {
         self.function_of(closure).map(|function| function.arity)
     }
 
+    /// Which module a closure's code resolves its variables against.
+    fn module_of(&self, closure: ObjectId) -> usize {
+        self.function_of(closure).map_or(0, |function| function.module)
+    }
+
+    /// The module of whatever frame is on top.
+    fn current_module(&self) -> usize {
+        self.frames
+            .last()
+            .map_or(0, |frame| self.module_of(frame.closure))
+    }
+
     fn function_of(&self, closure: ObjectId) -> Option<&ObjFn> {
         let Some(Object::Closure(closure)) = self.heap.get(closure) else {
             return None;
@@ -507,7 +614,9 @@ impl Vm {
     /// only live references are the ones below.
     fn roots(&self) -> Vec<Value> {
         let mut roots = self.stack.clone();
-        roots.extend(self.module.values.iter().copied());
+        for module in &self.modules {
+            roots.extend(module.values.iter().copied());
+        }
         for frame in &self.frames {
             roots.push(Value::object(frame.closure));
         }
@@ -690,6 +799,11 @@ impl Vm {
 
     /// Run a compiled chunk as a fresh top-level frame.
     pub fn run(&mut self, chunk: Rc<Chunk>) -> Result<(), RuntimeError> {
+        self.run_module(chunk, 0)
+    }
+
+    /// Run a chunk compiled against a particular module.
+    pub fn run_module(&mut self, chunk: Rc<Chunk>, module: usize) -> Result<(), RuntimeError> {
         // Module code is a function like any other, so that one loop handles
         // both and `return` at the top level means the same thing it does
         // anywhere else.
@@ -700,6 +814,7 @@ impl Vm {
             name: "(module)".into(),
             field_offset: 0,
             super_class: None,
+            module,
         })));
         let closure = self
             .heap
@@ -731,6 +846,14 @@ impl Vm {
     fn run_frames(&mut self, mut chunk: Rc<Chunk>, floor: usize) -> Result<Value, RuntimeError> {
         let mut ip = self.frames.last().map_or(0, |frame| frame.ip);
         let mut base = self.frames.last().map_or(0, |frame| frame.base);
+        // Cached with `ip` and `base` for the same reason: module variable
+        // access would otherwise reach through the frame to the closure to the
+        // function on every load.
+        let mut module = self
+            .frames
+            .last()
+            .and_then(|frame| self.function_of(frame.closure))
+            .map_or(0, |function| function.module);
 
         loop {
             let byte = chunk.code[ip];
@@ -763,12 +886,12 @@ impl Vm {
                 Op::LoadModuleVar => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
-                    self.stack.push(self.module.values[index]);
+                    self.stack.push(self.modules[module].values[index]);
                 }
                 Op::StoreModuleVar => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
-                    self.module.values[index] = *self.stack.last().unwrap();
+                    self.modules[module].values[index] = *self.stack.last().unwrap();
                 }
                 Op::Pop => {
                     self.stack.pop();
@@ -902,6 +1025,7 @@ impl Vm {
                                 chunk = next_chunk;
                                 ip = next_ip;
                                 base = next_base;
+                                module = self.current_module();
                                 continue;
                             }
                             None => unreachable!("deliver_error returns or switches"),
@@ -924,6 +1048,7 @@ impl Vm {
                                         chunk = next_chunk;
                                         ip = next_ip;
                                         base = next_base;
+                                        module = self.current_module();
                                         continue;
                                     }
                                     None => unreachable!("deliver_error returns or switches"),
@@ -941,6 +1066,7 @@ impl Vm {
                                 ip = frame.ip;
                                 base = frame.base;
                                 chunk = self.chunk_of(frame.closure)?;
+                                module = self.module_of(frame.closure);
                                 continue;
                             }
                             self.stack.push(value);
@@ -964,8 +1090,70 @@ impl Vm {
                             chunk = self.push_frame(closure, receiver_at)?;
                             ip = 0;
                             base = receiver_at;
+                            module = self.module_of(closure);
                         }
                     }
+                }
+                Op::ImportModule => {
+                    let index = chunk.read_short(ip) as usize;
+                    ip += 2;
+                    let name = self.to_string(chunk.constants[index]);
+
+                    match self.load_module(&name) {
+                        Ok((_, None)) => {
+                            // Already loaded: its body must not run twice.
+                            self.stack.push(Value::NULL);
+                        }
+                        Ok((_, Some(closure))) => {
+                            // Run the module body as an ordinary call. Its
+                            // return value lands where this instruction's
+                            // result would have, so nothing special is needed
+                            // on the way back.
+                            if let Some(frame) = self.frames.last_mut() {
+                                frame.ip = ip;
+                            }
+                            let base = self.stack.len();
+                            self.stack.push(Value::NULL);
+                            chunk = self.push_frame(closure, base)?;
+                            ip = 0;
+                            module = self.module_of(closure);
+                            continue;
+                        }
+                        Err(error) => match self.deliver_error(error, ip)? {
+                            Some((next_chunk, next_ip, next_base)) => {
+                                chunk = next_chunk;
+                                ip = next_ip;
+                                base = next_base;
+                                module = self.current_module();
+                                continue;
+                            }
+                            None => unreachable!("deliver_error returns or switches"),
+                        },
+                    }
+                }
+                Op::ImportVariable => {
+                    let module_name = chunk.read_short(ip) as usize;
+                    let variable_name = chunk.read_short(ip + 2) as usize;
+                    ip += 4;
+
+                    let module_name = self.to_string(chunk.constants[module_name]);
+                    let variable = self.to_string(chunk.constants[variable_name]);
+
+                    let Some(from) = self.module_index.get(&module_name).copied() else {
+                        return Err(RuntimeError {
+                            message: format!("Could not load module '{module_name}'."),
+                            line,
+                        });
+                    };
+                    let Some(value) = self.modules[from].get(&variable) else {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "Could not find a variable named '{variable}' in module '{module_name}'."
+                            ),
+                            line,
+                        });
+                    };
+                    self.stack.push(value);
                 }
                 Op::Return | Op::End => {
                     let result = if op == Op::End {
@@ -1002,6 +1190,7 @@ impl Vm {
                             ip = frame.ip;
                             base = frame.base;
                             chunk = self.chunk_of(frame.closure)?;
+                            module = self.module_of(frame.closure);
                             continue;
                         }
                         if let Some(id) = self.current_fiber {
@@ -1013,11 +1202,11 @@ impl Vm {
                     }
 
                     self.stack.push(result);
-                    let frame = self.frames.last().unwrap();
+                    let frame = *self.frames.last().unwrap();
                     ip = frame.ip;
                     base = frame.base;
-                    let closure = frame.closure;
-                    chunk = self.chunk_of(closure)?;
+                    chunk = self.chunk_of(frame.closure)?;
+                    module = self.module_of(frame.closure);
                 }
                 Op::Jump => {
                     let offset = chunk.read_short(ip) as usize;

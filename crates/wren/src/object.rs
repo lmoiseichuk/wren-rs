@@ -529,6 +529,10 @@ pub struct ObjFn {
     /// Where a `super` call in this body starts looking. Set at bind time,
     /// alongside [`ObjFn::field_offset`], for the same reason.
     pub super_class: Option<ObjectId>,
+    /// Which module's variables this function's `LoadModuleVar` indices refer
+    /// to. A function compiled in one module keeps resolving against that
+    /// module wherever it is later called from.
+    pub module: usize,
 }
 
 /// A function together with the variables it captured.

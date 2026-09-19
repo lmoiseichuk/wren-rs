@@ -12,9 +12,9 @@ paragraph of the spec rather than at a vague gap.
 | | |
 |---|---|
 | probes | 96 |
-| **works** | **88** |
+| **works** | **89** |
 | differs | 3 |
-| missing | 5 |
+| missing | 4 |
 
 ## By chapter
 
@@ -27,7 +27,7 @@ paragraph of the spec rather than at a vague gap.
 | [Method calls](#method-calls) | 8 | 0 | 0 |
 | [Control flow](#control-flow) | 11 | 0 | 0 |
 | [Variables](#variables) | 5 | 0 | 0 |
-| [Classes](#classes) | 13 | 0 | 2 |
+| [Classes](#classes) | 14 | 0 | 1 |
 | [Functions](#functions) | 7 | 0 | 0 |
 | [Concurrency](#concurrency) | 4 | 1 | 0 |
 | [Error handling](#error-handling) | 4 | 0 | 0 |
@@ -146,7 +146,7 @@ paragraph of the spec rather than at a vague gap.
 | Static members | works |  |
 | Static fields | **missing** | Expected expression. |
 | Inheritance | works |  |
-| super | **missing** | B does not implement 'v()'. |
+| super | works |  |
 | is operator | works |  |
 | type getter | works |  |
 
@@ -185,7 +185,7 @@ paragraph of the spec rather than at a vague gap.
 
 | feature | status | note |
 |---|---|---|
-| Importing | **missing** | Expected expression. |
-| Import with rename | **missing** | Expected expression. |
-| meta module | **missing** | Expected expression. |
+| Importing | **missing** | Could not load module 'random'. |
+| Import with rename | **missing** | Could not load module 'random'. |
+| meta module | **missing** | Could not load module 'meta'. |
 

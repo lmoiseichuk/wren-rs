@@ -181,7 +181,12 @@ struct Variable {
 /// Compile `source` into a chunk that [`Vm::run`](crate::vm::Vm::run) can
 /// execute.
 pub fn compile(vm: &mut Vm, source: &str) -> Result<Chunk, CompileError> {
-    let mut compiler = Compiler::new(vm, source);
+    compile_in(vm, source, 0)
+}
+
+/// Compile into a particular module's namespace.
+pub fn compile_in(vm: &mut Vm, source: &str, module: usize) -> Result<Chunk, CompileError> {
+    let mut compiler = Compiler::new(vm, source, module);
     compiler.advance()?;
     compiler.skip_newlines()?;
 
@@ -215,25 +220,32 @@ struct Compiler<'a> {
     method_depth: usize,
     /// Parameter names parsed by the signature, waiting for the body's scope.
     pending_parameters: Vec<String>,
+    /// Which module's namespace `var` at the top level writes into.
+    ///
+    /// Passed in rather than assumed to be zero, because compiling an imported
+    /// file has to put its variables in *its* module -- that is what makes two
+    /// files able to define the same name without colliding.
+    module: usize,
 }
 
 impl<'a> Compiler<'a> {
-    fn new(vm: &'a mut Vm, source: &'a str) -> Compiler<'a> {
+    fn new(vm: &'a mut Vm, source: &'a str, module: usize) -> Compiler<'a> {
         let placeholder = Token { kind: TokenKind::Eof, start: 0, end: 0, line: 1 };
-        let mut module = FnState::new("(module)".to_string(), "", false);
+        let mut body = FnState::new("(module)".to_string(), "", false);
         // **Module level is scope -1**, where a `var` becomes a module variable
         // rather than a stack slot. Upstream uses the same sentinel.
-        module.scope_depth = -1;
+        body.scope_depth = -1;
         Compiler {
             vm,
             source,
             lexer: Lexer::new(source),
             previous: placeholder,
             current: placeholder,
-            states: alloc::vec![module],
+            states: alloc::vec![body],
             classes: Vec::new(),
             method_depth: 0,
             pending_parameters: Vec::new(),
+            module,
         }
     }
 
@@ -428,7 +440,9 @@ impl<'a> Compiler<'a> {
     // --- declarations and statements ----------------------------------------
 
     fn declaration(&mut self) -> Result<(), CompileError> {
-        if self.match_token(TokenKind::Class)? {
+        if self.match_token(TokenKind::Import)? {
+            self.import_statement()?;
+        } else if self.match_token(TokenKind::Class)? {
             self.class_definition()?;
         } else if self.match_token(TokenKind::Var)? {
             self.var_declaration()?;
@@ -440,6 +454,62 @@ impl<'a> Compiler<'a> {
         // a one-line `if`, because `else` would come where the newline was
         // expected. Upstream splits it the same way for the same reason.
         self.consume_line("Expect newline after statement.")
+    }
+
+    /// `import "name"` and `import "name" for A, B as C`
+    ///
+    /// The bare form runs the module for its side effects. The `for` form also
+    /// binds names out of it, each becoming a variable in *this* module -- a
+    /// copy of the value, not a link, which is why reassigning an imported
+    /// variable does not affect the module it came from.
+    fn import_statement(&mut self) -> Result<(), CompileError> {
+        self.consume(TokenKind::String, "Expect a string after 'import'.")?;
+        let path = unescape(self.previous.text(self.source));
+        let line = self.line();
+
+        let path_value = self.vm.new_string(&path);
+        let Some(path_constant) = self.chunk_mut().add_constant(path_value) else {
+            return Err(self.error_at(self.previous, "A function may only contain 65536 unique constants."));
+        };
+
+        self.chunk_mut().emit_op(Op::ImportModule, line);
+        self.chunk_mut().emit_short(path_constant, line);
+        // The module body's result is of no interest; only its variables are.
+        self.chunk_mut().emit_op(Op::Pop, line);
+
+        if !self.match_token(TokenKind::For)? {
+            return Ok(());
+        }
+
+        loop {
+            self.skip_newlines()?;
+            self.consume(TokenKind::Name, "Expect variable name after 'for'.")?;
+            let imported = self.previous.text(self.source).to_string();
+
+            // `as` renames it on the way in, so two modules exporting the same
+            // name can both be used.
+            let local = if self.match_token(TokenKind::As)? {
+                self.consume(TokenKind::Name, "Expect variable name after 'as'.")?;
+                self.previous.text(self.source).to_string()
+            } else {
+                imported.clone()
+            };
+
+            let name_value = self.vm.new_string(&imported);
+            let Some(name_constant) = self.chunk_mut().add_constant(name_value) else {
+                return Err(self.error_at(self.previous, "A function may only contain 65536 unique constants."));
+            };
+            self.chunk_mut().emit_op(Op::ImportVariable, line);
+            self.chunk_mut().emit_short(path_constant, line);
+            self.chunk_mut().emit_short(name_constant, line);
+
+            self.define_variable(&local, line)?;
+
+            if !self.match_token(TokenKind::Comma)? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn var_declaration(&mut self) -> Result<(), CompileError> {
@@ -456,7 +526,7 @@ impl<'a> Compiler<'a> {
 
         if self.state().scope_depth < 0 {
             // Module level: the variable lives in the module, not on the stack.
-            let index = self.vm.module.define(&name, Value::NULL);
+            let index = self.vm.modules[self.module].define(&name, Value::NULL);
             self.chunk_mut().emit_op(Op::StoreModuleVar, line);
             self.chunk_mut().emit_short(index as u16, line);
             self.chunk_mut().emit_op(Op::Pop, line);
@@ -935,7 +1005,7 @@ impl<'a> Compiler<'a> {
                 self.chunk_mut().emit_byte(slot as u8, line);
                 return Ok(());
             }
-            if self.vm.module.names.find(&name).is_none() && self.is_this_call(&name) {
+            if self.vm.modules[self.module].names.find(&name).is_none() && self.is_this_call(&name) {
                 // Rewind: this is `name = value` on the receiver, a setter.
                 return self.named_call(&name, true, line);
             }
@@ -947,7 +1017,7 @@ impl<'a> Compiler<'a> {
 
         if self.resolve_local(&name).is_none()
             && self.resolve_upvalue(&name, self.states.len() - 1).is_none()
-            && self.vm.module.names.find(&name).is_none()
+            && self.vm.modules[self.module].names.find(&name).is_none()
             && self.is_this_call(&name)
         {
             return self.named_call(&name, can_assign, line);
@@ -989,14 +1059,14 @@ impl<'a> Compiler<'a> {
     /// it is upstream's rule: a lowercase name is an error on the spot, an
     /// uppercase one is a forward reference.
     fn module_variable(&mut self, name: &str) -> Result<usize, CompileError> {
-        if let Some(index) = self.vm.module.names.find(name) {
+        if let Some(index) = self.vm.modules[self.module].names.find(name) {
             return Ok(index);
         }
         let capitalised = name.chars().next().is_some_and(|first| first.is_uppercase());
         if !capitalised {
             return Err(self.error_at(self.previous, "Variable is not defined."));
         }
-        Ok(self.vm.module.define(name, Value::NULL))
+        Ok(self.vm.modules[self.module].define(name, Value::NULL))
     }
 
     /// A bare name inside a class body is a call on `this`.
@@ -1178,7 +1248,7 @@ impl<'a> Compiler<'a> {
     /// returns the list so it stays on the stack between elements.
     fn list_literal(&mut self) -> Result<(), CompileError> {
         let line = self.line();
-        let Some(index) = self.vm.module.names.find("List") else {
+        let Some(index) = self.vm.modules[self.module].names.find("List") else {
             return Err(self.error_at(self.previous, "List class is not defined."));
         };
         self.chunk_mut().emit_op(Op::LoadModuleVar, line);
@@ -1263,6 +1333,7 @@ impl<'a> Compiler<'a> {
             name: state.name,
             field_offset: 0,
             super_class: None,
+            module: self.module,
         })));
 
         let Some(index) = self.chunk_mut().add_constant(Value::object(function)) else {
@@ -1417,7 +1488,7 @@ impl<'a> Compiler<'a> {
     /// Declare a variable for something just pushed onto the stack.
     fn define_variable(&mut self, name: &str, line: u16) -> Result<Variable, CompileError> {
         if self.state().scope_depth < 0 {
-            let index = self.vm.module.define(name, Value::NULL);
+            let index = self.vm.modules[self.module].define(name, Value::NULL);
             self.chunk_mut().emit_op(Op::StoreModuleVar, line);
             self.chunk_mut().emit_short(index as u16, line);
             self.chunk_mut().emit_op(Op::Pop, line);

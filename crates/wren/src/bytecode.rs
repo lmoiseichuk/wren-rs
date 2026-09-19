@@ -122,6 +122,23 @@ pub enum Op {
     /// constructor body, then a return.
     Construct = 28,
 
+    /// Load and run the module named by `constants[operand]`, leaving its
+    /// result. Operand: `u16`.
+    ///
+    /// A module already loaded is not run again -- that is what makes two
+    /// files importing the same third one share it rather than each get their
+    /// own copy of its variables.
+    ImportModule = 30,
+    /// Push a variable out of an already-imported module. Operands: `u16` for
+    /// the module name, then `u16` for the variable name.
+    ///
+    /// **The module name is repeated rather than remembered from the preceding
+    /// `ImportModule`.** A module body may itself import, which would overwrite
+    /// any "last imported" state before the outer import got to read its
+    /// variables. Naming it twice costs two bytes and removes the ordering
+    /// hazard entirely.
+    ImportVariable = 31,
+
     /// Invoke a method on `this`, looking it up from the superclass of the
     /// class this method was bound to. Operands: arity `u8`, symbol `u16`.
     ///
@@ -172,6 +189,8 @@ impl Op {
             27 => Op::StoreField,
             28 => Op::Construct,
             29 => Op::Super,
+            30 => Op::ImportModule,
+            31 => Op::ImportVariable,
             _ => return None,
         };
         Some(op)
@@ -336,7 +355,7 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
         let mut operand = alloc::string::String::new();
         match op {
             Op::Constant | Op::LoadModuleVar | Op::StoreModuleVar | Op::MethodInstance
-            | Op::MethodStatic => {
+            | Op::MethodStatic | Op::ImportModule => {
                 let _ = write!(operand, " {}", chunk.read_short(offset));
                 offset += 2;
             }
@@ -355,6 +374,10 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                 let target = offset + 2 - chunk.read_short(offset) as usize;
                 let _ = write!(operand, " -> {target:04}");
                 offset += 2;
+            }
+            Op::ImportVariable => {
+                let _ = write!(operand, " {} {}", chunk.read_short(offset), chunk.read_short(offset + 2));
+                offset += 4;
             }
             Op::Call | Op::Super => {
                 let _ = write!(
