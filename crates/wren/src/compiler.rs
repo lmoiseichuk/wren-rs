@@ -1277,24 +1277,40 @@ impl<'a> Compiler<'a> {
         let line = self.line();
 
         if can_assign && self.check(TokenKind::Eq) {
+            // **Where the assignment goes is decided before the value is
+            // parsed**, because a setter call needs the receiver pushed
+            // *under* its argument. Parsing the value first and then
+            // discovering it was a setter leaves the value on the stack with
+            // nowhere to put a receiver -- which emitted a getter call and
+            // reported the setter as missing.
+            let local = self.resolve_local(&name);
+            let upvalue = if local.is_none() {
+                self.resolve_upvalue(&name, self.states.len() - 1)
+            } else {
+                None
+            };
+            let setter = local.is_none() && upvalue.is_none() && self.is_this_call(&name);
+
+            if setter {
+                self.load_named("this", line)?;
+            }
+
             self.advance()?;
             self.skip_newlines()?;
             self.expression()?;
 
-            if let Some(slot) = self.resolve_local(&name) {
+            if let Some(slot) = local {
                 self.chunk_mut().emit_op(Op::StoreLocal, line);
                 self.chunk_mut().emit_byte(slot as u8, line);
                 return Ok(());
             }
-            if let Some(slot) = self.resolve_upvalue(&name, self.states.len() - 1) {
+            if let Some(slot) = upvalue {
                 self.chunk_mut().emit_op(Op::StoreUpvalue, line);
                 self.chunk_mut().emit_byte(slot as u8, line);
                 return Ok(());
             }
-            if self.is_this_call(&name) {
-                // `name = value` on the receiver: a setter, for the same
-                // reason and in the same order as the load above.
-                return self.named_call(&name, true, line);
+            if setter {
+                return self.emit_call(&format!("{name}=(_)"), 1, line);
             }
             let index = self.module_variable(&name)?;
             self.chunk_mut().emit_op(Op::StoreModuleVar, line);

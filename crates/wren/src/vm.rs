@@ -1202,9 +1202,15 @@ impl Vm {
                 Op::StoreField => {
                     let index = chunk.code[ip] as usize;
                     ip += 1;
+                    // **The value is on top, the receiver below it.** The
+                    // compiler pushes `this` first and then evaluates the
+                    // right-hand side, so popping the receiver first took the
+                    // value and stored the instance into itself. Assignment is
+                    // an expression, so the value is what stays.
+                    let value = self.stack.pop().unwrap_or(Value::NULL);
                     let receiver = self.stack.pop().unwrap_or(Value::NULL);
-                    let value = *self.stack.last().unwrap();
                     self.set_field(receiver, base, index, value)?;
+                    self.stack.push(value);
                 }
                 Op::Construct => {
                     let class = self.stack[base];
