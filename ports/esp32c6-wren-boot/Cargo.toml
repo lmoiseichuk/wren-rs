@@ -1,0 +1,55 @@
+# A node that looks for `boot` and `main` at start-up, built two ways.
+#
+# **One package, two images, one source file.** The question this port answers
+# is what shipping precompiled bytecode costs and saves against compiling on
+# the device, and the only honest way to ask it is to change exactly one thing.
+# So the difference between the two builds is a single cargo feature:
+#
+#     cargo build --profile size                      # boot.wrenc + main.wrenc
+#     cargo build --profile size --features compiler  # boot.wren  + main.wren
+#
+# Same heap, same start-up, same reporting, same `main.rs`. Separate packages
+# would have let the two drift apart in a dozen small ways that each look like
+# nothing and together make the comparison meaningless.
+[package]
+name = "esp32c6-wren-boot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Its own workspace: a bare-metal firmware with its own target and profiles has
+# no business in the library's `cargo test`.
+[workspace]
+
+[features]
+# **Bytecode is the default**, because it is the configuration this port exists
+# to show. Turning `compiler` on links the lexer and the parser and switches
+# the embedded programs from `.wrenc` to `.wren`.
+default = []
+compiler = ["wren/compiler"]
+
+[dependencies]
+wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "libm"] }
+esp-hal = { version = "1.2", features = ["esp32c6", "unstable"] }
+esp-alloc = { version = "0.11", features = ["esp32c6"] }
+esp-println = { version = "0.16", features = ["esp32c6"] }
+esp-backtrace = { version = "0.18", features = ["esp32c6", "panic-handler", "println"] }
+
+# The two profiles the rest of this project publishes numbers for. `-Os` and
+# `-O2` are what the C port was measured at; these are the nearest equivalents.
+[profile.size]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.speed]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

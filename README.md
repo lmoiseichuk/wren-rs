@@ -88,12 +88,15 @@ one first.
 crates/wren/    the Rust VM -- the crate a firmware depends on
 vendor/wren/    upstream wren-lang/wren, submodule, unmodified
 benchmarks/     the same programs in both languages, same constants
+programs/       boot.wren and main.wren, and the bytecode built from them
 doc/wren/       what upstream Wren and MicroPython measured
 doc/wren-rs/    why the Rust implementation is built the way it is
 ports/          one directory per (board, implementation) pair
   esp32c6-wren/          step 1, the C reference
   esp32c6-micropython/   step 2, the baseline
   esp32c6-wren-rs/       step 3, the deliverable
+  esp32c6-wrenc-rs/      step 4, the same benchmarks with no compiler linked
+  esp32c6-wren-boot/     step 4, a node that looks for boot and main
 ```
 
 **`crates/wren` is a standalone package**, and the workspace root carries no
@@ -115,6 +118,8 @@ one has to provide.
 | — upstream's test suite | **829 of 829** |
 | — conformance probes | **96 of 96** |
 | — this crate's own tests | 193 |
+| **step 4 — bytecode** | **done, measured** |
+| — the suite, run from `.wrenc` | **829 of 829** |
 
 ### Step 3: the language is complete
 
@@ -208,6 +213,76 @@ of instances is exactly the workload that pays for it.
 
 Nothing here is tuned. It is the first run on hardware, published because a
 result that contradicts the design is worth more than a flattering one.
+
+### Step 4 measured: shipping bytecode
+
+`.wren` is compiled on a workstation to `.wrenc` and the device is handed that,
+so the lexer and the parser are never linked. The format carries a SHA-256 of
+the source it came from, which is what makes bytecode-in-the-tree checkable
+rather than a blob nobody can trace:
+
+```sh
+tools/build-bytecode.sh           # rebuild every .wrenc
+tools/build-bytecode.sh --check   # verify each against its source
+```
+
+**The suite passes 829 of 829 through the bytecode round-trip as well** — every
+test compiled, written, re-loaded into a fresh VM and run. That is the claim
+that matters before any number below: the two paths produce the same program.
+
+**Speed, source against bytecode** — the same four programs, same board, same
+profiles. The only difference is whether the device compiled them:
+
+| benchmark | `speed` source | `speed` bytecode | `size` source | `size` bytecode |
+|---|---|---|---|---|
+| `binary_trees` depth 9 | 8.616 | 8.366 | 17.087 | 15.025 |
+| `fib(24)` x5 | 18.176 | 18.064 | 34.921 | 34.686 |
+| `list_build` 10,000 | 0.574 | 0.568 | 1.028 | 1.017 |
+| `method_call` | 2.766 | 2.750 | 4.810 | 4.782 |
+
+These are the *same bytecode* executing either way, so the small spread is
+instruction-cache layout, not a property of the strategy. Loading a benchmark
+took 686–1,886 µs.
+
+**Footprint** — what the compiler was worth:
+
+| | `size` | `speed` |
+|---|---|---|
+| benchmarks, compiler linked | 273,376 B | 428,144 B |
+| benchmarks, no compiler | **239,184 B** | **349,680 B** |
+| **the compiler** | **34,192 B** | **78,464 B** |
+
+#### A node, not a harness
+
+`ports/esp32c6-wren-boot` is the shape a device would actually take: at
+start-up it looks for a program called `boot`, runs it, then looks for `main`
+and runs that — MicroPython's convention, and a missing name is skipped rather
+than faulted. It is **one package built twice**, so the only difference between
+the two images is whether `wren/compiler` is on.
+
+| | `-Os` bytecode | `-Os` compiler | `-O3` bytecode | `-O3` compiler |
+|---|---|---|---|---|
+| image | **239,728 B** | 274,160 B | **352,544 B** | 431,744 B |
+| prepare, both files | **9,674 µs** | 66,158 µs | **6,297 µs** | 54,747 µs |
+| run, both files | 3,281,147 µs | 3,294,957 µs | 2,018,227 µs | 1,971,631 µs |
+| reset to idle | **3,308,789 µs** | 3,379,348 µs | 2,038,688 µs | 2,040,777 µs |
+| heap left | **170,820 B** | 160,332 B | **170,820 B** | 160,332 B |
+
+**The image is where it wins**: 34,432 B at `-Os`. Of that, 3,393 B is the
+programs being smaller as bytecode than as source and **31,039 B is the lexer
+and the parser**.
+
+**Preparation is 6.8–8.7x faster and here it barely matters** — 9.7 ms against
+66.2 ms, against programs that then run for two seconds. It becomes the
+dominant number on the duty cycle these parts are actually bought for: a node
+that wakes, samples and sleeps pays prepare on every wake.
+
+**What bytecode costs is everything a compiler would have allowed.** No REPL,
+no `eval`, no accepting a program that arrives over the air as text. 31 KB is
+what that is worth.
+
+Details, and the programs themselves:
+**[`ports/esp32c6-wren-boot/README.md`](ports/esp32c6-wren-boot/README.md)**.
 
 ### Steps 1 and 2: the numbers to beat
 

@@ -1,0 +1,18 @@
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --monitor"
+# **esp-hal supplies the memory map.** `linkall.x` is the script that places
+# the vectors, the text and the data regions for the chip; without it the
+# link fails on the symbols the runtime expects the map to define.
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    # **The app descriptor is referenced by nothing**, so `--gc-sections`
+    # drops it and the flashing tool then refuses the image for not having
+    # one. Naming it as an undefined symbol keeps it.
+    "-C", "link-arg=--undefined=esp_app_desc",
+]
+
+[env]
+ESP_LOG = "info"
