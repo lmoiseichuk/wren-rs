@@ -1799,6 +1799,15 @@ impl Vm {
             Some(self.class_class),
         ))));
 
+        // 255 fields, inherited ones included: a field index is a byte in the
+        // bytecode, so this is the representation's limit rather than a policy.
+        if inherited + declared > 255 {
+            let child = self.to_string(name);
+            return Err(RuntimeError::new(format!(
+                "Class '{child}' may not have more than 255 fields, including inherited ones."
+            )));
+        }
+
         let mut class = ObjClass::new(name_id, Some(superclass_id));
         class.num_fields = (inherited + declared) as i32;
         class.metaclass = Some(metaclass);

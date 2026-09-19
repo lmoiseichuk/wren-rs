@@ -231,6 +231,19 @@ pub fn compile_in(vm: &mut Vm, source: &str, module: usize) -> Result<Chunk, Com
         compiler.skip_newlines()?;
     }
 
+    // Every forward reference must have been made good by now.
+    for (name, line) in core::mem::take(&mut compiler.implicit) {
+        if compiler.vm.modules[module].names.find(&name).is_some()
+            && compiler.defined.contains(&name)
+        {
+            continue;
+        }
+        return Err(CompileError {
+            message: "Variable is used but not defined.".to_string(),
+            line,
+        });
+    }
+
     let line = clamp_line(compiler.current.line);
     compiler.chunk_mut().emit_op(Op::End, line);
     Ok(compiler.states.pop().expect("the module's own state").chunk)
@@ -263,6 +276,18 @@ struct Compiler<'a> {
     /// Only `#!` attributes land here: a plain `#` is parsed and discarded, so
     /// it costs a running program nothing.
     pending_attributes: Vec<Attribute>,
+    /// Module variables this compilation actually defined, against which the
+    /// forward references are checked.
+    defined: Vec<String>,
+    /// Module variables referenced before being defined, with the line of the
+    /// first reference.
+    ///
+    /// **A capitalised name that is not defined yet is assumed to be a class
+    /// defined later**, which is what lets two classes refer to each other.
+    /// The assumption has to be checked when there is no more source to define
+    /// it in -- otherwise a misspelled class name is a null at run time
+    /// instead of an error at compile time.
+    implicit: Vec<(String, u16)>,
     /// How many attributes have been seen since the last class or method,
     /// counted separately from the ones kept.
     ///
@@ -299,6 +324,8 @@ impl<'a> Compiler<'a> {
             pending_parameters: Vec::new(),
             pending_attributes: Vec::new(),
             attributes_seen: 0,
+            implicit: Vec::new(),
+            defined: Vec::new(),
             module,
         }
     }
@@ -748,6 +775,7 @@ impl<'a> Compiler<'a> {
     fn var_declaration(&mut self) -> Result<(), CompileError> {
         self.consume(TokenKind::Name, "Expect variable name.")?;
         let name = self.previous.text(self.source).to_string();
+        self.check_name(&name)?;
         let line = self.line();
 
         if self.match_token(TokenKind::Eq)? {
@@ -759,6 +787,7 @@ impl<'a> Compiler<'a> {
 
         if self.state().scope_depth < 0 {
             // Module level: the variable lives in the module, not on the stack.
+            self.defined.push(name.clone());
             let index = self.vm.modules[self.module].define(&name, Value::NULL);
             self.chunk_mut().emit_op(Op::StoreModuleVar, line);
             self.chunk_mut().emit_short(index as u16, line);
@@ -1048,6 +1077,14 @@ impl<'a> Compiler<'a> {
                 let value = token
                     .number(self.source)
                     .ok_or_else(|| self.error_at(token, "Invalid number literal."))?;
+                // **A literal that overflows to infinity is an error.** Wren
+                // has infinities and a program may compute one, but writing
+                // one as a digit string is a mistake rather than a way to
+                // spell it -- and silently turning 10^200 digits into
+                // `infinity` hides the mistake.
+                if value.is_infinite() {
+                    return Err(self.error_at(token, "Number literal is too large."));
+                }
                 self.emit_constant(Value::num(value), line)
             }
             TokenKind::String => {
@@ -1366,6 +1403,7 @@ impl<'a> Compiler<'a> {
     /// it is upstream's rule: a lowercase name is an error on the spot, an
     /// uppercase one is a forward reference.
     fn module_variable(&mut self, name: &str) -> Result<usize, CompileError> {
+        self.check_name(name)?;
         if let Some(index) = self.vm.modules[self.module].names.find(name) {
             return Ok(index);
         }
@@ -1373,6 +1411,7 @@ impl<'a> Compiler<'a> {
         if !capitalised {
             return Err(self.error_at(self.previous, "Variable is not defined."));
         }
+        self.implicit.push((name.to_string(), clamp_line(self.previous.line)));
         Ok(self.vm.modules[self.module].define(name, Value::NULL))
     }
 
@@ -1646,10 +1685,15 @@ impl<'a> Compiler<'a> {
                 }
                 self.expression()?;
                 self.emit_call("addCore(_)", 1, line)?;
-                self.skip_newlines()?;
+                // **No newline before the comma.** Wren allows one after a
+                // comma, so a list can be broken across lines with the commas
+                // trailing -- but a newline *before* one ends the expression,
+                // and accepting it would make a missing bracket parse as
+                // something else entirely.
                 if !self.match_token(TokenKind::Comma)? {
                     break;
                 }
+                self.skip_newlines()?;
             }
         }
         self.skip_newlines()?;
@@ -1830,6 +1874,12 @@ impl<'a> Compiler<'a> {
                 let name = self.previous.text(self.source).to_string();
                 self.add_local(&name)?;
                 self.state_mut().arity += 1;
+                if self.state().arity > MAX_PARAMETERS {
+                    return Err(self.error_at(
+                        self.current,
+                        &format!("Cannot have more than {MAX_PARAMETERS} parameters."),
+                    ));
+                }
                 if !self.match_token(TokenKind::Comma)? {
                     break;
                 }
@@ -1932,7 +1982,9 @@ impl<'a> Compiler<'a> {
 
     /// Declare a variable for something just pushed onto the stack.
     fn define_variable(&mut self, name: &str, line: u16) -> Result<Variable, CompileError> {
+        self.check_name(name)?;
         if self.state().scope_depth < 0 {
+            self.defined.push(name.to_string());
             let index = self.vm.modules[self.module].define(name, Value::NULL);
             self.chunk_mut().emit_op(Op::StoreModuleVar, line);
             self.chunk_mut().emit_short(index as u16, line);
@@ -1961,6 +2013,17 @@ impl<'a> Compiler<'a> {
 
         let (full, arity) = self.method_signature()?;
         let line = self.line();
+
+        // The name a method is *declared* with, as well as one it is called
+        // with. `emit_call` covers the call site; this covers the definition,
+        // which is where a too-long name is actually written.
+        let bare = full.split(['(', '=', '[']).next().unwrap_or(&full);
+        if bare.len() > MAX_NAME {
+            return Err(self.error_at(
+                self.previous,
+                &format!("Method names cannot be longer than {MAX_NAME} characters."),
+            ));
+        }
 
         // **A constructor is a named method taking parentheses.** It cannot be
         // an operator, a getter, a setter or a subscript, because every one of
