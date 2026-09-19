@@ -1668,3 +1668,36 @@ fn stripped_bytecode_runs_the_same_and_reports_no_line() {
     assert_eq!(kept_line, 4, "with the table, the error knows its line");
     assert_eq!(stripped_line, 0, "without it, there is no line to report");
 }
+
+/// **Capturing an upvalue is its own instruction now**, emitted after the
+/// `Closure` it belongs to rather than carried as payload inside it -- see
+/// `Op::CaptureLocal`. These pin both halves: that capture still works, and
+/// that it survives a round trip through the `.wrenc` format, whose walker
+/// has to agree with the compiler about how long an instruction is.
+#[test]
+fn a_closure_captures_through_a_bytecode_round_trip() {
+    let source = "var make = Fn.new { |n|\n  return Fn.new { n * 2 }\n}\nSystem.print(make.call(21).call())\n";
+
+    let mut direct = Vm::new();
+    direct.interpret(source).expect("it runs");
+    assert_eq!(direct.output_str().trim(), "42", "run straight from source");
+
+    let mut vm = Vm::new();
+    let chunk = wren::compiler::compile(&mut vm, source).expect("it compiles");
+    let bytes = wren::wrenc::write(&vm, &chunk, source.as_bytes()).expect("it serialises");
+
+    let mut loaded_vm = Vm::new();
+    let loaded = wren::wrenc::load(&mut loaded_vm, &bytes).expect("it loads");
+    loaded_vm.run_closure(loaded.closure).expect("it runs");
+    assert_eq!(loaded_vm.output_str().trim(), "42", "run from bytecode");
+}
+
+#[test]
+fn several_upvalues_are_captured_in_order() {
+    let mut vm = Vm::new();
+    vm.interpret(
+        "var make = Fn.new { |a, b, c|\n  return Fn.new { a + b * c }\n}\nSystem.print(make.call(1, 2, 3).call())\n",
+    )
+    .expect("it runs");
+    assert_eq!(vm.output_str().trim(), "7");
+}

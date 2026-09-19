@@ -641,6 +641,66 @@ had already outlined them. The cheap error paths were worth 2,800 bytes and
 
 ---
 
+## A fixed-length instruction set, built and refused
+
+`Closure` is the only variable-length instruction: an opcode, a `u16`
+constant, a `u8` count, and then two bytes per upvalue. That makes it a special
+case in every walker over the code -- the disassembler, the file writer, the
+jump-target scan, the peephole pass -- and puts a loop inside the dispatch
+arm.
+
+There is no rule that one construct compiles to one instruction, so it was
+split: a fixed four-byte `Closure` followed by one fixed two-byte capture
+instruction per upvalue, each appending to the closure on top of the stack.
+Every instruction in the set then has a length known from its opcode alone.
+
+It works -- 829/829, and upvalues survive a `.wrenc` round trip -- and it is
+slower, in two independent encodings:
+
+| | `binary_trees` | `fib` | `method_call` |
+|---|---|---|---|
+| two opcodes (`CaptureLocal`, `CaptureUpvalue`) | +0.27% | +0.79% | +0.62% |
+| one opcode, local flagged in the operand's top bit | +0.23% | +0.79% | +0.56% |
+
+Time moved further: `method_call` 1.949 s to 2.005 and 2.012, `fib` 13.454 to
+14.008 and 14.102.
+
+**The cost is not in executing the new instructions.** `fib` runs `Closure`
+about twice in a whole benchmark, and its work went up by 6,374,871
+instructions against 6.38 million bytecode instructions executed -- almost
+exactly one extra machine instruction per dispatch. Adding an arm to a
+forty-arm match perturbed how the optimiser compiles the whole loop, and every
+instruction that is *not* a capture paid for it. `run_frames` grew from 17,698
+bytes to 18,020 and 18,152.
+
+*The rule this hands forward: an opcode is not free even when it never runs.*
+Fusing pairs was worth it because it removed a sixth of all dispatches, which
+paid for the five opcodes it added many times over. Splitting one rare
+instruction into two adds the same kind of cost with nothing to set against it.
+
+**What it would have bought was real but not measurable**: `instruction_len`
+becomes a pure table, and four walkers lose a special case. That is worth
+having when it is free, and it is not free here.
+
+### What a uniform width would cost
+
+Measured statically over the compiled benchmarks -- `op-profile` reports it --
+three quarters of all instructions are three bytes or more, so a uniform two
+bytes cannot hold a `Call` and the realistic scheme is two widths:
+
+| | `binary_trees` | `method_call` | `fib` |
+|---|---|---|---|
+| as compiled | 659 B | 508 B | 183 B |
+| every instruction 4 bytes | +35% | +46% | +36% |
+| 2 bytes if it fits, else 4 | +19% | +24% | +19% |
+
+A fifth to a quarter more code, which on this VM is RAM, because programs are
+compiled on the device. Against that, the decoding it would simplify is not
+where the time goes: the operand-window experiment above found the optimiser
+had already merged the bounds checks a fixed layout would remove.
+
+---
+
 ## The protocol, as it now stands
 
 | the change is… | measure it by |
