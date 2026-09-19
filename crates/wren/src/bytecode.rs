@@ -303,10 +303,10 @@ mod opcode_bytes {
 impl Op {
     /// Decode a byte, or `None` if it is not an opcode.
     ///
-    /// **The numbering is not arbitrary**: opcodes are assigned in order of
-    /// instruction length, so that [`Chunk::instruction_len`] is a comparison
-    /// on the byte rather than a table. A new opcode belongs in the range for
-    /// its length.
+    /// **The numbering is in order of instruction length.** That no longer
+    /// decides anything -- [`Chunk::instruction_units`] reads the length out
+    /// of the instruction's own bits -- but it keeps related opcodes together
+    /// and costs nothing to preserve.
     ///
     /// A `match` rather than a transmute — which is what keeps this crate free
     /// of `unsafe`. The interpreter no longer calls it: `run_frames` matches
@@ -361,10 +361,65 @@ impl Op {
     }
 }
 
+/// The furthest a jump may reach, in units.
+///
+/// **Not what the operand could hold.** A `u16` of units reaches 65,535
+/// instructions, which is twice as far as upstream's 65,535 *bytes* -- and a
+/// program upstream rejects but this accepts is exactly the kind of difference
+/// this implementation exists not to have. Upstream's two limit tests,
+/// `jump_too_far` and `loop_too_far`, are built to sit just past its reach;
+/// with the wider one they compile, and `loop_too_far` then runs a loop it was
+/// never meant to run.
+///
+/// Half the operand's range is a little under upstream's reach in the worst
+/// case and a little over in the best, which is as close as two different
+/// encodings come.
+pub const MAX_JUMP: usize = u16::MAX as usize / 2;
+
+/// Which bits of an instruction's first unit hold what. See [`Chunk::code`].
+///
+/// Six bits of opcode is 64, against the 40 there are; two bits of length
+/// cover one, two and three units, and the fourth value is the escape for the
+/// one instruction whose length is not fixed.
+pub const OPCODE_MASK: u16 = 0x3f;
+/// Where the length field starts.
+pub const LENGTH_SHIFT: u16 = 6;
+/// Where the inline `u8` operand starts.
+pub const OPERAND_SHIFT: u16 = 8;
+/// The length field's escape value: the instruction is two units plus one per
+/// unit its inline operand counts. Only `Closure` uses it, for its upvalues,
+/// and Wren caps those at what a `u8` holds -- so 257 units at the very worst,
+/// against a `Closure` of two units when it captures nothing.
+pub const VARIABLE_LENGTH: u16 = 3;
+
 /// A compiled chunk of code: the instructions, and the constants they refer to.
 #[derive(Debug)]
 pub struct Chunk {
-    pub code: Vec<u8>,
+    /// The instructions, one 16-bit unit at a time.
+    ///
+    /// **A unit, not a byte.** The first unit of an instruction is
+    ///
+    /// | bits | |
+    /// |---|---|
+    /// | 0..5 | the opcode, so 64 of them |
+    /// | 6..7 | how many units the instruction is, less one |
+    /// | 8..15 | an inline `u8` operand, where it has one |
+    ///
+    /// and any further operands are whole units. A length of `3` in that
+    /// field means *variable*, which only `Closure` is: it holds the number of
+    /// upvalues in its inline byte and is two units plus one per upvalue.
+    ///
+    /// **What it buys is the operand read.** A `u16` operand used to be two
+    /// bounds-checked byte loads, a shift and an or; it is now one aligned
+    /// load. An instruction with a single `u8` operand -- `LoadLocal` and its
+    /// kind -- used to be two loads and is now one, because the operand rides
+    /// in the opcode's own unit.
+    ///
+    /// **What it costs is about a fifth of the code**, which on the four
+    /// benchmarks is 130 bytes or less: a one-byte instruction rounds up to a
+    /// unit, and a three-byte one to two units. Against a heap measured in
+    /// hundreds of kilobytes that is not a trade worth thinking about twice.
+    pub code: Vec<u16>,
     pub constants: Vec<Value>,
     /// Bit pattern of each constant to its index, so adding one is a lookup
     /// rather than a scan.
@@ -396,6 +451,13 @@ pub struct Chunk {
     /// from the interpreter's error paths alone -- so a binary search costs
     /// nothing that matters.
     pub lines: Vec<(u32, u16)>,
+    /// Where the instruction now being emitted starts, so that its length can
+    /// be written into it when the next one begins. See [`Chunk::close`].
+    building: Option<usize>,
+    /// Whether the instruction being emitted has already used the inline
+    /// operand slot in its first unit. A `0` there is a real operand value,
+    /// so the slot's emptiness cannot be read off the bits.
+    inline_taken: bool,
 }
 
 impl Chunk {
@@ -405,6 +467,8 @@ impl Chunk {
             constants: Vec::new(),
             lookup: BTreeMap::new(),
             lines: Vec::new(),
+            building: None,
+            inline_taken: false,
         }
     }
 
@@ -414,12 +478,14 @@ impl Chunk {
     /// index for reusing constants, and a loaded chunk will never have another
     /// added. Writing it to the file would cost bytes for a table nothing
     /// reads.
-    pub fn from_parts(code: Vec<u8>, constants: Vec<Value>, lines: Vec<(u32, u16)>) -> Chunk {
+    pub fn from_parts(code: Vec<u16>, constants: Vec<Value>, lines: Vec<(u32, u16)>) -> Chunk {
         let mut chunk = Chunk {
             code,
             constants,
             lookup: BTreeMap::new(),
             lines,
+            building: None,
+            inline_taken: false,
         };
         // **Fused on the way in, not only on the way out.** A `.wrenc` written
         // before the fused opcodes existed carries the pairs unfused, and a
@@ -430,16 +496,60 @@ impl Chunk {
         chunk
     }
 
+    /// Begin an instruction. Its length is written when the next one begins.
     pub fn emit_op(&mut self, op: Op, line: u16) {
-        self.emit_byte(op as u8, line);
-    }
-
-    pub fn emit_byte(&mut self, byte: u8, line: u16) {
+        self.close();
         match self.lines.last() {
             Some((_, last)) if *last == line => {}
             _ => self.lines.push((self.code.len() as u32, line)),
         }
-        self.code.push(byte);
+        self.building = Some(self.code.len());
+        self.code.push(op as u16);
+    }
+
+    /// Add a `u8` operand: into the opcode's own unit if that slot is still
+    /// free, otherwise into a unit of its own.
+    pub fn emit_byte(&mut self, byte: u8, line: u16) {
+        let _ = line;
+        match self.building {
+            Some(start) if self.code[start] >> OPERAND_SHIFT == 0 && !self.inline_taken => {
+                self.code[start] |= u16::from(byte) << OPERAND_SHIFT;
+                self.inline_taken = true;
+            }
+            _ => self.code.push(u16::from(byte)),
+        }
+    }
+
+    /// Add two `u8` operands sharing one unit.
+    ///
+    /// For `Closure`'s upvalue descriptors, which come in pairs and would
+    /// otherwise take a unit each.
+    pub fn emit_byte_pair(&mut self, low: u8, high: u8, line: u16) {
+        let _ = line;
+        self.code
+            .push(u16::from(low) | (u16::from(high) << OPERAND_SHIFT));
+    }
+
+    /// Finish the instruction being emitted by writing its length into it.
+    ///
+    /// **Lengths are known only in arrears.** An instruction is as long as
+    /// what was emitted into it, and that is known when the next one starts --
+    /// or when the chunk is finished.
+    fn close(&mut self) {
+        let Some(start) = self.building.take() else {
+            return;
+        };
+        self.inline_taken = false;
+        let units = self.code.len() - start;
+        // Three units is the longest fixed instruction, so a longer one can
+        // only be `Closure` and is marked variable.
+        let bits = match units {
+            0 | 1 => 0,
+            2 => 1,
+            3 => 2,
+            _ => VARIABLE_LENGTH,
+        };
+        self.code[start] |= bits << LENGTH_SHIFT;
     }
 
     /// Emit a big-endian `u16` operand.
@@ -447,8 +557,8 @@ impl Chunk {
     /// Big-endian because upstream is, and a disassembly that disagrees about
     /// byte order with the reference implementation is a needless puzzle.
     pub fn emit_short(&mut self, value: u16, line: u16) {
-        self.emit_byte((value >> 8) as u8, line);
-        self.emit_byte((value & 0xff) as u8, line);
+        let _ = line;
+        self.code.push(value);
     }
 
     /// Add a constant and return its index, reusing an identical one.
@@ -480,7 +590,7 @@ impl Chunk {
     pub fn emit_jump(&mut self, op: Op, line: u16) -> usize {
         self.emit_op(op, line);
         self.emit_short(u16::MAX, line);
-        self.code.len() - 2
+        self.code.len() - 1
     }
 
     /// Fill in a jump emitted earlier, now that its destination is known.
@@ -491,12 +601,15 @@ impl Chunk {
     pub fn patch_jump(&mut self, at: usize) -> bool {
         // The offset is measured from the instruction after the operand, which
         // is where the instruction pointer will be when the jump executes.
-        let distance = self.code.len() - at - 2;
-        if distance > u16::MAX as usize {
+        // `at` is the operand's own unit, so the instruction after the jump
+        // starts one unit later. Distances are in units now, which is also
+        // four times the reach a byte offset had.
+        self.close();
+        let distance = self.code.len() - at - 1;
+        if distance > MAX_JUMP {
             return false;
         }
-        self.code[at] = (distance >> 8) as u8;
-        self.code[at + 1] = (distance & 0xff) as u8;
+        self.code[at] = distance as u16;
         true
     }
 
@@ -504,45 +617,62 @@ impl Chunk {
     #[must_use]
     pub fn emit_loop(&mut self, start: usize, line: u16) -> bool {
         self.emit_op(Op::Loop, line);
-        let distance = self.code.len() - start + 2;
-        if distance > u16::MAX as usize {
+        // One more unit for the operand about to be emitted: after it the
+        // instruction pointer is at `code.len() + 1`, and it has to land on
+        // `start`.
+        let distance = self.code.len() + 1 - start;
+        if distance > MAX_JUMP {
             return false;
         }
         self.emit_short(distance as u16, line);
         true
     }
 
-    /// Read a big-endian `u16` at `offset`.
-    pub fn read_short(&self, offset: usize) -> u16 {
-        ((self.code[offset] as u16) << 8) | self.code[offset + 1] as u16
+    /// The operand unit at `at`. One aligned load.
+    pub fn read_short(&self, at: usize) -> u16 {
+        self.code[at]
+    }
+
+    /// Replace the `u8` operand carried inside the instruction at `at`.
+    ///
+    /// For an operand that is only known once the instruction has been
+    /// emitted -- a class's field count, which the class body decides.
+    pub fn patch_inline_operand(&mut self, at: usize, value: u8) {
+        let keep = self.code[at] & !(0xff << OPERAND_SHIFT);
+        self.code[at] = keep | (u16::from(value) << OPERAND_SHIFT);
+    }
+
+    /// The `u8` operand carried inside an instruction's first unit.
+    #[inline(always)]
+    pub fn inline_operand(unit: u16) -> u8 {
+        (unit >> OPERAND_SHIFT) as u8
+    }
+
+    /// The opcode an instruction's first unit names.
+    #[inline(always)]
+    pub fn opcode_of(unit: u16) -> u8 {
+        (unit & OPCODE_MASK) as u8
     }
 
     /// How many bytes the instruction at `at` occupies, opcode included.
     ///
     /// `None` when the byte is not an opcode or the instruction runs off the
     /// end, which for a chunk this crate compiled cannot happen.
-    pub fn instruction_len(code: &[u8], at: usize) -> Option<usize> {
-        // **The opcode numbers carry the length.** They are assigned in order
-        // of how long the instruction is, so this is a comparison on the raw
-        // byte rather than a table with one entry per opcode -- there is
-        // nothing to keep in step, and no `Op` to decode first.
-        //
-        // Adding an opcode means putting it in the right range, which means
-        // renumbering the ones after it and regenerating the `.wrenc` files.
-        // The tests in `tests/bytecode_lengths.rs` are what catch getting it
-        // wrong: they walk compiled programs by these lengths and require the
-        // walk to land exactly on the end.
-
-        Some(match *code.get(at)? {
-            0..=8 => 1,
-            9..=19 => 2,
-            20..=33 => 3,
-            34..=36 => 4,
-            37..=38 => 5,
-            // `Closure` alone is variable: a fixed head and two bytes per
-            // upvalue it captures.
-            39 => 4 + *code.get(at + 3)? as usize * 2,
-            _ => return None,
+    /// How many units the instruction at `at` occupies, its first included.
+    ///
+    /// **The instruction says so itself**, in two bits of its own first unit.
+    /// There is no table to keep in step with the compiler, the interpreter
+    /// and the disassembler -- which there was, four times over, and twice in
+    /// one afternoon they disagreed.
+    ///
+    /// `None` when `at` is past the end, or when a variable-length
+    /// instruction's count runs off it.
+    #[inline(always)]
+    pub fn instruction_units(code: &[u16], at: usize) -> Option<usize> {
+        let unit = *code.get(at)?;
+        Some(match (unit >> LENGTH_SHIFT) & 0b11 {
+            VARIABLE_LENGTH => 2 + Chunk::inline_operand(unit) as usize,
+            fixed => fixed as usize + 1,
         })
     }
 
@@ -552,25 +682,21 @@ impl Chunk {
     /// moves nothing, so every offset in the chunk stays correct -- unless a
     /// jump lands on the *second* instruction of the pair, which after fusing
     /// is a byte that is no longer an instruction.
-    fn jump_targets(code: &[u8]) -> Vec<bool> {
+    fn jump_targets(code: &[u16]) -> Vec<bool> {
         let mut targets = alloc::vec![false; code.len() + 1];
         let mut at = 0;
         while at < code.len() {
-            let Some(len) = Chunk::instruction_len(code, at) else {
+            let Some(len) = Chunk::instruction_units(code, at) else {
                 break;
             };
-            if let Some(op) = Op::from_byte(code[at]) {
-                // **Where the jump is measured from is the end of the
-                // instruction**, which is asked for rather than written as
-                // `at + 3`. The two agree today because every jump is three
-                // bytes; a wider offset would make them disagree silently,
-                // and a jump target computed one byte out is the kind of
-                // fault that shows up as the wrong code running.
+            if let Some(op) = Op::from_byte(Chunk::opcode_of(code[at])) {
+                // **Where a jump is measured from is the end of the
+                // instruction**, which is asked for rather than restated. A
+                // jump target computed one unit out is the kind of fault that
+                // shows up as the wrong code running.
                 let after = at + len;
                 let offset = match op {
-                    Op::Jump | Op::JumpIf | Op::And | Op::Or | Op::Loop => {
-                        ((code[at + 1] as usize) << 8) | code[at + 2] as usize
-                    }
+                    Op::Jump | Op::JumpIf | Op::And | Op::Or | Op::Loop => code[at + 1] as usize,
                     _ => 0,
                 };
                 let target = match op {
@@ -605,6 +731,12 @@ impl Chunk {
     /// bytes of entries against 1,232 bytes of actual code, and a `BTreeMap`
     /// node is far larger than its entries.
     pub fn finish(&mut self) {
+        // **The last instruction has nothing after it to close it.** Every
+        // other one is closed when the next begins; without this the final
+        // instruction keeps a length of zero-plus-one, and everything that
+        // walks the code -- the fusion pass and the jump-target scan it
+        // depends on -- misreads the tail.
+        self.close();
         self.fuse();
         self.lookup = BTreeMap::new();
     }
@@ -613,12 +745,15 @@ impl Chunk {
         let targets = Chunk::jump_targets(&self.code);
         let mut at = 0;
         while at < self.code.len() {
-            let Some(first_len) = Chunk::instruction_len(&self.code, at) else {
+            let Some(first_len) = Chunk::instruction_units(&self.code, at) else {
                 return;
             };
             let second = at + first_len;
-            let fused = match (Op::from_byte(self.code[at]), self.code.get(second).copied()) {
-                (Some(first), Some(byte)) => match (first, Op::from_byte(byte)) {
+            let fused = match (
+                Op::from_byte(Chunk::opcode_of(self.code[at])),
+                self.code.get(second).copied(),
+            ) {
+                (Some(first), Some(unit)) => match (first, Op::from_byte(Chunk::opcode_of(unit))) {
                     (Op::LoadLocal, Some(Op::Constant)) => Some(Op::LoadLocalConstant),
                     (Op::LoadLocal, Some(Op::LoadLocal)) => Some(Op::LoadLocalPair),
                     (Op::LoadLocal, Some(Op::Return)) => Some(Op::LoadLocalReturn),
@@ -629,12 +764,26 @@ impl Chunk {
                 _ => None,
             };
 
-            // A jump landing on the second half would land on a byte that is
+            // A jump landing on the second half would land on a unit that is
             // no longer an instruction.
             match fused {
                 Some(fused) if !targets.get(second).copied().unwrap_or(true) => {
-                    self.code[at] = fused as u8;
-                    at = second + Chunk::instruction_len(&self.code, second).unwrap_or(1);
+                    let second_len = Chunk::instruction_units(&self.code, second).unwrap_or(1);
+                    // **The opcode changes; the length has to change with
+                    // it.** A fused instruction spans both of the ones it
+                    // replaces, so that nothing moves and every jump offset
+                    // in the chunk still means what it meant -- and the
+                    // length field is what says so.
+                    let units = first_len + second_len;
+                    let bits = match units {
+                        0 | 1 => 0,
+                        2 => 1,
+                        3 => 2,
+                        _ => VARIABLE_LENGTH,
+                    };
+                    let keep = self.code[at] & !(OPCODE_MASK | (0b11 << LENGTH_SHIFT));
+                    self.code[at] = keep | fused as u16 | (bits << LENGTH_SHIFT);
+                    at = second + second_len;
                 }
                 _ => at += first_len,
             }
@@ -697,16 +846,16 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
     let mut out = alloc::string::String::new();
     let mut at = 0;
     while at < chunk.code.len() {
-        let Some(op) = Op::from_byte(chunk.code[at]) else {
+        let Some(op) = Op::from_byte(Chunk::opcode_of(chunk.code[at])) else {
             let _ = writeln!(out, "{at:04} ??? {}", chunk.code[at]);
             at += 1;
             continue;
         };
         // **How far to move is asked for, not restated.** This carried its own
-        // per-opcode `offset +=` table, a second copy of `instruction_len`
+        // per-opcode `offset +=` table, a second copy of `instruction_units`
         // that had to agree with it byte for byte and twice did not. The arms
         // below format operands and nothing else; the walk is one call.
-        let Some(len) = Chunk::instruction_len(&chunk.code, at) else {
+        let Some(len) = Chunk::instruction_units(&chunk.code, at) else {
             let _ = writeln!(out, "{at:04} ??? truncated");
             break;
         };
@@ -733,39 +882,38 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
             | Op::LoadStaticField
             | Op::StoreStaticField
             | Op::Class => {
-                let _ = write!(operand, " {}", chunk.code[offset]);
+                let _ = write!(operand, " {}", Chunk::inline_operand(chunk.code[at]));
             }
             Op::Jump | Op::JumpIf | Op::And | Op::Or => {
-                let target = offset + 2 + chunk.read_short(offset) as usize;
+                let target = at + len + chunk.code[offset] as usize;
                 let _ = write!(operand, " -> {target:04}");
             }
             Op::Loop => {
-                let target = offset + 2 - chunk.read_short(offset) as usize;
+                let target = at + len - chunk.code[offset] as usize;
                 let _ = write!(operand, " -> {target:04}");
             }
             Op::ImportVariable => {
                 let _ = write!(
                     operand,
                     " {} {}",
-                    chunk.read_short(offset),
-                    chunk.read_short(offset + 2)
+                    chunk.code[offset],
+                    chunk.code[offset + 1]
                 );
             }
             Op::Call | Op::Super => {
                 let _ = write!(
                     operand,
                     " arity {} symbol {}",
-                    chunk.code[offset],
-                    chunk.read_short(offset + 1)
+                    Chunk::inline_operand(chunk.code[at]),
+                    chunk.code[offset]
                 );
             }
             Op::Closure => {
-                let index = chunk.read_short(offset);
-                let count = chunk.code[offset + 2] as usize;
+                // The count rides inline; the descriptors that follow are one
+                // unit each and are counted by `instruction_units`.
+                let index = chunk.code[offset];
+                let count = Chunk::inline_operand(chunk.code[at]);
                 let _ = write!(operand, " {index} upvalues {count}");
-                // The descriptors are part of the instruction, so they have to
-                // be consumed or every later offset is wrong -- which is
-                // exactly the sort of thing this exists to catch.
             }
             // The fused pairs, whose second operand sits past the dead byte
             // where the second opcode used to be.
@@ -773,20 +921,20 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                 let _ = write!(
                     operand,
                     " {} then constant {}",
-                    chunk.code[offset],
-                    chunk.read_short(offset + 2)
+                    Chunk::inline_operand(chunk.code[at]),
+                    chunk.code[offset + 1]
                 );
             }
             Op::LoadLocalPair => {
                 let _ = write!(
                     operand,
                     " {} then {}",
-                    chunk.code[offset],
-                    chunk.code[offset + 2]
+                    Chunk::inline_operand(chunk.code[at]),
+                    Chunk::inline_operand(chunk.code[offset])
                 );
             }
             Op::LoadLocalReturn | Op::StoreFieldThisPop | Op::LoadFieldThisReturn => {
-                let _ = write!(operand, " {}", chunk.code[offset]);
+                let _ = write!(operand, " {}", Chunk::inline_operand(chunk.code[at]));
             }
             _ => {}
         }

@@ -60,7 +60,7 @@ const MAGIC: [u8; 6] = *b"WRENC\0";
 /// A file from a different version is refused rather than guessed at: the
 /// failure of loading the wrong bytecode is an interpreter running nonsense,
 /// which is far harder to diagnose than a message at load time.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// What went wrong reading a `.wrenc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,25 +104,29 @@ enum Table {
 /// offsets and constant indices. Walking the stream is also the check that it
 /// is well formed: a stream that does not decode is one that would have jumped
 /// into the middle of an instruction at run time.
-fn table_operands(code: &[u8]) -> Result<Vec<(Table, usize)>, LoadError> {
+fn table_operands(code: &[u16]) -> Result<Vec<(Table, usize)>, LoadError> {
     let mut found = Vec::new();
     let mut at = 0;
 
-    // **One length table, in `Chunk::instruction_len`.** This used to carry
+    // **One length table, in `Chunk::instruction_units`.** This used to carry
     // its own copy of how long each instruction is, which is a second thing to
     // update whenever an opcode is added -- and the fused pairs were added
     // without it, so the walk misaligned and every file failed to load.
     while at < code.len() {
-        let Some(op) = Op::from_byte(code[at]) else {
+        let Some(op) = Op::from_byte(Chunk::opcode_of(code[at])) else {
             return Err(LoadError::Malformed("unknown opcode"));
         };
         match op {
-            Op::Call | Op::Super => found.push((Table::Symbol, at + 2)),
-            Op::MethodInstance | Op::MethodStatic => found.push((Table::Symbol, at + 1)),
+            // Every one of these carries its table index as a whole unit,
+            // the one after the opcode's. `Call` puts its arity inline, so its
+            // symbol is in the same place as the others'.
+            Op::Call | Op::Super | Op::MethodInstance | Op::MethodStatic => {
+                found.push((Table::Symbol, at + 1))
+            }
             Op::LoadModuleVar | Op::StoreModuleVar => found.push((Table::Variable, at + 1)),
             _ => {}
         }
-        let Some(len) = Chunk::instruction_len(code, at) else {
+        let Some(len) = Chunk::instruction_units(code, at) else {
             return Err(LoadError::Truncated);
         };
         at += len;
@@ -134,13 +138,12 @@ fn table_operands(code: &[u8]) -> Result<Vec<(Table, usize)>, LoadError> {
     Ok(found)
 }
 
-fn read_index(code: &[u8], at: usize) -> usize {
-    ((code[at] as usize) << 8) | code[at + 1] as usize
+fn read_index(code: &[u16], at: usize) -> usize {
+    code[at] as usize
 }
 
-fn write_index(code: &mut [u8], at: usize, value: usize) {
-    code[at] = (value >> 8) as u8;
-    code[at + 1] = (value & 0xff) as u8;
+fn write_index(code: &mut [u16], at: usize, value: usize) {
+    code[at] = value as u16;
 }
 
 /// The names a chunk actually uses, gathered in first-use order.
@@ -284,8 +287,12 @@ fn write_function(
         let dense = names.dense(table, read_index(&code, at));
         write_index(&mut code, at, dense);
     }
+    // **Units, little-endian.** The format carries what the chunk holds, so
+    // a reader neither expands nor repacks.
     write_u32(out, code.len() as u32);
-    out.extend_from_slice(&code);
+    for unit in &code {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
 
     // **The line table travels run-length encoded**, in the same shape the
     // chunk holds it: one entry per line, and the run lengths are the gaps
@@ -469,6 +476,19 @@ impl<'a> Reader<'a> {
         let length = self.u32()? as usize;
         self.take(length)
     }
+
+    /// A length-prefixed run of instruction units, little-endian.
+    ///
+    /// The count is in units and each is two bytes, which is what the chunk
+    /// holds -- so nothing is expanded or repacked on the way in.
+    fn units(&mut self) -> Result<Vec<u16>, LoadError> {
+        let count = self.u32()? as usize;
+        let bytes = self.take(count * 2)?;
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect())
+    }
 }
 
 /// What a loaded file was compiled from, so a caller can check it is current.
@@ -544,7 +564,7 @@ fn read_function(
     let upvalues = reader.byte()? as usize;
     let name = String::from_utf8_lossy(reader.blob()?).into_owned();
 
-    let mut code = reader.blob()?.to_vec();
+    let mut code = reader.units()?;
 
     // Straight into the compact form: one entry per line rather than per byte,
     // which is what the chunk holds. Expanding it here and compressing again
@@ -650,7 +670,7 @@ fn read_constant(
 /// be decoded rather than scanned -- which is also the check that the code is
 /// well-formed, since a stream that does not decode is one that would have
 /// jumped into the middle of an instruction at run time.
-fn remap(code: &mut [u8], symbols: &[u16], variables: &[u16]) -> Result<(), LoadError> {
+fn remap(code: &mut [u16], symbols: &[u16], variables: &[u16]) -> Result<(), LoadError> {
     for (table, at) in table_operands(code)? {
         let list = match table {
             Table::Symbol => symbols,

@@ -1697,7 +1697,13 @@ impl Vm {
             // line up cost a bounds check and a load on every instruction
             // executed.
             let at = ip;
-            let byte = chunk.code[at];
+            // **One aligned load for the opcode and its first operand.** The
+            // unit holds the opcode in its low six bits, the instruction's
+            // length in the next two, and a `u8` operand in its high byte --
+            // so an instruction like `LoadLocal` is fetched and decoded
+            // without touching memory again.
+            let unit = chunk.code[at];
+            let byte = Chunk::opcode_of(unit);
             ip += 1;
             #[cfg(feature = "profile")]
             {
@@ -1715,16 +1721,15 @@ impl Vm {
 
             match byte {
                 code::CONSTANT => {
-                    let index = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let index = chunk.code[ip] as usize;
+                    ip += 1;
                     self.stack.push(chunk.constants[index]);
                 }
                 code::NULL => self.stack.push(Value::NULL),
                 code::FALSE => self.stack.push(Value::FALSE),
                 code::TRUE => self.stack.push(Value::TRUE),
                 code::LOAD_LOCAL => {
-                    let slot = chunk.code[ip] as usize;
-                    ip += 1;
+                    let slot = Chunk::inline_operand(unit) as usize;
                     self.stack.push(self.stack[base + slot]);
                 }
                 // **The fused pairs.** Each occupies exactly the bytes of the
@@ -1732,22 +1737,28 @@ impl Vm {
                 // always did and there is a dead byte where the second
                 // opcode was. See the note on them in `bytecode.rs`.
                 code::LOAD_LOCAL_CONSTANT => {
-                    let slot = chunk.code[ip] as usize;
-                    let index = chunk.read_short(ip + 2) as usize;
-                    ip += 4;
+                    let slot = Chunk::inline_operand(unit) as usize;
+                    // **Three units, and the index is in the third.** This
+                    // spans a one-unit `LoadLocal` and a two-unit `Constant`,
+                    // and nothing moved when they fused -- so the constant is
+                    // where the `Constant` put it, past its own dead opcode.
+                    let index = chunk.code[ip + 1] as usize;
+                    ip += 2;
                     self.stack.push(self.stack[base + slot]);
                     self.stack.push(chunk.constants[index]);
                 }
                 code::LOAD_LOCAL_PAIR => {
-                    let first = chunk.code[ip] as usize;
-                    let second = chunk.code[ip + 2] as usize;
-                    ip += 3;
+                    let first = Chunk::inline_operand(unit) as usize;
+                    // The second slot rides inline in what was the second
+                    // `LoadLocal`'s own unit.
+                    let second = Chunk::inline_operand(chunk.code[ip]) as usize;
+                    ip += 1;
                     self.stack.push(self.stack[base + first]);
                     self.stack.push(self.stack[base + second]);
                 }
                 code::STORE_FIELD_THIS_POP => {
-                    let index = chunk.code[ip] as usize;
-                    ip += 2;
+                    let index = Chunk::inline_operand(unit) as usize;
+                    ip += 1;
                     // Popping first rather than storing and then popping: the
                     // value is an argument to `set_field`, not something it
                     // reads off the stack.
@@ -1756,32 +1767,29 @@ impl Vm {
                     self.set_field(receiver, base, index, value)?;
                 }
                 code::STORE_LOCAL => {
-                    let slot = chunk.code[ip] as usize;
-                    ip += 1;
+                    let slot = Chunk::inline_operand(unit) as usize;
                     self.stack[base + slot] = *self.stack.last().unwrap();
                 }
                 code::LOAD_MODULE_VAR => {
-                    let index = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let index = chunk.code[ip] as usize;
+                    ip += 1;
                     self.stack.push(self.modules[module].values[index]);
                 }
                 code::STORE_MODULE_VAR => {
-                    let index = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let index = chunk.code[ip] as usize;
+                    ip += 1;
                     self.modules[module].values[index] = *self.stack.last().unwrap();
                 }
                 code::POP => {
                     self.stack.pop();
                 }
                 code::LOAD_UPVALUE => {
-                    let slot = chunk.code[ip] as usize;
-                    ip += 1;
+                    let slot = Chunk::inline_operand(unit) as usize;
                     let value = self.read_upvalue(base, slot)?;
                     self.stack.push(value);
                 }
                 code::STORE_UPVALUE => {
-                    let slot = chunk.code[ip] as usize;
-                    ip += 1;
+                    let slot = Chunk::inline_operand(unit) as usize;
                     let value = *self.stack.last().unwrap();
                     self.write_upvalue(slot, value)?;
                 }
@@ -1790,19 +1798,23 @@ impl Vm {
                     self.stack.pop();
                 }
                 code::CLOSURE => {
-                    let index = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    // The upvalue count rides inline; the function's constant
+                    // index is the unit after, and the descriptors follow it.
+                    let count = Chunk::inline_operand(unit) as usize;
+                    let index = chunk.code[ip] as usize;
+                    ip += 1;
                     let function = chunk.constants[index]
                         .as_object()
                         .ok_or_else(|| RuntimeError::new("Closure constant is not a function."))?;
-                    let count = chunk.code[ip] as usize;
-                    ip += 1;
 
                     let mut upvalues = Vec::with_capacity(count);
                     for _ in 0..count {
-                        let is_local = chunk.code[ip] != 0;
-                        let index = chunk.code[ip + 1] as usize;
-                        ip += 2;
+                        // One unit per upvalue: whether it is a local in the
+                        // low byte, which one in the high byte.
+                        let descriptor = chunk.code[ip];
+                        let is_local = descriptor & 0xff != 0;
+                        let index = Chunk::inline_operand(descriptor) as usize;
+                        ip += 1;
                         let captured = if is_local {
                             self.capture_upvalue(base + index)
                         } else {
@@ -1817,43 +1829,38 @@ impl Vm {
                     self.stack.push(Value::object(id));
                 }
                 code::CLASS => {
-                    let declared = chunk.code[ip] as usize;
-                    ip += 1;
+                    let declared = Chunk::inline_operand(unit) as usize;
                     let superclass = self.stack.pop().unwrap_or(Value::NULL);
                     let name = self.stack.pop().unwrap_or(Value::NULL);
                     let class = self.make_class(name, superclass, declared)?;
                     self.stack.push(class);
                 }
                 code::METHOD_INSTANCE | code::METHOD_STATIC => {
-                    let symbol = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let symbol = chunk.code[ip] as usize;
+                    ip += 1;
                     let class = self.stack.pop().unwrap_or(Value::NULL);
                     let body = self.stack.pop().unwrap_or(Value::NULL);
                     self.bind_method(class, body, symbol, byte == code::METHOD_STATIC)?;
                 }
                 code::LOAD_FIELD_THIS => {
-                    let index = chunk.code[ip] as usize;
-                    ip += 1;
+                    let index = Chunk::inline_operand(unit) as usize;
                     let value = self.field_of(self.stack[base], base, index)?;
                     self.stack.push(value);
                 }
                 code::STORE_FIELD_THIS => {
-                    let index = chunk.code[ip] as usize;
-                    ip += 1;
+                    let index = Chunk::inline_operand(unit) as usize;
                     let value = *self.stack.last().unwrap();
                     let receiver = self.stack[base];
                     self.set_field(receiver, base, index, value)?;
                 }
                 code::LOAD_FIELD => {
-                    let index = chunk.code[ip] as usize;
-                    ip += 1;
+                    let index = Chunk::inline_operand(unit) as usize;
                     let receiver = self.stack.pop().unwrap_or(Value::NULL);
                     let value = self.field_of(receiver, base, index)?;
                     self.stack.push(value);
                 }
                 code::STORE_FIELD => {
-                    let index = chunk.code[ip] as usize;
-                    ip += 1;
+                    let index = Chunk::inline_operand(unit) as usize;
                     // **The value is on top, the receiver below it.** The
                     // compiler pushes `this` first and then evaluates the
                     // right-hand side, so popping the receiver first took the
@@ -1870,10 +1877,10 @@ impl Vm {
                     self.stack[base] = instance;
                 }
                 code::CALL | code::SUPER => {
-                    let arity = chunk.code[ip] as usize;
+                    // The arity rides inline; the symbol is the unit after.
+                    let arity = Chunk::inline_operand(unit) as usize;
+                    let symbol = chunk.code[ip] as usize;
                     ip += 1;
-                    let symbol = chunk.read_short(ip) as usize;
-                    ip += 2;
 
                     let start_from = if byte == code::SUPER {
                         self.frames
@@ -2029,21 +2036,19 @@ impl Vm {
                     }
                 }
                 code::LOAD_STATIC_FIELD => {
-                    let index = chunk.code[ip] as usize;
-                    ip += 1;
+                    let index = Chunk::inline_operand(unit) as usize;
                     let value = self.static_field(index);
                     self.stack.push(value);
                 }
                 code::STORE_STATIC_FIELD => {
-                    let index = chunk.code[ip] as usize;
-                    ip += 1;
+                    let index = Chunk::inline_operand(unit) as usize;
                     let value = *self.stack.last().unwrap();
                     self.set_static_field(index, value)?;
                 }
                 code::SET_ATTRIBUTES => self.set_attributes(),
                 code::IMPORT_MODULE => {
-                    let index = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let index = chunk.code[ip] as usize;
+                    ip += 1;
                     let name = self.to_string(chunk.constants[index]);
                     // Resolved against the module doing the importing.
                     let name = resolve_module(&self.modules[module].name, &name);
@@ -2094,9 +2099,9 @@ impl Vm {
                     }
                 }
                 code::IMPORT_VARIABLE => {
-                    let module_name = chunk.read_short(ip) as usize;
-                    let variable_name = chunk.read_short(ip + 2) as usize;
-                    ip += 4;
+                    let module_name = chunk.code[ip] as usize;
+                    let variable_name = chunk.code[ip + 1] as usize;
+                    ip += 2;
 
                     let module_name = self.to_string(chunk.constants[module_name]);
                     // The same resolution, or the `for` clause would look the
@@ -2116,13 +2121,13 @@ impl Vm {
                     let result = match byte {
                         code::END => Value::NULL,
                         code::LOAD_LOCAL_RETURN => {
-                            let slot = chunk.code[ip] as usize;
-                            ip += 2;
+                            let slot = Chunk::inline_operand(unit) as usize;
+                            ip += 1;
                             self.stack[base + slot]
                         }
                         code::LOAD_FIELD_THIS_RETURN => {
-                            let index = chunk.code[ip] as usize;
-                            ip += 2;
+                            let index = Chunk::inline_operand(unit) as usize;
+                            ip += 1;
                             self.field_of(self.stack[base], base, index)?
                         }
                         _ => self.stack.pop().unwrap_or(Value::NULL),
@@ -2197,25 +2202,28 @@ impl Vm {
                     module = frame.module;
                 }
                 code::JUMP => {
-                    let offset = chunk.read_short(ip) as usize;
-                    ip += 2 + offset;
+                    let offset = chunk.code[ip] as usize;
+                    // One unit for the operand, then the distance -- which is
+                    // in units too, and so reaches four times as far as the
+                    // byte offset it replaces.
+                    ip += 1 + offset;
                 }
                 code::LOOP => {
-                    let offset = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let offset = chunk.code[ip] as usize;
+                    ip += 1;
                     ip -= offset;
                 }
                 code::JUMP_IF => {
-                    let offset = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let offset = chunk.code[ip] as usize;
+                    ip += 1;
                     let condition = self.stack.pop().unwrap_or(Value::NULL);
                     if condition.is_falsy() {
                         ip += offset;
                     }
                 }
                 code::AND => {
-                    let offset = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let offset = chunk.code[ip] as usize;
+                    ip += 1;
                     if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
                         ip += offset;
                     } else {
@@ -2223,8 +2231,8 @@ impl Vm {
                     }
                 }
                 code::OR => {
-                    let offset = chunk.read_short(ip) as usize;
-                    ip += 2;
+                    let offset = chunk.code[ip] as usize;
+                    ip += 1;
                     if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
                         self.stack.pop();
                     } else {

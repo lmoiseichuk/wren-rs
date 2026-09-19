@@ -1906,8 +1906,9 @@ impl<'a> Compiler<'a> {
         // so it has to say so here rather than at compile time of the inner
         // function.
         for upvalue in &upvalues {
-            self.chunk_mut().emit_byte(u8::from(upvalue.is_local), line);
-            self.chunk_mut().emit_byte(upvalue.index as u8, line);
+            // One unit per upvalue: whether it is a local, then which one.
+            self.chunk_mut()
+                .emit_byte_pair(u8::from(upvalue.is_local), upvalue.index as u8, line);
         }
         Ok(())
     }
@@ -2020,8 +2021,10 @@ impl<'a> Compiler<'a> {
 
         // The field count is not known until the methods have been compiled,
         // so a placeholder goes in and is patched at the end.
-        self.chunk_mut().emit_op(Op::Class, line);
+        // The count rides inline in the instruction's own unit, so what has
+        // to be remembered is where that unit is, not where a byte would be.
         let field_count_at = self.chunk_mut().code.len();
+        self.chunk_mut().emit_op(Op::Class, line);
         self.chunk_mut().emit_byte(255, line);
 
         let variable = self.define_variable(&name, line)?;
@@ -2054,7 +2057,12 @@ impl<'a> Compiler<'a> {
         self.consume(TokenKind::RightBrace, "Expect '}' after class body.")?;
 
         let class = self.classes.pop().expect("the class being compiled");
-        self.state_mut().chunk.code[field_count_at] = class.fields.len() as u8;
+        // **The field count rides inline in the `Class` instruction's own
+        // unit**, so patching it means replacing that byte rather than a whole
+        // unit -- the opcode and its length share the word.
+        self.state_mut()
+            .chunk
+            .patch_inline_operand(field_count_at, class.fields.len() as u8);
 
         // Attach the attributes, if the class or any of its methods had one
         // the runtime can see. A class with only compile-time attributes gets

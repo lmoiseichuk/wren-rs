@@ -85,7 +85,7 @@ fn main() {
             };
             let mut at = 0;
             while at < chunk.code.len() {
-                let Some(len) = wren::bytecode::Chunk::instruction_len(&chunk.code, at) else {
+                let Some(len) = wren::bytecode::Chunk::instruction_units(&chunk.code, at) else {
                     break;
                 };
                 *by_length.entry(len).or_insert(0usize) += 1;
