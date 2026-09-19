@@ -129,6 +129,9 @@ pub struct Switch {
     pub catching: bool,
     /// Set when the switch is a fiber finishing rather than yielding.
     pub finishing: bool,
+    /// Deliver `value` to the target as an *error* rather than as a result.
+    /// This is what `transferError` does: hand control over and fail there.
+    pub as_error: bool,
 }
 
 /// A module's variables: names and values, in parallel.
@@ -245,6 +248,11 @@ pub struct Vm {
     /// primitive's signature for the handful that switch, the switching ones
     /// leave the request here and the call site checks for it.
     pub pending_switch: Option<Switch>,
+    /// Set when the program should stop, short of an error.
+    ///
+    /// Only `Fiber.yield` from the root fiber sets it: there is nobody to hand
+    /// control back to, and upstream ends the run rather than failing.
+    pub halting: bool,
     /// How deep the frames were when Rust last re-entered the interpreter.
     ///
     /// A yield may not cross that boundary: there is a Rust stack frame in the
@@ -338,6 +346,7 @@ impl Vm {
             current_fiber: None,
             root_fiber: None,
             pending_switch: None,
+            halting: false,
             rust_floor: 0,
             frames: Vec::new(),
             open_upvalues: Vec::new(),
@@ -1186,8 +1195,30 @@ impl Vm {
                             // either way; a switch leaves the target to push
                             // its own value there when it comes back.
                             self.stack.truncate(receiver_at);
+                            if self.halting {
+                                self.halting = false;
+                                return Ok(Value::NULL);
+                            }
                             if let Some(switch) = self.pending_switch.take() {
+                                let failing = switch.as_error.then_some(switch.value);
                                 self.perform_switch(switch, ip)?;
+                                if let Some(value) = failing {
+                                    // The target fails the moment it resumes,
+                                    // which is what makes `transferError`
+                                    // different from `transfer`.
+                                    let message = self.to_string(value);
+                                    let error = RuntimeError { message, line };
+                                    match self.deliver_error(error, 0)? {
+                                        Some((next_chunk, next_ip, next_base)) => {
+                                            chunk = next_chunk;
+                                            ip = next_ip;
+                                            base = next_base;
+                                            module = self.current_module();
+                                            continue;
+                                        }
+                                        None => unreachable!("deliver_error returns or switches"),
+                                    }
+                                }
                                 let frame = *self.frames.last().expect("a frame to resume");
                                 ip = frame.ip;
                                 base = frame.base;
@@ -1328,6 +1359,7 @@ impl Vm {
                                     set_caller: false,
                                     catching: false,
                                     finishing: true,
+                                    as_error: false,
                                 },
                                 ip,
                             )?;
@@ -1439,6 +1471,7 @@ impl Vm {
                 set_caller: false,
                 catching: false,
                 finishing: false,
+                as_error: false,
             },
             ip,
         )?;

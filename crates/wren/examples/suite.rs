@@ -98,6 +98,46 @@ fn main() {
         return;
     }
 
+    // `--diff <path substring>` shows expected against actual, line by line,
+    // for the files that match. The histogram says how many; this says what.
+    if std::env::args().nth(2).as_deref() == Some("--diff") {
+        let wanted = std::env::args().nth(3).unwrap_or_default();
+        for outcome in &outcomes {
+            let path = outcome.path.display().to_string();
+            if !path.contains(&wanted) || outcome.result.is_ok() {
+                continue;
+            }
+            println!("\n--- {path}");
+            if let Err(reason) = &outcome.result {
+                if !reason.starts_with("output differs") {
+                    println!("    {reason}");
+                    continue;
+                }
+            }
+            let Ok(source) = std::fs::read_to_string(&outcome.path) else { continue };
+            let expected: Vec<String> = source
+                .lines()
+                .filter_map(|line| line.find("// expect: ").map(|at| line[at + 11..].to_string()))
+                .collect();
+            let directory = outcome.path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let mut vm = wren::Vm::new();
+            let base = directory.clone();
+            vm.set_module_loader(move |name| {
+                std::fs::read_to_string(base.join(format!("{}.wren", name.trim_start_matches("./")))).ok()
+            });
+            let _ = vm.interpret(&source);
+            let got: Vec<&str> = vm.output_str().lines().collect();
+            for index in 0..expected.len().max(got.len()) {
+                let want = expected.get(index).map(String::as_str).unwrap_or("<none>");
+                let have = got.get(index).copied().unwrap_or("<none>");
+                if want != have {
+                    println!("    {index}: got {have:?} want {want:?}");
+                }
+            }
+        }
+        return;
+    }
+
     if let Some(wanted) = std::env::args().nth(2) {
         println!("\nfiles failing with {wanted:?}:");
         for outcome in &outcomes {

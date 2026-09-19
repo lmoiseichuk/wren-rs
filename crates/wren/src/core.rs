@@ -148,6 +148,7 @@ macro_rules! arithmetic {
 /// Install the core library into a fresh VM.
 pub fn install(vm: &mut Vm) {
     install_object(vm);
+    install_class(vm);
     install_fn(vm);
     install_fiber(vm);
     install_num(vm);
@@ -216,13 +217,47 @@ fn install_object(vm: &mut Vm) {
 }
 
 /// `Fn`: what a function literal is an instance of.
+/// `Class`: what every class, and every metaclass, responds to.
+fn install_class(vm: &mut Vm) {
+    let class = vm.class_class;
+
+    define(vm, class, "name", |vm, at| {
+        let Some(id) = receiver(vm, at).as_object() else {
+            return Err(RuntimeError::new("Receiver must be a class."));
+        };
+        let name = match vm.heap.get(id) {
+            Some(Object::Class(class)) => class.name,
+            _ => return Err(RuntimeError::new("Receiver must be a class.")),
+        };
+        Ok(Value::object(name))
+    });
+
+    define(vm, class, "supertype", |vm, at| {
+        let Some(id) = receiver(vm, at).as_object() else {
+            return Err(RuntimeError::new("Receiver must be a class."));
+        };
+        match vm.heap.get(id) {
+            // `Object` has no supertype, which is what makes it the root.
+            Some(Object::Class(class)) => Ok(class
+                .superclass
+                .map_or(Value::NULL, Value::object)),
+            _ => Err(RuntimeError::new("Receiver must be a class.")),
+        }
+    });
+
+    define(vm, class, "toString", |vm, at| {
+        let text = vm.to_string(receiver(vm, at));
+        Ok(vm.new_string(&text))
+    });
+}
+
 fn install_fn(vm: &mut Vm) {
     let class = vm.fn_class;
 
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Fn metaclass")));
     let metaclass = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
     if let Some(Object::Class(function)) = vm.heap.get_mut(class) {
         function.metaclass = Some(metaclass);
     }
@@ -287,7 +322,7 @@ fn install_fiber(vm: &mut Vm) {
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Fiber metaclass")));
     let metaclass = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
     if let Some(Object::Class(fiber)) = vm.heap.get_mut(class) {
         fiber.metaclass = Some(metaclass);
     }
@@ -349,6 +384,16 @@ fn install_fiber(vm: &mut Vm) {
         let value = argument(vm, at, 1);
         switch_into(vm, at, value, false, false)
     });
+    // Transfer control to a fiber *and* make it fail there, so whoever is
+    // running it with `try` sees the error as if it had raised one itself.
+    define(vm, class, "transferError(_)", |vm, at| {
+        let value = argument(vm, at, 1);
+        switch_into(vm, at, value, false, false)?;
+        if let Some(switch) = vm.pending_switch.as_mut() {
+            switch.as_error = true;
+        }
+        Ok(Value::NULL)
+    });
 
     define(vm, class, "isDone", |vm, at| {
         match receiver(vm, at).as_object().and_then(|id| vm.heap.get(id)) {
@@ -396,6 +441,7 @@ fn switch_into(
         set_caller,
         catching,
         finishing: false,
+        as_error: false,
     });
     Ok(Value::NULL)
 }
@@ -409,7 +455,12 @@ fn yield_to_caller(vm: &mut Vm, value: Value) -> Result<Value, RuntimeError> {
             _ => None,
         });
     let Some(caller) = caller else {
-        return Err(RuntimeError::new("No fiber to yield to."));
+        // **Yielding from the root fiber stops the program.** There is nobody
+        // to hand control back to, and upstream treats that as the end of the
+        // run rather than as an error -- `yield_from_main` prints what came
+        // before the yield and nothing after it.
+        vm.halting = true;
+        return Ok(Value::NULL);
     };
     vm.pending_switch = Some(Switch {
         target: caller,
@@ -417,6 +468,7 @@ fn yield_to_caller(vm: &mut Vm, value: Value) -> Result<Value, RuntimeError> {
         set_caller: false,
         catching: false,
         finishing: false,
+        as_error: false,
     });
     Ok(Value::NULL)
 }
@@ -702,7 +754,7 @@ fn install_num_extras(vm: &mut Vm) {
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Num metaclass")));
     let metaclass = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
     if let Some(Object::Class(num)) = vm.heap.get_mut(class) {
         num.metaclass = Some(metaclass);
     }
@@ -863,7 +915,7 @@ fn install_string_extras(vm: &mut Vm) {
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("String metaclass")));
     let metaclass = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
     if let Some(Object::Class(string)) = vm.heap.get_mut(class) {
         string.metaclass = Some(metaclass);
     }
@@ -1232,7 +1284,7 @@ fn install_list(vm: &mut Vm) {
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("List metaclass")));
     let metaclass = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
     if let Some(Object::Class(list)) = vm.heap.get_mut(class) {
         list.metaclass = Some(metaclass);
     }
@@ -1584,7 +1636,7 @@ fn install_map(vm: &mut Vm) {
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Map metaclass")));
     let metaclass = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
     if let Some(Object::Class(map)) = vm.heap.get_mut(class) {
         map.metaclass = Some(metaclass);
     }
@@ -1920,7 +1972,7 @@ fn install_system(vm: &mut Vm) {
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("System metaclass")));
     let metaclass = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
 
     let name = vm.heap.allocate(Object::String(ObjString::from_text("System")));
     let mut class = ObjClass::new(name, None);
@@ -1991,7 +2043,7 @@ pub fn install_random(vm: &mut Vm) -> usize {
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text("Random metaclass")));
     let metaclass = vm
         .heap
-        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, None))));
+        .allocate(Object::Class(Box::new(ObjClass::new(metaclass_name, Some(vm.class_class)))));
     if let Some(Object::Class(random)) = vm.heap.get_mut(class) {
         random.metaclass = Some(metaclass);
         // Four `u32` words of state, each exactly representable as an `f64`.
