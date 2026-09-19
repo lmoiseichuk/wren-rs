@@ -79,7 +79,30 @@ impl WrenError {
 /// a message.
 const MAX_FRAMES: usize = 256;
 
+/// Why the interpreter keeps `chunk`, `ip` and `base` in locals
+/// ------------------------------------------------------------
+///
+/// The obvious shape is to read them out of `self.frames.last()` on every
+/// instruction. It is also the shape that makes the fetch -- the single
+/// hottest path in the whole VM -- cost a bounds check, a pointer chase and a
+/// field load per opcode, before any work is done.
+///
+/// So the running frame's three fields are hoisted into locals for the
+/// duration, and written back only when a call or a return changes which frame
+/// is running. The cost of that decision is real and worth naming: **every
+/// path that leaves the loop has to remember to park `ip` first**, or the
+/// frame resumes at a stale instruction. That is why `park_current` takes `ip`
+/// as an argument rather than reading it from anywhere -- there is nowhere to
+/// read it from, and making it a parameter turns a silent bug into a
+/// compile error.
+const _: () = ();
+
 /// One call in progress.
+///
+/// `Copy`, which is what lets the interpreter take a frame out of the stack to
+/// read its fields without borrowing `self` for the rest of the expression.
+/// Three words is cheap enough that the alternative -- a borrow that conflicts
+/// with the next `self.stack.push` -- is not worth arguing with.
 #[derive(Debug, Clone, Copy)]
 pub struct Frame {
     pub closure: ObjectId,
@@ -394,6 +417,15 @@ impl Vm {
         Ok(chunk)
     }
 
+    /// The code a closure runs.
+    ///
+    /// Returns an `Rc` clone rather than a reference, and that is the point of
+    /// storing chunks behind an `Rc` at all. A `&Chunk` borrowed out of the
+    /// heap would be a live immutable borrow of `self` for as long as the call
+    /// runs -- and the very next instruction pushes onto `self.stack`. The
+    /// choices were an `Rc` clone once per call, `unsafe` to sever the borrow,
+    /// or copying the whole chunk per call. A refcount bump per *call* (not per
+    /// instruction) is the cheapest of the three by a wide margin.
     fn chunk_of(&self, closure: ObjectId) -> Result<Rc<Chunk>, RuntimeError> {
         let Some(Object::Closure(closure)) = self.heap.get(closure) else {
             return Err(RuntimeError::new("Not a closure."));
@@ -462,6 +494,17 @@ impl Vm {
     }
 
     /// Every value the collector must treat as reachable.
+    ///
+    /// **Getting this list wrong is the classic collector bug**, and it fails
+    /// silently: an object missed here is freed while still in use, and what
+    /// breaks is whatever happens to reuse the slot, somewhere else entirely.
+    /// So the rule is to enumerate every place a `Value` can hide rather than
+    /// to reason about which ones "must" already be reachable.
+    ///
+    /// Note what is *not* here: a Rust local holding a freshly allocated
+    /// object. There is no way to enumerate those, which is why `Heap::allocate`
+    /// never collects and the check happens between instructions, where the
+    /// only live references are the ones below.
     fn roots(&self) -> Vec<Value> {
         let mut roots = self.stack.clone();
         roots.extend(self.module.values.iter().copied());
@@ -1013,9 +1056,16 @@ impl Vm {
                 }
             }
 
-            // Collect between instructions, where the roots are exactly the
-            // stack, the module and the frames -- never part way through
-            // building something.
+            // **Between instructions, and only here.** Upstream collects inside
+            // the allocator, which means any allocation can free an object the
+            // caller is half way through building and holding only in a C
+            // local; upstream handles that with a stack of temporary roots the
+            // caller must remember to push, and forgetting one is a classic
+            // source of collector bugs.
+            //
+            // Checking here instead costs a branch per instruction and removes
+            // the whole category: at an instruction boundary the live set is
+            // exactly what `roots` enumerates, with nothing in flight.
             if self.heap.should_collect() {
                 if let Some(frame) = self.frames.last_mut() {
                     frame.ip = ip;
@@ -1381,6 +1431,12 @@ fn format_number(value: f64) -> String {
         .expect("Rust's {:e} always writes an exponent");
     let exponent: i32 = exponent.parse().expect("and it is always an integer");
 
+    // Written as two comparisons rather than a range check because this *is*
+    // `%g`'s rule as the C standard states it -- "style e is used if the
+    // exponent is less than -4 or greater than or equal to the precision" --
+    // and a reader checking this against the standard should see the same
+    // shape. `(-4..14).contains()` would be the same test and a worse mirror.
+    #[allow(clippy::manual_range_contains)]
     if exponent < -4 || exponent >= 14 {
         let mantissa = trim_trailing_zeros(mantissa);
         let sign = if exponent < 0 { '-' } else { '+' };

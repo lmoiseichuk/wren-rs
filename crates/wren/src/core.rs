@@ -15,6 +15,25 @@
 //!
 //! Error messages are upstream's, word for word, because the test suite checks
 //! them.
+//!
+//! # The calling convention, and why it is an index
+//!
+//! A primitive receives `&mut Vm` and the **stack index of the receiver**, not
+//! a slice of arguments. The receiver is at `at`, the first argument at
+//! `at + 1`, and so on — which is why the helpers here are named `receiver` and
+//! `argument(_, 1)`, matching upstream's `args[0]` and `args[1]`.
+//!
+//! A slice would read better and does not typecheck: the arguments live in
+//! `vm.stack`, so borrowing them as a slice borrows the VM immutably for the
+//! whole call, while every interesting primitive needs it mutably to allocate.
+//! The alternative — copying arguments into a fixed buffer on entry — costs up
+//! to 17 `Value`s of memcpy on the hottest path in the language, since every
+//! `a + b` goes through here. An index costs nothing and sidesteps both.
+//!
+//! The price is that a primitive can read past its own arguments if it asks for
+//! the wrong index. That is a bug of the same shape as reading `args[2]` of a
+//! one-argument method in C, and it is caught the same way: by the signature
+//! and the tests, not by the type system.
 
 extern crate alloc;
 

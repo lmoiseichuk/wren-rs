@@ -12,6 +12,23 @@
 //! nodes for a program is a large allocation on a part measured in kilobytes,
 //! and it exists only to be walked once.
 //!
+//! What single-pass costs, so the trade is on the record rather than implied:
+//!
+//! * **No constant folding, no dead-code elimination, no peephole pass.**
+//!   `1 + 2` compiles to two constants and a call, every time. A tree would
+//!   make those easy; without one they would have to be done on the byte
+//!   stream after the fact, which is step 6's territory rather than this one's.
+//! * **Jump offsets have to be patched.** The compiler emits a placeholder and
+//!   fills it in once the destination is known, which is why `patch_jump`
+//!   returns a `bool` and every caller has to handle a body too long to jump
+//!   over. A tree would know the size before emitting anything.
+//! * **Errors are reported at the first failure.** There is no recovery and no
+//!   second error, because there is no tree to resynchronise against.
+//!
+//! What it buys is that a program's peak compile-time memory is its bytecode
+//! plus one token of lookahead, which on a part with 8 KB is the difference
+//! between compiling on the device and not.
+//!
 //! # What this compiles
 //!
 //! Expressions, variables, `if`/`else`, `while`, `for`-`in`, blocks, list
@@ -337,6 +354,13 @@ impl<'a> Compiler<'a> {
     /// The invariant this depends on: **when a local is declared, the stack
     /// height equals the number of locals already declared.** Every statement
     /// leaves the stack as it found it, which is what keeps that true.
+    ///
+    /// That invariant is the compiler's half of a contract with the VM, and it
+    /// is unchecked — nothing verifies at run time that slot *n* holds what the
+    /// compiler thought it would. When it is broken the symptom is not a crash
+    /// at the break but a variable reading as some unrelated value much later,
+    /// which is how the loop-discard and scope-end bugs presented. The
+    /// disassembler in `bytecode.rs` exists for exactly this class of fault.
     fn add_local(&mut self, name: &str) -> Result<usize, CompileError> {
         if self.state().locals.len() >= u8::MAX as usize {
             return Err(self.error_at(self.previous, "Too many local variables in scope."));
@@ -355,6 +379,19 @@ impl<'a> Compiler<'a> {
     /// between has to capture it as an upvalue of its own, so the chain can be
     /// followed one hop at a time at run time. The recursion here builds that
     /// chain.
+    ///
+    /// Why a chain at all, rather than having the inner function reach straight
+    /// up to the variable? Because at run time the intermediate function may
+    /// still be on the stack *or* may have returned, and which one it is
+    /// changes where the variable lives — a live stack slot, or a closed-over
+    /// copy. Only the function that directly owns the local knows which, so
+    /// each level captures from the one above it and the question is answered
+    /// once per level rather than guessed at from the bottom.
+    ///
+    /// Marking the local captured is not bookkeeping either: it tells the
+    /// enclosing scope to emit `CloseUpvalue` instead of `Pop` when the scope
+    /// ends, which is what copies the value out of the slot before it is
+    /// reused.
     fn resolve_upvalue(&mut self, name: &str, level: usize) -> Option<usize> {
         if level == 0 {
             return None;
