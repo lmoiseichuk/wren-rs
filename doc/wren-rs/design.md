@@ -479,9 +479,25 @@ every later collection. Survival across all 873 programs is 52.9%, and 95–97%
 for the three benchmarks that hold something.
 
 That waste is precisely what a generational collector removes. **It is also
-where the collector already costs nothing**, which is the argument against
-building one: on `binary_trees`, the one program where collection is 17% of the
-clock, tracing is already efficient at 1.70 and a nursery has little to remove.
+where the collector already costs nothing**, which looked at the time like the
+argument against building one: on `binary_trees`, the one program where
+collection is 17% of the clock, tracing is already efficient at 1.70.
+
+**That reasoning used the wrong number and the conclusion was wrong.** Survival
+of the whole live set is not the generational hypothesis; survival of
+*recently allocated* objects is, and they are not the same thing at all. Asked
+properly -- of the objects allocated since the last collection, how many are
+alive at the next one -- the answer is:
+
+| | allocated | survive |
+|---|---|---|
+| `binary_trees` | 100,183 | **16.2%** |
+| all 873 programs | 533,645 | **18.6%** |
+
+So 84% of what the one allocating benchmark produces is dead by the next
+collection, and a nursery would reclaim it while tracing only the sixth that
+is not. The other three benchmarks allocate about a hundred objects each, so
+their survival percentages are noise rather than counter-evidence.
 
 **No garbage was cyclic. None.** Across 453,581 garbage objects, a simulated
 reference count — built at every collection by counting references within the
@@ -532,9 +548,6 @@ sweep has, moved rather than solved.
 
 **What is not worth building**, on this evidence:
 
-- **Generational collection.** It removes re-marking, and re-marking is only
-  wasteful where the collector is already free. Revisit if a workload appears
-  with both a large stable live set *and* a high allocation rate.
 - **More bitmaps.** The marks are already one bit per slot in a side vector.
   There is nothing left to win.
 - **A moving or compacting arena**, as the first step. It would remove the
@@ -542,6 +555,62 @@ sweep has, moved rather than solved.
   dependent load per field access, which the census priced at 9,312 B across
   `binary_trees` — real, but a quarter of what prompt reclamation is worth, and
   it needs objects to move.
+
+### What refcounting measured, and what it means for a nursery
+
+Refcounting is built, behind the `refcount` feature, and it is off. The
+barriers were proved complete rather than audited -- `verify_counts` walks
+every live object, counts the references that exist, and reports every count
+that disagrees; it started at roughly twenty thousand and reports none across
+all 873 programs. With it on, **95.8% of reclaims never reach the collector.**
+
+It still does not pay:
+
+| | time | `binary_trees` peak |
+|---|---|---|
+| tracing only | 8.169 s | 133,888 B |
+| counting only | 8.980 s | 154,064 B |
+| counting and freeing | 9.630 s | 126,056 B |
+
+Eighteen percent of the one allocating benchmark to save six percent of its
+peak, and three to five percent of the others to save nothing.
+
+**Why, stated so it is not relearned.** The profile says the collector is
+16.9% of `binary_trees` and 0.0–0.6% of the rest, so anything replacing it
+wins at most 17% of one program. Counting, by contrast, costs work on every
+store whether or not anything is reclaimed — the cost scales with what the
+program *does*, while the saving is capped by what the collector *costs*.
+
+And the "half of peak is floating garbage" figure that motivated it compared a
+host census of the live set against the device's retained heap. Those are not
+the same measurement.
+
+### The shape the evidence actually points at
+
+Not refcounting, and not a generational collector with several generations and
+a compacting old space either. One nursery, and nothing else:
+
+- **84% of allocations die before the next collection.** A minor collection
+  traces roots and the remembered set, marks the sixth that survives, promotes
+  them and resets the nursery. Its cost is the survivors, not the live set.
+- **Long-lived objects stop being re-marked.** That is the 1.70-to-34 marked-
+  per-object-freed waste, and it is the half of the problem a threshold cannot
+  touch.
+- **No counting.** A nursery trace already learns what a reference count would
+  have told it, without a barrier on every store. The write-barrier *sites*
+  from the refcounting work are the ones a remembered set needs, so that part
+  is not wasted -- only the retain and release in them would be replaced by
+  recording an old-to-young reference.
+- **Bump allocation in the nursery**, which makes creating an object a pointer
+  move rather than a free-list pop, and makes reclaiming the whole nursery a
+  pointer reset.
+
+The honest expectation is the same ceiling as before: at most the 17% the
+collector costs on an allocating program, and nothing on one that does not
+allocate. **The reason to build it is memory, not speed** -- a nursery bounds
+floating garbage by construction, and a bound is what a fixed heap needs.
+
+Which is also why the cheap version of that bound went in first: see below.
 
 ### The dial that is already there
 
@@ -555,6 +624,18 @@ other three benchmarks at all, because they do not collect often enough for the
 threshold to matter. `Heap::set_growth` exists so a firmware can make that
 trade; the default is left alone so the published numbers stay comparable with
 the C port.
+
+**A ratio is the wrong shape for a fixed heap, though.** It lets a program
+hold half as much garbage again as it is using, so the allowance grows with
+the workload on a part whose total does not. `Heap::set_headroom` makes the
+threshold the live set plus a constant instead: with 16 KB of headroom,
+`binary_trees` peaked at 121,624 B rather than 133,888, nine percent less for
+eight percent more time — and, more usefully, at a number a firmware can
+budget against, because it no longer moves with the program.
+
+That is the property a nursery would provide by construction. The headroom is
+the two-line version of it, and it is what makes the nursery a speed
+optimisation of an existing guarantee rather than a new one.
 
 ## The memory targets these have to meet
 
