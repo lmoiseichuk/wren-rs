@@ -16,11 +16,20 @@ exclude = ["/tests/fixtures"]
 [lib]
 name = "wren"
 
-# **No dependencies, and that is a design constraint rather than an accident.**
-# The point of this crate is that a firmware can `cargo add wren` without
-# pulling a C toolchain or a tree of crates behind it. Anything added here has
-# to be paid for in flash on a part with 62 KB of it.
+# **No dependencies by default, and that is a design constraint rather than an
+# accident.** The point of this crate is that a firmware can `cargo add wren`
+# without pulling a C toolchain or a tree of crates behind it. Anything added
+# here has to be paid for in flash on a part with 62 KB of it.
+#
+# `libm` is the one exception, and it is optional. Wren's `Num` class has the
+# transcendentals -- `sin`, `log`, `pow` -- and upstream gets them from the
+# platform's libm; `std` provides them on a host, and a bare-metal target has
+# nothing. Writing them here is not the answer: the tests check them to
+# fourteen significant digits, which is specialist numerical work that a naive
+# series will not reach. `libm` is the Rust port of musl's, so enabling it
+# keeps the crate pure Rust while making the two builds agree.
 [dependencies]
+libm = { version = "0.2", optional = true }
 
 [features]
 default = ["std"]
@@ -31,3 +40,7 @@ std = ["alloc"]
 # The object heap needs a growable allocation. A part with no allocator at all
 # can still use the lexer and, later, the bytecode reader.
 alloc = []
+# `Num`'s transcendentals on a target without `std`. Without either, they are
+# simply not defined -- which reports "Num does not implement 'sin'" rather
+# than answering something wrong.
+libm = ["dep:libm"]

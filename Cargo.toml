@@ -7,6 +7,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/wren"]
+# The ports build for other targets and carry their own profiles; they are
+# their own workspaces.
+exclude = ["ports"]
 
 # Applied to every member. A part with 62 KB of flash cannot afford the default
 # release profile's inlining, and `panic = "abort"` removes the unwinder, which

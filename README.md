@@ -111,10 +111,36 @@ one has to provide.
 | upstream submodule | pinned at 0.4.0 |
 | **step 1 — C reference on the C6** | **done, measured** |
 | **step 2 — MicroPython baseline** | **done, measured** |
-| **step 3 — the Rust VM** | **started** |
-| — lexer | written, 24 tests |
-| — values, objects, collector | written, 28 tests |
-| — compiler, interpreter loop | not started |
+| **step 3 — the Rust VM** | **the language is complete** |
+| — upstream's test suite | **829 of 829** |
+| — conformance probes | **96 of 96** |
+| — this crate's own tests | 193 |
+
+### Step 3: the language is complete
+
+`crates/wren` passes **all 829** of upstream Wren's own tests — every group,
+including `core`, `language`, `limit`, `meta`, `random` and `regression` — run
+unmodified and scored against the `// expect:` comments they already carry.
+That is the same contract the C port was held to in step 1, where upstream
+itself scored 821 of 846 on an ESP32-C6.
+
+Everything the language has: classes with constructors, fields, inheritance,
+`super`, static members and static fields; closures with upvalues; fibers as
+real coroutines, and the error handling built on them; modules and `import`;
+maps as a hash table; `Sequence` with lazy `map`/`where`/`take`/`skip`; class
+attributes; string interpolation and Wren's UTF-8 rules. No `unsafe`.
+
+**One difference that matters for benchmarking, stated before any numbers.**
+Upstream writes a good deal of its core library *in Wren* — `Sequence` and its
+methods live in `wren_core.wren` and are compiled at every start-up. Here they
+are Rust primitives. That is a deliberate choice for the 8 KB target, where
+compiling several hundred lines of core library before user code runs is
+unaffordable, and it is why this VM starts faster and uses less stack than
+upstream's. It also means **any benchmark leaning on `Sequence` measures that
+choice rather than the interpreter**, and would flatter this implementation for
+a reason that has nothing to do with the VM. The four benchmark programs do not
+use those methods — they are loops, field access, arithmetic and dispatch — so
+the published comparison is unaffected; a different benchmark might not be.
 
 ### Steps 1 and 2: the numbers to beat
 

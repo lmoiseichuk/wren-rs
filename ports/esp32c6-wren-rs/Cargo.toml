@@ -1,0 +1,50 @@
+# The Rust VM on an ESP32-C6, for the measurement that matters.
+#
+# **Bare metal, not ESP-IDF.** The C port in `../esp32c6-wren` is an ESP-IDF
+# application because upstream Wren is a C library that expects a libc; this
+# crate is `no_std` by design, so going through ESP-IDF would add a layer it
+# does not need and measure that layer's start-up and heap alongside the VM's.
+#
+# The dependencies here are the port's, not the library's. `crates/wren` still
+# has none, which is the point -- a firmware takes the VM without taking a tree
+# of crates with it.
+[package]
+name = "esp32c6-wren-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# **Its own workspace, deliberately.** This builds for a different target with
+# its own profiles, and sweeping it into the root workspace would put a
+# bare-metal firmware into `cargo test` at the top level.
+[workspace]
+
+[dependencies]
+wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "libm"] }
+esp-hal = { version = "1.2", features = ["esp32c6", "unstable"] }
+esp-alloc = { version = "0.11", features = ["esp32c6"] }
+esp-println = { version = "0.16", features = ["esp32c6"] }
+esp-backtrace = { version = "0.18", features = ["esp32c6", "panic-handler", "println"] }
+# The chip's second-stage bootloader expects an app descriptor at a fixed
+# offset, even in an application that uses none of ESP-IDF otherwise.
+
+# **Two profiles, matching the two the C port publishes.** `-Os` and `-O2` are
+# the compiler flags that produced those numbers; `opt-level = "z"` and
+# `opt-level = 3` are the nearest equivalents here, and both are built from the
+# same source so the difference is the optimiser's alone.
+[profile.size]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.speed]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

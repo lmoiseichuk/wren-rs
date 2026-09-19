@@ -42,6 +42,64 @@ pub fn sqrt(x: f64) -> f64 {
 #[cfg(not(feature = "std"))]
 pub use fallback::{abs, ceil, floor, sqrt, trunc};
 
+/// The transcendentals, which have to come from somewhere.
+///
+/// **`std` on a host, `libm` on a target that enables it, and nothing at all
+/// otherwise.** Wren's tests check these to fourteen significant digits, which
+/// is not something a hand-rolled series reaches reliably -- so rather than
+/// ship an approximation that is quietly wrong in the last digits, a build
+/// with neither simply does not define the methods. That reports `Num does not
+/// implement 'sin'`, which a caller can see, instead of an answer they cannot
+/// check.
+#[cfg(any(feature = "std", feature = "libm"))]
+pub mod real {
+    macro_rules! from_std_or_libm {
+        ($($name:ident),* $(,)?) => {
+            $(
+                #[cfg(feature = "std")]
+                pub fn $name(x: f64) -> f64 {
+                    x.$name()
+                }
+                #[cfg(all(not(feature = "std"), feature = "libm"))]
+                pub fn $name(x: f64) -> f64 {
+                    libm::$name(x)
+                }
+            )*
+        };
+    }
+
+    from_std_or_libm!(round, exp, log2, cbrt, sin, cos, tan, asin, acos, atan);
+
+    // `ln` is spelled `log` by libm and `ln` by std, and `powf`/`atan2` take
+    // two arguments, so these three are written out.
+    #[cfg(feature = "std")]
+    pub fn ln(x: f64) -> f64 {
+        x.ln()
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    pub fn ln(x: f64) -> f64 {
+        libm::log(x)
+    }
+
+    #[cfg(feature = "std")]
+    pub fn pow(x: f64, y: f64) -> f64 {
+        x.powf(y)
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    pub fn pow(x: f64, y: f64) -> f64 {
+        libm::pow(x, y)
+    }
+
+    #[cfg(feature = "std")]
+    pub fn atan2(y: f64, x: f64) -> f64 {
+        y.atan2(x)
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    pub fn atan2(y: f64, x: f64) -> f64 {
+        libm::atan2(y, x)
+    }
+}
+
 /// The `no_std` implementations.
 ///
 /// Public so the tests can compare them against `std`'s even in a build where

@@ -746,54 +746,57 @@ fn install_num_extras(vm: &mut Vm) {
         Ok(Value::num(!(value as i64 as u32) as f64))
     });
 
-    // **Only with `std`.** These need libm, which a `no_std` firmware does not
-    // have and this crate will not take a dependency for. Leaving them
-    // undefined there gives "Num does not implement 'sin'", which is honest;
-    // defining them to return NaN would be a silent wrong answer.
-    #[cfg(feature = "std")]
+    // **Present when there is a libm to get them from**, which is `std` on a
+    // host and the optional `libm` feature on a bare-metal target. With
+    // neither they are undefined, and `1.sin` reports "Num does not implement
+    // 'sin'" -- an answer the caller can see, rather than one from a series
+    // that is quietly wrong in the digits Wren prints.
+    #[cfg(any(feature = "std", feature = "libm"))]
     {
+        use crate::math::real;
+
         define(vm, class, "round", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).round()))
+            Ok(Value::num(real::round(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "pow(_)", |vm, at| {
             let base = receiver(vm, at).as_num().unwrap_or(f64::NAN);
             let exponent = number_argument(vm, at, 1)?;
-            Ok(Value::num(base.powf(exponent)))
+            Ok(Value::num(real::pow(base, exponent)))
         });
         define(vm, class, "log", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).ln()))
+            Ok(Value::num(real::ln(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "log2", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).log2()))
+            Ok(Value::num(real::log2(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "exp", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).exp()))
+            Ok(Value::num(real::exp(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "cbrt", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).cbrt()))
+            Ok(Value::num(real::cbrt(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "sin", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).sin()))
+            Ok(Value::num(real::sin(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "cos", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).cos()))
+            Ok(Value::num(real::cos(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "tan", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).tan()))
+            Ok(Value::num(real::tan(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "asin", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).asin()))
+            Ok(Value::num(real::asin(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "acos", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).acos()))
+            Ok(Value::num(real::acos(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "atan", |vm, at| {
-            Ok(Value::num(receiver(vm, at).as_num().unwrap_or(f64::NAN).atan()))
+            Ok(Value::num(real::atan(receiver(vm, at).as_num().unwrap_or(f64::NAN))))
         });
         define(vm, class, "atan(_)", |vm, at| {
             let y = receiver(vm, at).as_num().unwrap_or(f64::NAN);
             let x = number_argument(vm, at, 1)?;
-            Ok(Value::num(y.atan2(x)))
+            Ok(Value::num(real::atan2(y, x)))
         });
     }
 
