@@ -83,9 +83,10 @@ instructions land* is worth more than that: padding every branch target to eight
 bytes, with the source untouched, takes `fib` from 16.774 s to 16.127. So a
 small difference between two builds is a fact about placement until it has been
 measured at several placements, and consistency across all four benchmarks is
-not the check it looks like. The experiment, and the mirror one showing that
-moving the *data* changes nothing at all, is in
-**[`doc/wren-rs/design.md`](doc/wren-rs/design.md)**.
+not the check it looks like. The experiment, the mirror one showing that moving
+the *data* changes nothing at all, and the chip's performance counter that
+settles both are in
+**[`doc/wren-rs/profiling.md`](doc/wren-rs/profiling.md)**.
 
 ### `f32` against `f64`
 
@@ -319,7 +320,7 @@ The full tables — every benchmark at both optimisation levels, against C Wren
 and MicroPython, with the method and caveats — are in
 **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
 
-### Two documents
+### Three documents
 
 **[`doc/wren-rs/design.md`](doc/wren-rs/design.md)** — the decisions and what
 they cost. NaN tagging in safe Rust; why an object carries **no header at all**
@@ -333,6 +334,15 @@ mark-sweep built, verified and rejected, each with the number that justified it
 and how that number was misread; and the ceiling on garbage that **costs
 nothing at all on a part holding few objects**, which is the setting a CH32
 wants.
+
+**[`doc/wren-rs/profiling.md`](doc/wren-rs/profiling.md)** — how any of this is
+measured, and what each instrument lies about. Why a workstation called every
+real optimisation noise; a sampling profiler built out of `gdb` because there
+is no `perf`, and the three things it gets wrong; the board being exact to the
+microsecond while **3 to 4% of a benchmark is where the code landed**; and the
+chip's performance counter, whose event numbers are in no header here and were
+found by experiment — which then said the interpreter spends two cycles in
+three retiring nothing.
 
 ### Step 4 measured: shipping bytecode
 

@@ -16,76 +16,31 @@ core library at start-up, and an object that carries no header.
 
 ## What a measurement on this board is worth
 
-Every number in this document is the C6's, because a workstation says nothing
-useful about an in-order core -- an out-of-order one hides a dependent load that
-this part pays for in full. It turned out the board needs a control of its own.
+Two facts govern every number below, and both cost a day to learn. They are
+argued in full in [`profiling.md`](profiling.md); the short form is:
 
-**There is no run-to-run noise to average away.** Three flashes of the same
-image gave `binary_trees` 9.006731 s, 9.006731 s and 9.006731 s -- identical to
-the microsecond, not to three decimals. One run is the measurement, and a
-difference between two runs of the same image is not a thing that happens.
+**The board is exact.** Three flashes of one image give `binary_trees`
+9.006731 s, 9.006731 s and 9.006731 s. One run is the measurement.
 
-**What moves instead is where the instructions land.** Adding one field to
-`Heap` moved `fib` by 1.8% -- and `fib` allocates four kilobytes in total,
-compacts nothing, and cannot be touched by a change to the collector at all.
-All four benchmarks moved by about that much in the same direction, which is the
-signature of the instruction stream shifting under the fetch rather than of work
-being removed.
+**Its code placement is not.** Padding every branch target to four bytes --
+same source, same structs, only the instructions moved -- is worth 3 to 4% on
+all four benchmarks. So a difference of one or two per cent between two builds
+says nothing about the change, and *consistency across all four benchmarks says
+nothing either*, because that is exactly what placement produces. The chip's
+performance counter is what settles those: instructions retired move by one
+part in 541 million across a placement change worth 3% of the time.
 
-Shown directly, by changing *only* placement:
-`-Cllvm-args=-align-all-nofallthru-blocks=N` pads every branch target to a
-2^N-byte boundary and does nothing else to the program.
+The interpreter is **fetch-bound** — between 2.6 and 2.8 cycles per instruction
+on an in-order core whose common instructions take one. That is the fact behind
+the next section, and behind the padding now being in the build.
 
-| branch targets padded to | `binary_trees` | `fib` | `list_build` | `method_call` | flashed image |
-|---|---|---|---|---|---|
-| nothing | 9.007 s | 16.774 s | 0.5659 s | 2.4788 s | 465,904 B |
-| 2 B | 9.007 s | 16.774 s | 0.5659 s | 2.4788 s | 465,904 B |
-| **4 B** *(now the default)* | 8.729 s | **16.127 s** | 0.5446 s | **2.3820 s** | **472,544 B** |
-| 8 B | 8.737 s | 16.127 s | **0.5445 s** | 2.3820 s | 484,832 B |
-| 16 B | **8.725 s** | 16.137 s | 0.5446 s | 2.3837 s | 511,232 B |
-| 32 B | 8.751 s | 16.174 s | 0.5445 s | 2.3901 s | 559,776 B |
+### What it said about the obvious next optimisation
 
-Two bytes is a no-op and the image comes out byte-identical, because RV32IMAC's
-compressed instructions already force that alignment. Four bytes takes the
-whole effect; past it the flash grows three and seven times as fast for less
-than half a per cent. `-Os` gains the same way -- `binary_trees` 17.189 ->
-16.587 s, `fib` 33.367 -> 32.448 -- for 2,880 B of a 291,200 B image, so
-`ports/esp32c6-wren-rs/.cargo/config.toml` now passes
-`-Cllvm-args=-align-all-nofallthru-blocks=2` on both profiles. **It costs no
-RAM**, which is the resource that decides what this VM can run on.
-
-*Flashed image, `-O3`, as `espflash` reports it -- not the ELF on disk, which
-carries symbols nothing loads and is 800 KB whatever the padding. The `-Os`
-image, which is the footprint figure this project leads with, is 291,200 B.*
-
-**It is the code's placement, not the data's.** The mirror experiment leaks a
-fixed number of bytes before the VM is built, so every allocation the VM makes
-moves by that much while its code stays exactly where it was. A verified
-64-byte shift -- the next allocation really does move from `0x408013a0` to
-`0x408013e0` -- changed `binary_trees` by 0.009% and `fib` by 0.0002%. That is
-what the part's memory map predicts: instructions are fetched from flash through
-a cache, and data sits in SRAM with nothing in front of it, so data has no
-alignment to get wrong.
-
-*The first version of that experiment measured nothing, because the optimiser
-deleted a leaked allocation whose result nothing read -- both shifts reported
-the same address. A control needs its own control.*
-
-**What this costs the method.** A source change that alters the size of
-anything in the interpreter moves everything after it, and that alone is worth a
-couple of percent in either direction. So a one-or-two-percent difference
-between two builds is not evidence about the change -- and *consistency across
-all four benchmarks is not evidence either*, because that is exactly what
-placement produces. Anything in that range has to be measured at several
-paddings, which holds placement roughly still while the source varies, or left
-unclaimed.
-
-**What that method then said about the obvious next optimisation.** The
-interpreter decodes each byte into an `Op` and matches on the `Op` -- a switch
-feeding a switch, which the sampling profiler put at 14% of `binary_trees` and
-which LLVM does not fuse on this target. Matching the raw byte instead, with
-`const u8` patterns, makes it one jump table. Measured at four placements, both
-variants built from the same commit:
+The interpreter decodes each byte into an `Op` and matches on the `Op` -- a
+switch feeding a switch, which the sampling profiler put at 14% of
+`binary_trees` and which LLVM does not fuse on this target. Matching the raw
+byte instead, with `const u8` patterns, makes it one jump table. Measured at
+several placements, both variants built from the same commit:
 
 | | `binary_trees` | `fib` | `method_call` | flashed image |
 |---|---|---|---|---|
@@ -95,81 +50,17 @@ variants built from the same commit:
 | one table, 4 B padding | 8.824 s | 16.380 s | 2.422 s | 472,192 B |
 
 **The two are substitutes, and together they are worse than padding alone.**
-Rewriting the dispatch is worth 2.4-3.4% on an unpadded build and is a
-1.1-1.6% *regression* on a padded one. Both are treating the same bottleneck --
-the loop is instruction-fetch bound -- and once it is relieved the rewrite only
-adds code. So the rewrite is not in the tree: it would have to be re-argued
-against whatever placement ships, and it costs the exhaustiveness check that
-`match op` gives for free, where a new opcode with no arm becomes a runtime
-"bad opcode" instead of a compile error.
+The rewrite is worth 2.4-3.4% on an unpadded build and is a 1.1-1.6%
+*regression* on a padded one. Both treat the same bottleneck, and once it is
+relieved the rewrite only adds code. So it is not in the tree: it would have to
+be re-argued against whatever placement ships, and it costs the exhaustiveness
+`match op` gives for free -- a new opcode with no arm would become a runtime
+"bad opcode" rather than a compile error.
 
-The padding is cheap at four bytes and saturates there: 8 B and 16 B are within
-0.3% of it for three and seven times the flash. On `-Os` it costs 2,880 B of a
-291,200 B image.
+*The shape of that finding is the one to carry forward: on this part a source
+change to the interpreter competes with instruction placement rather than
+adding to it, and neither can be judged without the other.*
 
-*This is the shape of the finding worth carrying forward: on this part, a
-source change to the interpreter competes with instruction placement rather
-than adding to it, and neither can be judged without the other.*
-
-### The instrument that settles it: counting work instead of time
-
-**The part has a performance counter, and it is not the RISC-V standard one.**
-Reading `minstret` raises an illegal-instruction exception here -- the
-privileged spec's machine counters are not implemented. What is implemented is
-Espressif's own, three custom CSRs that ESP-IDF declares for this chip with
-`SOC_CPU_HAS_CSR_PC` and saves across a sleep:
-
-| CSR | name | holds |
-|---|---|---|
-| `0x7e0` | `mpcer` | which events to count, one bit each |
-| `0x7e1` | `mpcmr` | bit 0 enables counting |
-| `0x7e2` | `mpccr` | the count |
-
-ESP-IDF names exactly one event, `PCER_CYCLES = 1 << 0`; the rest are in the
-chip's manual and in no header on this bench. So they were found by
-experiment. `ports/esp32c6-wren-rs/src/bin/counters.rs` runs five workloads
-that differ from a baseline loop by one known operation each, and reports which
-event moves. Counts per iteration:
-
-| event | base | +arith | +load | +store | +branch | what it is |
-|---|---|---|---|---|---|---|
-| 0 | 7.05 | 8.03 | 9.01 | 8.04 | 14.04 | **cycles** (ESP-IDF's one name) |
-| 1 | 7.00 | 7.00 | 9.00 | 8.00 | 11.00 | **instructions retired** |
-| 5 | 1.00 | 1.00 | **2.00** | 1.00 | 1.00 | loads |
-| 6 | 1.00 | 1.00 | 1.00 | **2.00** | 2.00 | stores |
-| 4, 7, 8, 9, 10, 12 | | | | | | move, unidentified |
-
-*The `+arith` column does not move event 1, which it should: the optimiser
-folds that add into the loop's induction variable. Events 4 and 7-12 respond to
-the workloads but not in a way that names them from these five alone -- an
-instruction-cache-miss event is very likely among them, and finding it would
-turn the fetch-bound conclusion below from an inference into a reading.*
-
-**The proof that it measures work and not placement.** The same source, built
-twice, differing only in branch-target padding:
-
-| `binary_trees` | no padding | 4 B padding | difference |
-|---|---|---|---|
-| time | 9.007332 s | 8.731564 s | **−3.06%** |
-| instructions retired | 541,532,864 | 541,532,863 | **1 in 541 million** |
-
-| `fib` | no padding | 4 B padding | difference |
-|---|---|---|---|
-| time | 16.774597 s | 16.127337 s | **−3.86%** |
-| instructions retired | 970,748,140 | 970,747,973 | 1 in 5.8 million |
-
-Three per cent of time, and the work is the same to a part in a million. That
-is the whole argument for the instrument: it cannot be fooled by where the code
-landed, so a change that claims to do less work has somewhere to prove it.
-
-**And it says what the bottleneck is.** At 160 MHz, `binary_trees` unpadded is
-1.441 billion cycles for 541.5 million instructions -- **2.66 cycles per
-instruction**, on an in-order core whose common instructions are one cycle.
-Padding takes it to 2.58. Nearly two of every three cycles are spent not
-retiring anything, and the thing that moves the number is where the branch
-targets sit. That is a fetch-bound interpreter, which is why a source change
-that removes work can still measure slower, and why the two fixes in the table
-above were substitutes rather than additions.
 
 ## Value: NaN tagging, as upstream, in safe Rust
 
