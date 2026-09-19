@@ -35,6 +35,15 @@ use appdesc as _;
 /// makes a heap figure comparable, rather than matching the total.
 const HEAP_BYTES: usize = 320 * 1024;
 
+/// How much garbage the collector may leave lying before it runs again.
+///
+/// `None` uses the growth ratio, which is what the C port is measured against
+/// and therefore what the published numbers use. `Some(16 * 1024)` measured
+/// `binary_trees` at 121,624 B peak instead of 133,888 -- 9% less memory for
+/// 8% more time, and a peak that is the live set plus a constant rather than
+/// half as much again as the live set.
+const HEADROOM: Option<usize> = None;
+
 /// The benchmarks, in the order the published table lists them.
 const BENCHMARKS: &[(&str, &str)] = &[
     ("binary_trees", include_str!("../../../benchmarks/wren/binary_trees.wren")),
@@ -78,6 +87,11 @@ fn run_one(name: &str, source: &str) {
     // starting condition -- the C port restarts the board between runs for the
     // same reason.
     let mut vm = Vm::new();
+    // **A fixed heap wants a fixed ceiling on garbage.** The default growth
+    // factor is upstream's 1.5x, which lets a program hold half as much
+    // garbage again as it is using -- a ratio, on a part whose total is a
+    // constant. See `Heap::set_headroom`.
+    vm.heap.set_headroom(HEADROOM);
 
     // `System.clock` is a host hook on a bare-metal target: there is no
     // process clock to default to, so the port supplies the one the chip has.

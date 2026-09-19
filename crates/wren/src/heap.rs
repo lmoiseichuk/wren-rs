@@ -325,6 +325,15 @@ pub struct Heap {
     threshold: usize,
     /// The growth factor, as a fraction. See [`GROWTH_NUMERATOR`].
     growth: (usize, usize),
+    /// An absolute ceiling on floating garbage, if one is set.
+    ///
+    /// **A multiple makes garbage grow with the live set; a cap does not.**
+    /// At 1.5x, a program holding 200 KB is allowed 100 KB of garbage before
+    /// anything is collected -- which is the wrong shape entirely for a part
+    /// that has 320 KB in total. With a headroom of 16 KB the peak is the live
+    /// set plus 16 KB, whatever the live set is, and a firmware can size its
+    /// heap from the one number it can actually predict.
+    headroom: Option<usize>,
     /// Set while a collection is not wanted — during a sequence of allocations
     /// whose intermediate results are not yet reachable from any root.
     paused: bool,
@@ -420,6 +429,7 @@ impl Heap {
             bytes: 0,
             threshold: INITIAL_THRESHOLD,
             growth: (GROWTH_NUMERATOR, GROWTH_DENOMINATOR),
+            headroom: None,
             paused: false,
             collections: 0,
             candidates: Vec::new(),
@@ -1206,6 +1216,20 @@ impl Heap {
         self.growth = (numerator, denominator);
     }
 
+    /// Collect once the live set has grown by this many bytes, rather than by
+    /// a multiple of itself.
+    ///
+    /// **This is the setting for a fixed heap.** The growth factor is
+    /// upstream's and it is a ratio, so the garbage a program is allowed to
+    /// accumulate scales with how much it is holding -- exactly backwards for
+    /// a part where the total is fixed. A headroom makes the peak the live set
+    /// plus a constant, which is a number a firmware can budget against.
+    ///
+    /// `None` restores the ratio.
+    pub fn set_headroom(&mut self, bytes: Option<usize>) {
+        self.headroom = bytes;
+    }
+
     /// The growth factor in force, as `(numerator, denominator)`.
     pub fn growth(&self) -> (usize, usize) {
         self.growth
@@ -1361,8 +1385,14 @@ impl Heap {
 
         self.live = live;
         self.bytes = bytes;
-        let (numerator, denominator) = self.growth;
-        self.threshold = (bytes * numerator / denominator).max(INITIAL_THRESHOLD);
+        self.threshold = match self.headroom {
+            Some(headroom) => bytes.saturating_add(headroom),
+            None => {
+                let (numerator, denominator) = self.growth;
+                bytes * numerator / denominator
+            }
+        }
+        .max(INITIAL_THRESHOLD);
         self.collections += 1;
 
         Collection {
