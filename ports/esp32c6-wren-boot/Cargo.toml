@@ -28,6 +28,8 @@ publish = false
 # the embedded programs from `.wrenc` to `.wren`.
 default = []
 compiler = ["wren/compiler"]
+# 32-bit numbers, orthogonal to whether the compiler is linked.
+f32 = ["wren/f32"]
 
 [dependencies]
 wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "libm"] }

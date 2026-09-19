@@ -14,33 +14,67 @@
 //! `cfg` branch: the test suite calls it **by name** and checks it against
 //! `std`'s across the range, so the device path is tested on every run.
 
+use crate::value::Num;
+
+// `std`'s methods exist on both `f32` and `f64`, so one definition covers
+// either width.
 #[cfg(feature = "std")]
-pub fn abs(x: f64) -> f64 {
+pub fn abs(x: Num) -> Num {
     x.abs()
 }
 
 #[cfg(feature = "std")]
-pub fn trunc(x: f64) -> f64 {
+pub fn trunc(x: Num) -> Num {
     x.trunc()
 }
 
 #[cfg(feature = "std")]
-pub fn floor(x: f64) -> f64 {
+pub fn floor(x: Num) -> Num {
     x.floor()
 }
 
 #[cfg(feature = "std")]
-pub fn ceil(x: f64) -> f64 {
+pub fn ceil(x: Num) -> Num {
     x.ceil()
 }
 
 #[cfg(feature = "std")]
-pub fn sqrt(x: f64) -> f64 {
+pub fn sqrt(x: Num) -> Num {
     x.sqrt()
 }
 
+// **The fallbacks stay `f64` and a narrower build widens into them.** One
+// implementation, one set of tests, and the answers are the same ones: `abs`,
+// `trunc`, `floor` and `ceil` are exact under widening, and `f64` has more
+// than twice `f32`'s mantissa plus two bits, which is the condition under
+// which rounding a `f64` square root down to `f32` gives the correctly rounded
+// `f32` result. Writing a second bit-twiddling implementation to save a
+// conversion on the path that has no libm would be trading a tested thing for
+// an untested one.
 #[cfg(not(feature = "std"))]
-pub use fallback::{abs, ceil, floor, sqrt, trunc};
+pub fn abs(x: Num) -> Num {
+    fallback::abs(x as f64) as Num
+}
+
+#[cfg(not(feature = "std"))]
+pub fn trunc(x: Num) -> Num {
+    fallback::trunc(x as f64) as Num
+}
+
+#[cfg(not(feature = "std"))]
+pub fn floor(x: Num) -> Num {
+    fallback::floor(x as f64) as Num
+}
+
+#[cfg(not(feature = "std"))]
+pub fn ceil(x: Num) -> Num {
+    fallback::ceil(x as f64) as Num
+}
+
+#[cfg(not(feature = "std"))]
+pub fn sqrt(x: Num) -> Num {
+    fallback::sqrt(x as f64) as Num
+}
 
 /// The transcendentals, which have to come from somewhere.
 ///
@@ -53,50 +87,84 @@ pub use fallback::{abs, ceil, floor, sqrt, trunc};
 /// check.
 #[cfg(any(feature = "std", feature = "libm"))]
 pub mod real {
+    use crate::value::Num;
+
+    // **libm names its `f32` entry points with an `f` suffix**, so a narrow
+    // build names them explicitly rather than widening to `f64` and back. That
+    // matters here in a way it does not for the five above: these are the
+    // expensive ones, and on a part with no FPU a software `f64` sine is
+    // several times the cost of a software `f32` one.
     macro_rules! from_std_or_libm {
-        ($($name:ident),* $(,)?) => {
+        ($($name:ident / $narrow:ident),* $(,)?) => {
             $(
                 #[cfg(feature = "std")]
-                pub fn $name(x: f64) -> f64 {
+                pub fn $name(x: Num) -> Num {
                     x.$name()
                 }
-                #[cfg(all(not(feature = "std"), feature = "libm"))]
-                pub fn $name(x: f64) -> f64 {
+                #[cfg(all(not(feature = "std"), feature = "libm", not(feature = "f32")))]
+                pub fn $name(x: Num) -> Num {
                     libm::$name(x)
+                }
+                #[cfg(all(not(feature = "std"), feature = "libm", feature = "f32"))]
+                pub fn $name(x: Num) -> Num {
+                    libm::$narrow(x)
                 }
             )*
         };
     }
 
-    from_std_or_libm!(round, exp, log2, cbrt, sin, cos, tan, asin, acos, atan);
+    from_std_or_libm!(
+        round / roundf,
+        exp / expf,
+        log2 / log2f,
+        cbrt / cbrtf,
+        sin / sinf,
+        cos / cosf,
+        tan / tanf,
+        asin / asinf,
+        acos / acosf,
+        atan / atanf,
+    );
 
-    // `ln` is spelled `log` by libm and `ln` by std, and `powf`/`atan2` take
+    // `ln` is spelled `log` by libm and `ln` by std, and `pow`/`atan2` take
     // two arguments, so these three are written out.
     #[cfg(feature = "std")]
-    pub fn ln(x: f64) -> f64 {
+    pub fn ln(x: Num) -> Num {
         x.ln()
     }
-    #[cfg(all(not(feature = "std"), feature = "libm"))]
-    pub fn ln(x: f64) -> f64 {
+    #[cfg(all(not(feature = "std"), feature = "libm", not(feature = "f32")))]
+    pub fn ln(x: Num) -> Num {
         libm::log(x)
     }
+    #[cfg(all(not(feature = "std"), feature = "libm", feature = "f32"))]
+    pub fn ln(x: Num) -> Num {
+        libm::logf(x)
+    }
 
     #[cfg(feature = "std")]
-    pub fn pow(x: f64, y: f64) -> f64 {
+    pub fn pow(x: Num, y: Num) -> Num {
         x.powf(y)
     }
-    #[cfg(all(not(feature = "std"), feature = "libm"))]
-    pub fn pow(x: f64, y: f64) -> f64 {
+    #[cfg(all(not(feature = "std"), feature = "libm", not(feature = "f32")))]
+    pub fn pow(x: Num, y: Num) -> Num {
         libm::pow(x, y)
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm", feature = "f32"))]
+    pub fn pow(x: Num, y: Num) -> Num {
+        libm::powf(x, y)
     }
 
     #[cfg(feature = "std")]
-    pub fn atan2(y: f64, x: f64) -> f64 {
+    pub fn atan2(y: Num, x: Num) -> Num {
         y.atan2(x)
     }
-    #[cfg(all(not(feature = "std"), feature = "libm"))]
-    pub fn atan2(y: f64, x: f64) -> f64 {
+    #[cfg(all(not(feature = "std"), feature = "libm", not(feature = "f32")))]
+    pub fn atan2(y: Num, x: Num) -> Num {
         libm::atan2(y, x)
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm", feature = "f32"))]
+    pub fn atan2(y: Num, x: Num) -> Num {
+        libm::atan2f(y, x)
     }
 }
 

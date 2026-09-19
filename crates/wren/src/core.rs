@@ -49,7 +49,7 @@ use crate::object::{
     MapEntry, ObjClass, ObjFiber, ObjInstance, ObjList, ObjMap, ObjRange, ObjString, Object,
     Primitive,
 };
-use crate::value::Value;
+use crate::value::{Num, Value};
 use crate::vm::{RuntimeError, Switch, Vm};
 
 /// Bind a primitive to a signature on a class.
@@ -73,7 +73,7 @@ fn argument(vm: &Vm, at: usize, index: usize) -> Value {
 /// **Wren distinguishes "not a number" from "not an integer"** and the suite
 /// checks both messages, so this cannot collapse into one check. `noun` is the
 /// word the message starts with -- "Index", "Iterator", "Count".
-fn integer_argument(vm: &Vm, at: usize, index: usize, noun: &str) -> Result<f64, RuntimeError> {
+fn integer_argument(vm: &Vm, at: usize, index: usize, noun: &str) -> Result<Num, RuntimeError> {
     let value = argument(vm, at, index)
         .as_num()
         .ok_or_else(|| RuntimeError::new(alloc::format!("{noun} must be a number.")))?;
@@ -123,7 +123,7 @@ fn expect_arity(vm: &Vm, function: Value, wanted: usize) -> Result<(), RuntimeEr
     Ok(())
 }
 
-fn number_argument(vm: &Vm, at: usize, index: usize) -> Result<f64, RuntimeError> {
+fn number_argument(vm: &Vm, at: usize, index: usize) -> Result<Num, RuntimeError> {
     argument(vm, at, index)
         .as_num()
         .ok_or_else(|| RuntimeError::new("Right operand must be a number."))
@@ -133,7 +133,7 @@ fn number_argument(vm: &Vm, at: usize, index: usize) -> Result<f64, RuntimeError
 macro_rules! arithmetic {
     ($vm:expr, $class:expr, $signature:literal, $left:ident, $right:ident, $body:expr) => {
         define($vm, $class, $signature, |vm, at| {
-            let $left = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+            let $left = receiver(vm, at).as_num().unwrap_or(Num::NAN);
             let $right = number_argument(vm, at, 1)?;
             Ok($body)
         });
@@ -323,7 +323,7 @@ fn install_fn(vm: &mut Vm) {
             return Err(RuntimeError::new("Receiver must be a function."));
         };
         let arity = vm.arity_of(id).unwrap_or(0);
-        Ok(Value::num(arity as f64))
+        Ok(Value::num(arity as Num))
     });
 
     // **One `call` per arity, because a Wren signature includes its arity.**
@@ -554,7 +554,7 @@ fn install_num(vm: &mut Vm) {
     // closure's parameter. Macro hygiene is right to bind it that way, and the
     // result is a closure that captures, which is not a `fn` pointer.
     define(vm, class, "..(_)", |vm, at| {
-        let from = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let from = receiver(vm, at).as_num().unwrap_or(Num::NAN);
         let to = number_argument(vm, at, 1)?;
         let id = vm.heap.allocate(Object::Range(ObjRange {
             from,
@@ -564,7 +564,7 @@ fn install_num(vm: &mut Vm) {
         Ok(Value::object(id))
     });
     define(vm, class, "...(_)", |vm, at| {
-        let from = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let from = receiver(vm, at).as_num().unwrap_or(Num::NAN);
         let to = number_argument(vm, at, 1)?;
         let id = vm.heap.allocate(Object::Range(ObjRange {
             from,
@@ -594,26 +594,26 @@ fn install_num(vm: &mut Vm) {
     });
 
     define(vm, class, "-", |vm, at| {
-        Ok(Value::num(-receiver(vm, at).as_num().unwrap_or(f64::NAN)))
+        Ok(Value::num(-receiver(vm, at).as_num().unwrap_or(Num::NAN)))
     });
     define(vm, class, "abs", |vm, at| {
         Ok(Value::num(math::abs(
-            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            receiver(vm, at).as_num().unwrap_or(Num::NAN),
         )))
     });
     define(vm, class, "floor", |vm, at| {
         Ok(Value::num(math::floor(
-            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            receiver(vm, at).as_num().unwrap_or(Num::NAN),
         )))
     });
     define(vm, class, "ceil", |vm, at| {
         Ok(Value::num(math::ceil(
-            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            receiver(vm, at).as_num().unwrap_or(Num::NAN),
         )))
     });
     define(vm, class, "sqrt", |vm, at| {
         Ok(Value::num(math::sqrt(
-            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            receiver(vm, at).as_num().unwrap_or(Num::NAN),
         )))
     });
     define(vm, class, "toString", |vm, at| {
@@ -677,7 +677,7 @@ fn install_string(vm: &mut Vm) {
         // question and a different method.
         let bytes = string_bytes(vm, receiver(vm, at));
         let count = bytes.iter().filter(|byte| !is_continuation(**byte)).count();
-        Ok(Value::num(count as f64))
+        Ok(Value::num(count as Num))
     });
 
     define(vm, class, "toString", |vm, at| Ok(receiver(vm, at)));
@@ -717,17 +717,17 @@ fn install_num_extras(vm: &mut Vm) {
     let class = vm.num_class;
 
     define(vm, class, "min(_)", |vm, at| {
-        let a = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let a = receiver(vm, at).as_num().unwrap_or(Num::NAN);
         let b = number_argument(vm, at, 1)?;
         Ok(Value::num(if a < b { a } else { b }))
     });
     define(vm, class, "max(_)", |vm, at| {
-        let a = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let a = receiver(vm, at).as_num().unwrap_or(Num::NAN);
         let b = number_argument(vm, at, 1)?;
         Ok(Value::num(if a > b { a } else { b }))
     });
     define(vm, class, "clamp(_,_)", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
         let low = number_argument(vm, at, 1)?;
         let high = number_argument(vm, at, 2)?;
         let clamped = if value < low {
@@ -742,11 +742,11 @@ fn install_num_extras(vm: &mut Vm) {
 
     define(vm, class, "truncate", |vm, at| {
         Ok(Value::num(math::trunc(
-            receiver(vm, at).as_num().unwrap_or(f64::NAN),
+            receiver(vm, at).as_num().unwrap_or(Num::NAN),
         )))
     });
     define(vm, class, "fraction", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
         let fraction = value - math::trunc(value);
         // `(-2).fraction` is `-0`, not `0`. The subtraction gives a positive
         // zero, and Wren prints the sign, so it has to be put back.
@@ -756,7 +756,7 @@ fn install_num_extras(vm: &mut Vm) {
         Ok(Value::num(fraction))
     });
     define(vm, class, "sign", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
         let sign = if value > 0.0 {
             1.0
         } else if value < 0.0 {
@@ -769,7 +769,7 @@ fn install_num_extras(vm: &mut Vm) {
         Ok(Value::num(sign))
     });
     define(vm, class, "isInteger", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
         Ok(Value::bool(
             value.is_finite() && value == math::trunc(value),
         ))
@@ -798,8 +798,8 @@ fn install_num_extras(vm: &mut Vm) {
         bitwise(vm, at, |a, b| a.wrapping_shr(b & 31))
     });
     define(vm, class, "~", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(f64::NAN);
-        Ok(Value::num(!(value as i64 as u32) as f64))
+        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+        Ok(Value::num(!(value as i64 as u32) as Num))
     });
 
     // **Present when there is a libm to get them from**, which is `std` on a
@@ -813,66 +813,66 @@ fn install_num_extras(vm: &mut Vm) {
 
         define(vm, class, "round", |vm, at| {
             Ok(Value::num(real::round(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "pow(_)", |vm, at| {
-            let base = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+            let base = receiver(vm, at).as_num().unwrap_or(Num::NAN);
             let exponent = number_argument(vm, at, 1)?;
             Ok(Value::num(real::pow(base, exponent)))
         });
         define(vm, class, "log", |vm, at| {
             Ok(Value::num(real::ln(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "log2", |vm, at| {
             Ok(Value::num(real::log2(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "exp", |vm, at| {
             Ok(Value::num(real::exp(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "cbrt", |vm, at| {
             Ok(Value::num(real::cbrt(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "sin", |vm, at| {
             Ok(Value::num(real::sin(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "cos", |vm, at| {
             Ok(Value::num(real::cos(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "tan", |vm, at| {
             Ok(Value::num(real::tan(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "asin", |vm, at| {
             Ok(Value::num(real::asin(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "acos", |vm, at| {
             Ok(Value::num(real::acos(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "atan", |vm, at| {
             Ok(Value::num(real::atan(
-                receiver(vm, at).as_num().unwrap_or(f64::NAN),
+                receiver(vm, at).as_num().unwrap_or(Num::NAN),
             )))
         });
         define(vm, class, "atan(_)", |vm, at| {
-            let y = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+            let y = receiver(vm, at).as_num().unwrap_or(Num::NAN);
             let x = number_argument(vm, at, 1)?;
             Ok(Value::num(real::atan2(y, x)))
         });
@@ -901,8 +901,8 @@ fn install_num_extras(vm: &mut Vm) {
         {
             Some(digits) => u64::from_str_radix(digits, 16)
                 .ok()
-                .map(|value| value as f64),
-            None => trimmed.parse::<f64>().ok(),
+                .map(|value| value as Num),
+            None => trimmed.parse::<Num>().ok(),
         };
         // **Null rather than an error for junk**: the caller asked whether the
         // text is a number, and "no" is an answer. A number too large to
@@ -918,18 +918,18 @@ fn install_num_extras(vm: &mut Vm) {
     });
 
     define(vm, metaclass, "pi", |_, _| {
-        Ok(Value::num(core::f64::consts::PI))
+        Ok(Value::num(core::f64::consts::PI as Num))
     });
     define(vm, metaclass, "e", |_, _| {
-        Ok(Value::num(core::f64::consts::E))
+        Ok(Value::num(core::f64::consts::E as Num))
     });
     define(vm, metaclass, "infinity", |_, _| {
-        Ok(Value::num(f64::INFINITY))
+        Ok(Value::num(Num::INFINITY))
     });
-    define(vm, metaclass, "nan", |_, _| Ok(Value::num(f64::NAN)));
-    define(vm, metaclass, "largest", |_, _| Ok(Value::num(f64::MAX)));
+    define(vm, metaclass, "nan", |_, _| Ok(Value::num(Num::NAN)));
+    define(vm, metaclass, "largest", |_, _| Ok(Value::num(Num::MAX)));
     define(vm, metaclass, "smallest", |_, _| {
-        Ok(Value::num(f64::MIN_POSITIVE))
+        Ok(Value::num(Num::MIN_POSITIVE))
     });
     define(vm, metaclass, "maxSafeInteger", |_, _| {
         Ok(Value::num(9007199254740991.0))
@@ -940,12 +940,12 @@ fn install_num_extras(vm: &mut Vm) {
 }
 
 fn bitwise(vm: &Vm, at: usize, operation: fn(u32, u32) -> u32) -> Result<Value, RuntimeError> {
-    let left = receiver(vm, at).as_num().unwrap_or(f64::NAN);
+    let left = receiver(vm, at).as_num().unwrap_or(Num::NAN);
     let right = argument(vm, at, 1)
         .as_num()
         .ok_or_else(|| RuntimeError::new("Right operand must be a number."))?;
     Ok(Value::num(
-        operation(left as i64 as u32, right as i64 as u32) as f64,
+        operation(left as i64 as u32, right as i64 as u32) as Num,
     ))
 }
 
@@ -1001,7 +1001,7 @@ fn install_string_extras(vm: &mut Vm) {
         let text = string_text(vm, receiver(vm, at));
         let needle = string_argument(vm, at, 1)?;
         Ok(Value::num(
-            text.find(&needle).map_or(-1.0, |index| index as f64),
+            text.find(&needle).map_or(-1.0, |index| index as Num),
         ))
     });
 
@@ -1019,18 +1019,18 @@ fn install_string_extras(vm: &mut Vm) {
         // does. Equal to the length is allowed -- searching an empty tail is a
         // sensible question with the answer -1.
         let resolved = if start < 0.0 {
-            start + text.len() as f64
+            start + text.len() as Num
         } else {
             start
         };
         // The start must be a position *in* the string, so equal to the
         // length is already past the end.
-        if resolved < 0.0 || resolved >= text.len() as f64 {
+        if resolved < 0.0 || resolved >= text.len() as Num {
             return Err(RuntimeError::new("Start out of bounds."));
         }
         let start = resolved as usize;
         Ok(Value::num(
-            find_bytes(&text[start..], &needle).map_or(-1.0, |index| (index + start) as f64),
+            find_bytes(&text[start..], &needle).map_or(-1.0, |index| (index + start) as Num),
         ))
     });
 
@@ -1143,7 +1143,7 @@ fn install_string_extras(vm: &mut Vm) {
         if start >= bytes.len() {
             return Ok(Value::FALSE);
         }
-        Ok(Value::num(start as f64))
+        Ok(Value::num(start as Num))
     });
     define(vm, class, "iteratorValue(_)", |vm, at| {
         let bytes = string_bytes(vm, receiver(vm, at));
@@ -1182,7 +1182,7 @@ fn install_string_extras(vm: &mut Vm) {
         if point < 0.0 {
             return Err(RuntimeError::new("Code point cannot be negative."));
         }
-        if point > 0x10ffff as f64 {
+        if point > 0x10ffff as Num {
             return Err(RuntimeError::new(
                 "Code point cannot be greater than 0x10ffff.",
             ));
@@ -1303,14 +1303,14 @@ fn install_string_views(vm: &mut Vm) {
 
     define(vm, class, "count", |vm, at| {
         let string = instance_field(vm, receiver(vm, at), 0);
-        Ok(Value::num(string_bytes(vm, string).len() as f64))
+        Ok(Value::num(string_bytes(vm, string).len() as Num))
     });
     define(vm, class, "[_]", |vm, at| {
         let string = instance_field(vm, receiver(vm, at), 0);
         let bytes = string_bytes(vm, string);
         let index = number_argument(vm, at, 1)?;
         let index = resolve_index(index, bytes.len())?;
-        Ok(Value::num(bytes[index] as f64))
+        Ok(Value::num(bytes[index] as Num))
     });
     define(vm, class, "iterate(_)", |vm, at| {
         let string = instance_field(vm, receiver(vm, at), 0);
@@ -1326,7 +1326,7 @@ fn install_string_views(vm: &mut Vm) {
         if next < 1.0 && !current.is_null() {
             return Ok(Value::FALSE);
         }
-        if next < 0.0 || next >= length as f64 {
+        if next < 0.0 || next >= length as Num {
             return Ok(Value::FALSE);
         }
         Ok(Value::num(next))
@@ -1338,7 +1338,7 @@ fn install_string_views(vm: &mut Vm) {
         let index = integer_argument(vm, at, 1, "Iterator")?;
         let index = resolve_index(index, bytes.len())
             .map_err(|_| RuntimeError::new("Iterator out of bounds."))?;
-        Ok(Value::num(bytes[index] as f64))
+        Ok(Value::num(bytes[index] as Num))
     });
 
     let class = vm.string_code_point_sequence_class;
@@ -1347,7 +1347,7 @@ fn install_string_views(vm: &mut Vm) {
         let string = instance_field(vm, receiver(vm, at), 0);
         let bytes = string_bytes(vm, string);
         let count = bytes.iter().filter(|byte| !is_continuation(**byte)).count();
-        Ok(Value::num(count as f64))
+        Ok(Value::num(count as Num))
     });
     define(vm, class, "[_]", |vm, at| {
         let string = instance_field(vm, receiver(vm, at), 0);
@@ -1355,7 +1355,7 @@ fn install_string_views(vm: &mut Vm) {
         let index = number_argument(vm, at, 1)?;
         let index = resolve_index(index, bytes.len())?;
         Ok(Value::num(
-            code_point_at(&bytes, index).map_or(-1.0, |character| character as u32 as f64),
+            code_point_at(&bytes, index).map_or(-1.0, |character| character as u32 as Num),
         ))
     });
     define(vm, class, "iterate(_)", |vm, at| {
@@ -1379,7 +1379,7 @@ fn install_string_views(vm: &mut Vm) {
         if next >= bytes.len() {
             return Ok(Value::FALSE);
         }
-        Ok(Value::num(next as f64))
+        Ok(Value::num(next as Num))
     });
     define(vm, class, "iteratorValue(_)", |vm, at| {
         let string = instance_field(vm, receiver(vm, at), 0);
@@ -1388,7 +1388,7 @@ fn install_string_views(vm: &mut Vm) {
         let index = resolve_index(index, bytes.len())
             .map_err(|_| RuntimeError::new("Iterator out of bounds."))?;
         Ok(Value::num(
-            code_point_at(&bytes, index).map_or(-1.0, |character| character as u32 as f64),
+            code_point_at(&bytes, index).map_or(-1.0, |character| character as u32 as Num),
         ))
     });
 }
@@ -1756,7 +1756,7 @@ fn function_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeE
 }
 
 /// A count for `take` or `skip`: a non-negative whole number.
-fn counting_argument(vm: &Vm, at: usize, index: usize) -> Result<f64, RuntimeError> {
+fn counting_argument(vm: &Vm, at: usize, index: usize) -> Result<Num, RuntimeError> {
     let count = integer_argument(vm, at, index, "Count")?;
     if count < 0.0 {
         return Err(RuntimeError::new("Count must be a non-negative integer."));
@@ -1808,7 +1808,7 @@ fn install_list(vm: &mut Vm) {
     });
 
     define(vm, class, "count", |vm, at| {
-        Ok(Value::num(list_length(vm, receiver(vm, at)) as f64))
+        Ok(Value::num(list_length(vm, receiver(vm, at)) as Num))
     });
 
     define(vm, class, "[_]", |vm, at| {
@@ -1860,7 +1860,7 @@ fn install_list(vm: &mut Vm) {
             return Ok(Value::num(0.0));
         }
         let index = integer_argument(vm, at, 1, "Iterator")?;
-        if index < 0.0 || index >= (length - 1) as f64 {
+        if index < 0.0 || index >= (length - 1) as Num {
             return Ok(Value::FALSE);
         }
         Ok(Value::num(index + 1.0))
@@ -1913,11 +1913,11 @@ fn install_list_extras(vm: &mut Vm) {
         // `insert` accepts one past the end, where the other index-taking
         // methods do not: appending is a legitimate insertion point.
         let at_index = if index < 0.0 {
-            index + length as f64 + 1.0
+            index + length as Num + 1.0
         } else {
             index
         };
-        if at_index < 0.0 || at_index > length as f64 {
+        if at_index < 0.0 || at_index > length as Num {
             return Err(RuntimeError::new("Index out of bounds."));
         }
         match vm.heap.get_mut(list.as_object().unwrap()) {
@@ -2013,7 +2013,7 @@ fn install_list_extras(vm: &mut Vm) {
         let found = list_elements(vm, receiver(vm, at))
             .iter()
             .position(|element| values_equal(vm, *element, wanted));
-        Ok(Value::num(found.map_or(-1.0, |index| index as f64)))
+        Ok(Value::num(found.map_or(-1.0, |index| index as Num)))
     });
 
     define(vm, class, "isEmpty", |vm, at| {
@@ -2141,16 +2141,16 @@ fn list_length(vm: &Vm, list: Value) -> usize {
 ///
 /// `list[-1]` is the last element. Upstream's message for an out-of-range index
 /// is exactly this, and the suite checks it.
-fn resolve_index(index: f64, length: usize) -> Result<usize, RuntimeError> {
+fn resolve_index(index: Num, length: usize) -> Result<usize, RuntimeError> {
     if index != math::trunc(index) {
         return Err(RuntimeError::new("Index must be an integer."));
     }
     let resolved = if index < 0.0 {
-        index + length as f64
+        index + length as Num
     } else {
         index
     };
-    if resolved < 0.0 || resolved >= length as f64 {
+    if resolved < 0.0 || resolved >= length as Num {
         return Err(RuntimeError::new("Index out of bounds."));
     }
     Ok(resolved as usize)
@@ -2202,7 +2202,7 @@ fn install_map(vm: &mut Vm) {
     });
 
     define(vm, class, "count", |vm, at| {
-        Ok(Value::num(map_count(vm, receiver(vm, at)) as f64))
+        Ok(Value::num(map_count(vm, receiver(vm, at)) as Num))
     });
 
     define(vm, class, "containsKey(_)", |vm, at| {
@@ -2296,7 +2296,7 @@ fn install_map(vm: &mut Vm) {
             Some(Object::Map(map)) => map.next_live(from),
             _ => return Err(RuntimeError::new("Receiver must be a map.")),
         };
-        Ok(next.map_or(Value::FALSE, |slot| Value::num(slot as f64)))
+        Ok(next.map_or(Value::FALSE, |slot| Value::num(slot as Num)))
     });
 
     define(vm, class, "iteratorValue(_)", |vm, at| {
@@ -2431,11 +2431,14 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
         // Hash the bits, folded, so that nearby numbers do not all land in
         // nearby slots. `0.0` and `-0.0` are equal under `==` and must hash
         // alike, so the sign of zero is normalised away first.
-        let bits = if number == 0.0 {
-            0.0f64.to_bits()
-        } else {
-            number.to_bits()
-        };
+        // Widened to 64 bits before folding: the shift below is an overflow
+        // when a `Num` is 32 bits wide, and the fold is then a no-op rather
+        // than a panic.
+        let normalised = if number == 0.0 { 0.0 } else { number };
+        // Redundant in a 64-bit build and required in a 32-bit one, which is
+        // why the lint is silenced rather than the cast removed.
+        #[allow(clippy::unnecessary_cast)]
+        let bits = normalised.to_bits() as u64;
         return (bits as u32) ^ ((bits >> 32) as u32);
     }
     if value.is_null() {
@@ -2451,8 +2454,12 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
         // The cached hash, which is the reason it is cached.
         Some(Object::String(text)) => text.hash(),
         Some(Object::Range(range)) => {
-            let from = range.from.to_bits();
-            let to = range.to.to_bits();
+            // Widened before folding: the shift below is an overflow when a
+            // `Num` is 32 bits, where the fold should simply do nothing.
+            #[allow(clippy::unnecessary_cast)]
+            let from = range.from.to_bits() as u64;
+            #[allow(clippy::unnecessary_cast)]
+            let to = range.to.to_bits() as u64;
             (from as u32)
                 ^ ((from >> 32) as u32)
                 ^ (to as u32).rotate_left(7)
@@ -2603,21 +2610,21 @@ fn install_range(vm: &mut Vm) {
 
     define(vm, class, "from", |vm, at| {
         Ok(Value::num(
-            range_of(vm, receiver(vm, at)).map_or(f64::NAN, |r| r.from),
+            range_of(vm, receiver(vm, at)).map_or(Num::NAN, |r| r.from),
         ))
     });
     define(vm, class, "to", |vm, at| {
         Ok(Value::num(
-            range_of(vm, receiver(vm, at)).map_or(f64::NAN, |r| r.to),
+            range_of(vm, receiver(vm, at)).map_or(Num::NAN, |r| r.to),
         ))
     });
     define(vm, class, "min", |vm, at| {
         let range = range_of(vm, receiver(vm, at));
-        Ok(Value::num(range.map_or(f64::NAN, |r| r.from.min(r.to))))
+        Ok(Value::num(range.map_or(Num::NAN, |r| r.from.min(r.to))))
     });
     define(vm, class, "max", |vm, at| {
         let range = range_of(vm, receiver(vm, at));
-        Ok(Value::num(range.map_or(f64::NAN, |r| r.from.max(r.to))))
+        Ok(Value::num(range.map_or(Num::NAN, |r| r.from.max(r.to))))
     });
 
     // Upstream's `Range.iterate` verbatim in behaviour, including the two edge
@@ -2718,18 +2725,18 @@ fn slice_indices(range: &ObjRange, length: usize) -> Result<Vec<usize>, RuntimeE
     let end = if range.is_inclusive {
         -1.0
     } else {
-        length as f64
+        length as Num
     };
-    if range.from == length as f64 && range.to == end {
+    if range.from == length as Num && range.to == end {
         return Ok(Vec::new());
     }
 
-    let resolve = |value: f64| -> Result<isize, RuntimeError> {
+    let resolve = |value: Num| -> Result<isize, RuntimeError> {
         if value != math::trunc(value) {
             return Err(RuntimeError::new("Range start must be an integer."));
         }
         let resolved = if value < 0.0 {
-            value + length as f64
+            value + length as Num
         } else {
             value
         };
@@ -2828,7 +2835,9 @@ fn install_system(vm: &mut Vm) {
 
     // `System.clock` is what every benchmark times itself with.
     define(vm, metaclass, "clock", |vm, _| match vm.clock.as_ref() {
-        Some(clock) => Ok(Value::num(clock())),
+        // The host hands back a `f64` whatever this build's `Num` is, so
+        // that a port does not have to know which one it was compiled with.
+        Some(clock) => Ok(Value::num(clock() as Num)),
         None => Err(RuntimeError::new("This host provides no clock.")),
     });
 
@@ -3085,8 +3094,12 @@ pub fn install_random(vm: &mut Vm) -> usize {
     ))));
     if let Some(Object::Class(random)) = vm.heap.get_mut(class) {
         random.metaclass = Some(metaclass);
-        // Four `u32` words of state, each exactly representable as an `f64`.
-        random.num_fields = 4;
+        // **Eight fields, not four.** The generator's state is four `u32`
+        // words, and a `Num` only holds one exactly when it is a double: an
+        // `f32` has a 24-bit mantissa, so storing a word per field would
+        // silently round the state and collapse the sequence. Each word is
+        // kept as two 16-bit halves, which both widths hold exactly.
+        random.num_fields = 8;
     }
 
     define(vm, metaclass, "new()", |vm, _| {
@@ -3126,34 +3139,36 @@ pub fn install_random(vm: &mut Vm) -> usize {
 
     define(vm, class, "float()", |vm, at| {
         let value = next_float(vm, receiver(vm, at));
-        Ok(Value::num(value))
+        Ok(Value::num(value as Num))
     });
     define(vm, class, "float(_)", |vm, at| {
         let end = number_argument(vm, at, 1)?;
         let value = next_float(vm, receiver(vm, at));
-        Ok(Value::num(value * end))
+        Ok(Value::num(value as Num * end))
     });
     define(vm, class, "float(_,_)", |vm, at| {
         let start = number_argument(vm, at, 1)?;
         let end = number_argument(vm, at, 2)?;
         let value = next_float(vm, receiver(vm, at));
-        Ok(Value::num(start + value * (end - start)))
+        Ok(Value::num(start + value as Num * (end - start)))
     });
 
     define(vm, class, "int()", |vm, at| {
         let value = next_u32(vm, receiver(vm, at));
-        Ok(Value::num(value as f64))
+        Ok(Value::num(value as Num))
     });
     define(vm, class, "int(_)", |vm, at| {
         let end = number_argument(vm, at, 1)?;
         let value = next_float(vm, receiver(vm, at));
-        Ok(Value::num(math::floor(value * end)))
+        Ok(Value::num(math::floor(value as Num * end)))
     });
     define(vm, class, "int(_,_)", |vm, at| {
         let start = number_argument(vm, at, 1)?;
         let end = number_argument(vm, at, 2)?;
         let value = next_float(vm, receiver(vm, at));
-        Ok(Value::num(start + math::floor(value * (end - start))))
+        Ok(Value::num(
+            start + math::floor(value as Num * (end - start)),
+        ))
     });
 
     define(vm, class, "sample(_)", |vm, at| {
@@ -3236,11 +3251,32 @@ fn new_random(vm: &mut Vm, class: crate::handle::ObjectId, seed: u32) -> Value {
     for _ in 0..8 {
         step(&mut state);
     }
-    let fields = state.iter().map(|word| Value::num(*word as f64)).collect();
+    let fields = state.iter().flat_map(|word| halves(*word)).collect();
     let id = vm
         .heap
         .allocate(Object::Instance(ObjInstance { class, fields }));
     Value::object(id)
+}
+
+/// Split a state word into the two 16-bit numbers it is stored as.
+fn halves(word: u32) -> [Value; 2] {
+    [
+        Value::num((word & 0xffff) as Num),
+        Value::num((word >> 16) as Num),
+    ]
+}
+
+/// Read one 16-bit half back out of an instance's fields.
+fn field_half(instance: &ObjInstance, slot: usize) -> u32 {
+    match instance
+        .fields
+        .get(slot)
+        .copied()
+        .and_then(|value| value.as_num())
+    {
+        Some(half) => half as u32 & 0xffff,
+        None => 0,
+    }
 }
 
 /// xorshift128, one step.
@@ -3262,21 +3298,20 @@ fn next_u32(vm: &mut Vm, receiver: Value) -> u32 {
     let mut state = [0u32; 4];
     match vm.heap.get(id) {
         Some(Object::Instance(instance)) => {
-            for (slot, word) in state.iter_mut().enumerate() {
-                *word = instance
-                    .fields
-                    .get(slot)
-                    .copied()
-                    .and_then(|v| v.as_num())
-                    .unwrap_or(0.0) as u32;
+            for (word, slot) in state.iter_mut().zip((0..8).step_by(2)) {
+                let low = field_half(instance, slot);
+                let high = field_half(instance, slot + 1);
+                *word = low | (high << 16);
             }
         }
         _ => return 0,
     }
     let value = step(&mut state);
     if let Some(Object::Instance(instance)) = vm.heap.get_mut(id) {
-        for (slot, word) in state.iter().enumerate() {
-            instance.fields[slot] = Value::num(*word as f64);
+        for (word, slot) in state.iter().zip((0..8).step_by(2)) {
+            let [low, high] = halves(*word);
+            instance.fields[slot] = low;
+            instance.fields[slot + 1] = high;
         }
     }
     value
@@ -3284,6 +3319,9 @@ fn next_u32(vm: &mut Vm, receiver: Value) -> u32 {
 
 /// A double in `[0, 1)`, built from 53 bits so every representable value in
 /// the range is reachable -- 32 bits would leave most of them unused.
+///
+/// Computed at full width and narrowed by the caller, so a 32-bit build draws
+/// from the same stream rather than from a differently-quantised one.
 fn next_float(vm: &mut Vm, receiver: Value) -> f64 {
     let high = next_u32(vm, receiver) as u64;
     let low = next_u32(vm, receiver) as u64;

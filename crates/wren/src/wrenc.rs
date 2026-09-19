@@ -319,7 +319,13 @@ fn write_constant(
     }
     if let Some(number) = value.as_num() {
         out.push(3);
-        out.extend_from_slice(&number.to_bits().to_le_bytes());
+        // **Always written as a double, whatever this build's `Num` is.** A
+        // `.wrenc` is produced on a workstation and read on a part, and the
+        // two need not agree about the width -- so the wider of the pair is
+        // what goes on disk and a narrow loader rounds on the way in.
+        #[allow(clippy::unnecessary_cast)]
+        let wide = number as f64;
+        out.extend_from_slice(&wide.to_bits().to_le_bytes());
         return Ok(());
     }
     match value.as_object().and_then(|id| vm.heap.get(id)) {
@@ -544,7 +550,9 @@ fn read_constant(
         0 => Ok(Value::NULL),
         1 => Ok(Value::FALSE),
         2 => Ok(Value::TRUE),
-        3 => Ok(Value::num(f64::from_bits(reader.u64()?))),
+        3 => Ok(Value::num(
+            f64::from_bits(reader.u64()?) as crate::value::Num
+        )),
         4 => {
             let bytes = reader.blob()?.to_vec();
             Ok(Value::object(

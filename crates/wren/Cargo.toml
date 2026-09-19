@@ -44,6 +44,18 @@ alloc = []
 # simply not defined -- which reports "Num does not implement 'sin'" rather
 # than answering something wrong.
 libm = ["dep:libm"]
+# **32-bit numbers, for a part that cannot afford doubles. This is not Wren.**
+#
+# Wren's `Num` is a double by specification, and every conformance test and
+# published benchmark runs that way. Turning this on halves every stack slot,
+# list element, instance field and map entry, takes a heap slot from 24 bytes
+# to 20 by dropping the enum's alignment, and makes the arithmetic cheaper on a
+# part with no FPU.
+#
+# What it costs is exactness: an `f32` represents integers exactly only to
+# 2^24, so a program that counts past 16,777,216 will print something else.
+# `doc/wren-rs/design.md` sets out the trade in full.
+f32 = []
 # **The compiler, which a device running bytecode does not need.** This is
 # what step 4 of the plan is for: compile on a workstation, ship `.wrenc`, and
 # leave the lexer and parser out of the image entirely. Default on, because a

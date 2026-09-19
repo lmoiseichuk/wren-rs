@@ -407,8 +407,8 @@ impl Default for ObjMap {
 /// A range, as `1..5` or `1..=5`.
 #[derive(Clone, Copy, Debug)]
 pub struct ObjRange {
-    pub from: f64,
-    pub to: f64,
+    pub from: crate::value::Num,
+    pub to: crate::value::Num,
     /// `..=` rather than `..`.
     pub is_inclusive: bool,
 }
@@ -602,7 +602,37 @@ pub struct ObjInstance {
 // the sizes back, and these assertions are what keeps the document honest when
 // a field is added. A failure here means the design note needs rewriting, not
 // that the assertion needs relaxing.
-#[cfg(target_pointer_width = "32")]
+// **The same layout with 32-bit numbers, which is a different set of numbers.**
+// Kept separate rather than folded into the block above with `cfg!`, because
+// the point of these assertions is that a reader can see what each build
+// actually costs without reasoning about a conditional.
+#[cfg(all(target_pointer_width = "32", feature = "f32"))]
+mod layout_f32 {
+    use super::*;
+
+    // **Twenty, not twenty-four.** This is the whole memory argument for the
+    // `f32` feature: a 4-byte `Value` drops the enum's alignment from 8 to 4,
+    // and `ObjRange` -- which set the size at 24 with its two doubles -- is now
+    // 12. The largest payload is 16, the tag makes 17, and 4-byte alignment
+    // rounds that to 20 rather than to 24. Every object in the heap is 17%
+    // smaller.
+    const _: () = assert!(core::mem::size_of::<Object>() == 20);
+    const _: () = assert!(core::mem::size_of::<Option<Object>>() == 20);
+
+    const _: () = assert!(core::mem::size_of::<ObjRange>() == 12);
+    const _: () = assert!(core::mem::size_of::<ObjString>() == 16);
+    const _: () = assert!(core::mem::size_of::<ObjList>() == 12);
+    const _: () = assert!(core::mem::size_of::<ObjMap>() == 16);
+    const _: () = assert!(core::mem::size_of::<ObjInstance>() == 16);
+    // Held to 8 by the same `undefined` trick that holds it to 16 at full
+    // width: an `Option<Value>` here would be 12 and would tie `ObjMap`.
+    const _: () = assert!(core::mem::size_of::<ObjUpvalue>() == 8);
+
+    const _: () = assert!(core::mem::size_of::<ObjClass>() > 20);
+    const _: () = assert!(core::mem::size_of::<Box<ObjClass>>() == 4);
+}
+
+#[cfg(all(target_pointer_width = "32", not(feature = "f32")))]
 mod layout {
     use super::*;
 

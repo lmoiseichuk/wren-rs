@@ -1,9 +1,15 @@
-//! The value representation.
+//! The value representation, at full width.
 //!
 //! NaN tagging is the kind of trick that works for years and then fails on one
 //! input, so the interesting tests here are the edges: a genuine NaN arriving
 //! from arithmetic, the extremes of the handle range, and every singleton
 //! against every other.
+//!
+//! **These assert the 64-bit layout specifically** — eight bytes, 53 bits of
+//! integer, a 32-bit handle — so the whole file is skipped in an `f32` build,
+//! which has its own in `value_f32.rs`. Making them width-generic would have
+//! meant asserting whichever answer the build gives, which is not a test.
+#![cfg(not(feature = "f32"))]
 
 use wren::object::ObjectId;
 use wren::Value;

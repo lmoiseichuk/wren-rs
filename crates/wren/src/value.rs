@@ -38,15 +38,42 @@
 //! `f64::from_bits` are safe conversions, and the payload is a 32-bit table
 //! index rather than a pointer, so nothing is ever cast to or from one.
 
+// **A conversion here is redundant in one build and load-bearing in the
+// other.** `Bits` is `u64` or `u32` depending on the `f32` feature, so every
+// widening in this file is a no-op for one of the two and required for the
+// other. Silenced once, at the module, because each site is the same fact and
+// five copies of the same `#[allow]` read as five separate decisions.
+#![allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+
 use crate::handle::ObjectId;
+
+/// What a Wren number is.
+///
+/// **`f64` is the language**, and the default. `f32` is a build for parts that
+/// cannot afford doubles, and it is not Wren: see the module docs above and
+/// `doc/wren-rs/design.md`.
+#[cfg(not(feature = "f32"))]
+pub type Num = f64;
+#[cfg(feature = "f32")]
+pub type Num = f32;
+
+/// The unsigned integer of the same width as [`Num`], which is what a `Value`
+/// actually stores.
+#[cfg(not(feature = "f32"))]
+type Bits = u64;
+#[cfg(feature = "f32")]
+type Bits = u32;
 
 /// The sign bit. Set on a `Value` means the payload is an object handle.
 ///
 /// Upstream uses the same bit for the same purpose, which is why a pointer
-/// there must fit in 48 bits. Here the payload is a 32-bit index, so the
+/// there must fit in 48 bits. Here the payload is a table index, so the
 /// constraint is academic — but keeping the layout identical means the two
 /// implementations can be read against each other.
-const SIGN_BIT: u64 = 1 << 63;
+#[cfg(not(feature = "f32"))]
+const SIGN_BIT: Bits = 1 << 63;
+#[cfg(feature = "f32")]
+const SIGN_BIT: Bits = 1 << 31;
 
 /// A quiet NaN with two extra bits set.
 ///
@@ -54,17 +81,37 @@ const SIGN_BIT: u64 = 1 << 63;
 /// is set because some x86 instructions produce a NaN with that bit clear when
 /// given certain inputs, and a real NaN arriving from arithmetic must never be
 /// mistaken for a tagged value. Upstream calls this out in the same place; the
-/// value is bit-identical to its `QNAN`.
-const QNAN: u64 = 0x7ffc_0000_0000_0000;
+/// `f64` value is bit-identical to its `QNAN`.
+///
+/// The `f32` constant is the same three fields in the narrower layout:
+/// exponent all ones (`0x7f80_0000`), the quiet bit (`0x0040_0000`) and the
+/// bit below it (`0x0020_0000`).
+#[cfg(not(feature = "f32"))]
+const QNAN: Bits = 0x7ffc_0000_0000_0000;
+#[cfg(feature = "f32")]
+const QNAN: Bits = 0x7fe0_0000;
+
+/// How much of a tagged value is left over to hold a handle.
+///
+/// **This is the one real constraint `f32` adds.** A double leaves 52 mantissa
+/// bits and a handle is a 32-bit index, so nothing is lost. A single leaves 23,
+/// of which `QNAN` spends two, so a handle gets 21 bits — 2,097,151 objects.
+/// A heap that large would need 40 MB of slots, which is not a part this build
+/// exists for, but [`Value::object`] asserts it in debug builds rather than
+/// silently aliasing two objects onto one handle.
+#[cfg(not(feature = "f32"))]
+const PAYLOAD: Bits = 0xffff_ffff;
+#[cfg(feature = "f32")]
+const PAYLOAD: Bits = (1 << 21) - 1;
 
 /// The low bits that distinguish the singletons, when the sign bit is clear.
-const MASK_TAG: u64 = 7;
+const MASK_TAG: Bits = 7;
 
-const TAG_NAN: u64 = 0;
-const TAG_NULL: u64 = 1;
-const TAG_FALSE: u64 = 2;
-const TAG_TRUE: u64 = 3;
-const TAG_UNDEFINED: u64 = 4;
+const TAG_NAN: Bits = 0;
+const TAG_NULL: Bits = 1;
+const TAG_FALSE: Bits = 2;
+const TAG_TRUE: Bits = 3;
+const TAG_UNDEFINED: Bits = 4;
 
 /// A Wren value: a number, a boolean, null, or a handle to a heap object.
 ///
@@ -74,7 +121,7 @@ const TAG_UNDEFINED: u64 = 4;
 /// since a `Copy` type cannot observe its own copies or its own death;
 /// `doc/wren-rs/design.md` sets out what that would involve.
 #[derive(Clone, Copy)]
-pub struct Value(u64);
+pub struct Value(Bits);
 
 impl Value {
     /// The `null` Wren programs can see.
@@ -97,7 +144,7 @@ impl Value {
     /// No tagging happens: a double that is not a NaN already means itself.
     /// A NaN that arrives here stays a NaN and is still a number — the extra
     /// bit in [`QNAN`] is what keeps it from colliding with a tag.
-    pub fn num(value: f64) -> Value {
+    pub fn num(value: Num) -> Value {
         Value(value.to_bits())
     }
 
@@ -112,7 +159,12 @@ impl Value {
 
     /// A handle to a heap object.
     pub fn object(id: ObjectId) -> Value {
-        Value(SIGN_BIT | QNAN | id.raw() as u64)
+        debug_assert!(
+            u64::from(id.raw()) <= u64::from(PAYLOAD),
+            "handle {} does not fit in this build's payload",
+            id.raw()
+        );
+        Value(SIGN_BIT | QNAN | (id.raw() as Bits & PAYLOAD))
     }
 
     /// Is this a number?
@@ -154,9 +206,9 @@ impl Value {
     /// tested first. Returning an `Option` instead costs nothing once inlined
     /// and removes a whole class of mistake, so the unchecked form is not
     /// offered.
-    pub fn as_num(self) -> Option<f64> {
+    pub fn as_num(self) -> Option<Num> {
         if self.is_num() {
-            Some(f64::from_bits(self.0))
+            Some(Num::from_bits(self.0))
         } else {
             None
         }
@@ -165,7 +217,9 @@ impl Value {
     /// The object handle this holds, or `None` if it is not one.
     pub fn as_object(self) -> Option<ObjectId> {
         if self.is_object() {
-            Some(ObjectId::new(self.0 as u32))
+            // A truncation when `Bits` is `u64`, an identity when it is
+            // `u32`; the mask above is what makes the truncation safe.
+            Some(ObjectId::new((self.0 & PAYLOAD) as u32))
         } else {
             None
         }
@@ -198,7 +252,7 @@ impl Value {
     /// The raw bits, for tests and for a bytecode writer that has to serialise
     /// a constant.
     pub fn to_bits(self) -> u64 {
-        self.0
+        self.0 as u64
     }
 
     /// Rebuild a value from raw bits.
@@ -208,22 +262,22 @@ impl Value {
     /// the heap treats that as a lookup failure rather than as undefined
     /// behaviour, so it is safe in the Rust sense but still wrong.
     pub fn from_bits(bits: u64) -> Value {
-        Value(bits)
+        Value(bits as Bits)
     }
 }
 
 impl core::fmt::Debug for Value {
     fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match () {
-            _ if self.is_num() => write!(out, "Num({})", f64::from_bits(self.0)),
+            _ if self.is_num() => write!(out, "Num({})", Num::from_bits(self.0)),
             _ if self.is_null() => write!(out, "Null"),
             _ if self.is_true() => write!(out, "True"),
             _ if self.is_false() => write!(out, "False"),
             _ if self.is_undefined() => write!(out, "Undefined"),
-            _ if self.is_object() => write!(out, "Object({})", self.0 as u32),
+            _ if self.is_object() => write!(out, "Object({})", self.0 & PAYLOAD),
             // A quiet NaN that is not any known tag. Reachable only from
             // `from_bits` with something invented, so say so rather than lie.
-            _ => write!(out, "Invalid(0x{:016x})", self.0),
+            _ => write!(out, "Invalid(0x{:x})", self.0),
         }
     }
 }
@@ -236,4 +290,13 @@ const _: () = assert!(MASK_TAG == 7);
 
 // The whole reason for NaN tagging: a tagged enum would be sixteen bytes, and
 // every stack slot, list element and instance field would pay the difference.
+#[cfg(not(feature = "f32"))]
 const _: () = assert!(core::mem::size_of::<Value>() == 8);
+#[cfg(feature = "f32")]
+const _: () = assert!(core::mem::size_of::<Value>() == 4);
+
+// The tags have to fit under the quiet bits, or a singleton would read back as
+// a different one. Cheap to check and expensive to discover.
+const _: () = assert!(TAG_UNDEFINED <= MASK_TAG);
+const _: () = assert!(QNAN & MASK_TAG == 0);
+const _: () = assert!(PAYLOAD & QNAN == 0);

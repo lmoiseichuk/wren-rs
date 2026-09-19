@@ -153,7 +153,7 @@ impl Token {
     /// Wren numbers are doubles, including the hexadecimal ones — `0xff` is the
     /// value 255.0, not an integer type, because the language has only one
     /// numeric type.
-    pub fn number(&self, source: &str) -> Option<f64> {
+    pub fn number(&self, source: &str) -> Option<crate::value::Num> {
         if self.kind != TokenKind::Number {
             return None;
         }
@@ -161,8 +161,8 @@ impl Token {
         match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
             Some(digits) => u64::from_str_radix(digits, 16)
                 .ok()
-                .map(|value| value as f64),
-            None => f64::from_str(text).ok(),
+                .map(|value| value as crate::value::Num),
+            None => crate::value::Num::from_str(text).ok(),
         }
     }
 }

@@ -660,6 +660,10 @@ System.print(f.error)
 
 // --- numbers print the way Wren prints them ---------------------------------
 
+// **Fourteen digits is the double's rule.** A 32-bit build prints to eight
+// and these two would be asserting the wrong answer there, so they are skipped
+// rather than made to agree with whatever the build does.
+#[cfg(not(feature = "f32"))]
 #[test]
 fn numbers_use_fourteen_significant_digits() {
     // %.14g, which is what makes `0.1 + 0.2` print as `0.3` rather than as
@@ -668,6 +672,7 @@ fn numbers_use_fourteen_significant_digits() {
     assert_eq!(run("System.print(2.sqrt)"), "1.4142135623731\n");
 }
 
+#[cfg(not(feature = "f32"))]
 #[test]
 fn very_large_and_small_numbers_use_exponential_notation() {
     assert_eq!(run("System.print(1e300)"), "1e+300\n");

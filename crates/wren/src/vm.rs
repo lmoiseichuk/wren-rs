@@ -2430,7 +2430,7 @@ pub fn resolve_module(importer: &str, name: &str) -> String {
 /// exponential when the exponent is below -4 or at least the precision, and
 /// decimal otherwise, then strip trailing zeros either way. That is why `1e300`
 /// prints as `1e+300` while `1000` prints as `1000`.
-fn format_number(value: f64) -> String {
+fn format_number(value: crate::value::Num) -> String {
     // Wren spells these out rather than using C's "inf"/"-inf"/"nan", so a
     // program's output is the same on every platform -- C leaves the spelling
     // implementation-defined, which is exactly the sort of thing that makes a
@@ -2451,7 +2451,7 @@ fn format_number(value: f64) -> String {
     // the point (14 significant), then read back the exponent to decide which
     // shape to print. Doing it in this order means the rounding happens once,
     // before the decision, which is what C does.
-    let exponential = format!("{value:.13e}");
+    let exponential = format!("{:.*e}", SIGNIFICANT - 1, value);
     let (mantissa, exponent) = exponential
         .split_once('e')
         .expect("Rust's {:e} always writes an exponent");
@@ -2463,17 +2463,33 @@ fn format_number(value: f64) -> String {
     // and a reader checking this against the standard should see the same
     // shape. `(-4..14).contains()` would be the same test and a worse mirror.
     #[allow(clippy::manual_range_contains)]
-    if exponent < -4 || exponent >= 14 {
+    if exponent < -4 || exponent >= SIGNIFICANT as i32 {
         let mantissa = trim_trailing_zeros(mantissa);
         let sign = if exponent < 0 { '-' } else { '+' };
         // C pads the exponent to at least two digits: `1e+05`, not `1e+5`.
         return format!("{mantissa}e{sign}{:02}", exponent.abs());
     }
 
-    // Decimal: 14 significant digits means 13 - exponent after the point.
-    let decimals = (13 - exponent).max(0) as usize;
+    // Decimal: N significant digits means N - 1 - exponent after the point.
+    let decimals = (SIGNIFICANT as i32 - 1 - exponent).max(0) as usize;
     trim_trailing_zeros(&format!("{value:.decimals$}"))
 }
+
+/// How many significant digits a number prints to.
+///
+/// **Fourteen is upstream's `%.14g`**, and the reason is readability rather
+/// than round-tripping: `0.1 + 0.2` is `0.30000000000000004` at full precision
+/// and `0.3` at fourteen digits, and the second is what a person writing a
+/// script means.
+///
+/// A 32-bit build uses eight, which is the same argument at the narrower
+/// width. Seven would send any integer above 9,999,999 into exponential form
+/// while an `f32` still holds integers exactly to 16,777,216; nine would stop
+/// `0.1` printing as `0.1`. Eight is the value that keeps both.
+#[cfg(not(feature = "f32"))]
+const SIGNIFICANT: usize = 14;
+#[cfg(feature = "f32")]
+const SIGNIFICANT: usize = 8;
 
 /// Strip the trailing zeros `%g` removes, and the point if nothing follows it.
 fn trim_trailing_zeros(text: &str) -> String {

@@ -20,6 +20,13 @@ publish = false
 # bare-metal firmware into `cargo test` at the top level.
 [workspace]
 
+[features]
+# **32-bit numbers.** Not Wren -- see `crates/wren`'s own `f32` feature and
+# `doc/wren-rs/design.md`. Built here so the cost and the saving can be
+# measured on the part rather than argued about.
+default = []
+f32 = ["wren/f32"]
+
 [dependencies]
 # **No `compiler` feature**, which is the whole point of this port: the device
 # is handed `.wrenc` built on a workstation, so the lexer and the parser are
