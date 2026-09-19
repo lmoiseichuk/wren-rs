@@ -159,10 +159,24 @@ its own allocator overhead and an extra indirection to reach. For a short string
 the header saving roughly cancels the extra allocation; for many short strings,
 allocator overhead is real and this will show up.
 
-**Every access is bounds-checked.** A pointer dereference becomes an index into
-a `Vec`. Expect single-digit to low-double-digit percent, and note that the
-benchmark set from steps 1 and 2 exists precisely so this can be answered with a
-number rather than argued.
+**Every access is bounds-checked — and it costs far more than this note used to
+claim.** A pointer dereference becomes an index into a `Vec`. The estimate here
+was "single-digit to low-double-digit percent". The first run on real hardware
+says **four to eight times slower than upstream Wren**, worst on the benchmark
+that is almost pure method dispatch — see
+[`../wren/benchmarks-wren-rs.md`](../wren/benchmarks-wren-rs.md).
+
+Worth being precise about why the estimate was wrong, rather than just
+correcting the number. It was reasoned about as one bounds check per *field
+access*. It is not: it is a check on every traversal of every reference, and a
+single method call makes several — receiver to class, class through its box,
+class to method table, method to closure, closure to function, function to
+chunk. Upstream follows a pointer at each of those. Counting one of them and
+calling it representative is the mistake.
+
+The decision may still be right for a crate that forbids `unsafe`. But it has
+to be argued against 5x, not against 10%, and the honest form of that argument
+is a measurement of each indirection rather than a prediction about them.
 
 ### The alternative that has not been built
 

@@ -142,6 +142,33 @@ a reason that has nothing to do with the VM. The four benchmark programs do not
 use those methods — they are loops, field access, arithmetic and dispatch — so
 the published comparison is unaffected; a different benchmark might not be.
 
+### Step 3 measured: fast to write, slow to run
+
+On the same ESP32-C6, running the same four programs — full table and caveats
+in **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
+
+| | wren-rs | C Wren `-O2` | |
+|---|---|---|---|
+| `fib(24)` x5 | 18.176 s | 3.250 s | **5.6x slower** |
+| `binary_trees` depth 9 | 8.616 s | 2.160 s | **4.0x slower** |
+| `method_call` | 2.766 s | 0.350 s | **7.9x slower** |
+| `list_build` 10,000 | 0.574 s | 0.130 s | **4.4x slower** |
+| **VM resident** | **45,676 B** | 83,036 B | **45% smaller** |
+
+**The VM is far smaller and the interpreter is far slower**, and the second
+half of that was not what the design predicted. `doc/wren-rs/design.md` put the
+cost of reaching objects by index rather than by pointer at "single-digit to
+low-double-digit percent"; it is 4–8x. The note has been corrected and says why
+the estimate was wrong: a method call traverses six references, not one, and
+each is a bounds check where upstream follows a pointer.
+
+The memory result is the other side of the same design. 45,676 B resident
+against 83,036 B is what compiling no core library at start-up buys — upstream
+builds `wren_core.wren` every time a VM is created.
+
+Nothing here is tuned. It is the first run, published because a result that
+contradicts the design is worth more than a flattering one.
+
 ### Steps 1 and 2: the numbers to beat
 
 Upstream Wren 0.4.0 runs on an ESP32-C6 and passes **821 of 846** of its own
