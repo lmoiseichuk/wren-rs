@@ -234,6 +234,10 @@ pub struct Vm {
     pub where_sequence_class: ObjectId,
     pub take_sequence_class: ObjectId,
     pub skip_sequence_class: ObjectId,
+    /// What `map.keys` and `map.values` return: views over the same table,
+    /// yielding one half of each entry.
+    pub map_key_sequence_class: ObjectId,
+    pub map_value_sequence_class: ObjectId,
 
     /// The fiber currently running. Its stack and frames are the VM's own,
     /// and are swapped back into it when control moves elsewhere.
@@ -316,6 +320,8 @@ impl Vm {
         let where_sequence_class = class_named(&mut heap, "WhereSequence", iterable);
         let take_sequence_class = class_named(&mut heap, "TakeSequence", iterable);
         let skip_sequence_class = class_named(&mut heap, "SkipSequence", iterable);
+        let map_key_sequence_class = class_named(&mut heap, "MapKeySequence", iterable);
+        let map_value_sequence_class = class_named(&mut heap, "MapValueSequence", iterable);
 
         let mut vm = Vm {
             heap,
@@ -343,6 +349,8 @@ impl Vm {
             where_sequence_class,
             take_sequence_class,
             skip_sequence_class,
+            map_key_sequence_class,
+            map_value_sequence_class,
             current_fiber: None,
             root_fiber: None,
             pending_switch: None,
@@ -721,6 +729,7 @@ impl Vm {
             self.object_class, self.fn_class, self.map_entry_class, self.fiber_class,
             self.random_class, self.sequence_class, self.map_sequence_class,
             self.where_sequence_class, self.take_sequence_class, self.skip_sequence_class,
+            self.map_key_sequence_class, self.map_value_sequence_class,
         ] {
             roots.push(Value::object(class));
         }

@@ -163,6 +163,8 @@ pub fn install(vm: &mut Vm) {
     install_map(vm);
     install_range(vm);
     install_system(vm);
+    // Last, so that a class which made its own metaclass keeps it.
+    install_metaclasses(vm);
 }
 
 /// `Object`: what every value responds to, because every class inherits it.
@@ -1799,13 +1801,16 @@ fn install_map(vm: &mut Vm) {
         Ok(vm.new_string(&out))
     });
 
+    // **Views over the same table, not copies.** `map.keys` yields the keys as
+    // the map is iterated, so the slot indices a program sees match the map's
+    // own -- and building a list would snapshot a map that may still change.
     define(vm, class, "keys", |vm, at| {
-        let keys: Vec<Value> = map_entries(vm, receiver(vm, at)).iter().map(|e| e.key).collect();
-        Ok(new_list(vm, keys))
+        let class = vm.map_key_sequence_class;
+        Ok(new_view(vm, class, &[receiver(vm, at)]))
     });
     define(vm, class, "values", |vm, at| {
-        let values: Vec<Value> = map_entries(vm, receiver(vm, at)).iter().map(|e| e.value).collect();
-        Ok(new_list(vm, values))
+        let class = vm.map_value_sequence_class;
+        Ok(new_view(vm, class, &[receiver(vm, at)]))
     });
 
     // Iterating a map yields `MapEntry` objects, so `for (e in map)` can reach
@@ -1849,8 +1854,53 @@ fn install_map(vm: &mut Vm) {
         Ok(Value::object(id))
     });
 
+    // The two views delegate iteration to the map and take one half of each
+    // entry. `field 0` is the map they are over.
+    // Both advance the underlying map identically; only the half they read
+    // out of each entry differs, which is the `iteratorValue` below.
+    for class in [vm.map_key_sequence_class, vm.map_value_sequence_class] {
+        define(vm, class, "iterate(_)", |vm, at| {
+            let map = instance_field(vm, receiver(vm, at), 0);
+            let iterator = argument(vm, at, 1);
+            vm.invoke_with(map, "iterate(_)", &[iterator])
+        });
+    }
+    define(vm, vm.map_key_sequence_class, "iteratorValue(_)", |vm, at| {
+        let map = instance_field(vm, receiver(vm, at), 0);
+        let iterator = argument(vm, at, 1);
+        let entry = vm.invoke_with(map, "iteratorValue(_)", &[iterator])?;
+        Ok(instance_field(vm, entry, 0))
+    });
+    define(vm, vm.map_value_sequence_class, "iteratorValue(_)", |vm, at| {
+        let map = instance_field(vm, receiver(vm, at), 0);
+        let iterator = argument(vm, at, 1);
+        let entry = vm.invoke_with(map, "iteratorValue(_)", &[iterator])?;
+        Ok(instance_field(vm, entry, 1))
+    });
+
     // `MapEntry` itself: two fields, reachable by name.
     let entry_class = vm.map_entry_class;
+    let entry_metaclass_name = vm
+        .heap
+        .allocate(Object::String(ObjString::from_text("MapEntry metaclass")));
+    let entry_metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        entry_metaclass_name,
+        Some(vm.class_class),
+    ))));
+    if let Some(Object::Class(entry)) = vm.heap.get_mut(entry_class) {
+        entry.metaclass = Some(entry_metaclass);
+    }
+    define(vm, entry_metaclass, "new(_,_)", |vm, at| {
+        let key = argument(vm, at, 1);
+        let value = argument(vm, at, 2);
+        let class = vm.map_entry_class;
+        let id = vm.heap.allocate(Object::Instance(ObjInstance {
+            class,
+            fields: alloc::vec![key, value],
+        }));
+        Ok(Value::object(id))
+    });
+
     define(vm, entry_class, "key", |vm, at| Ok(instance_field(vm, receiver(vm, at), 0)));
     define(vm, entry_class, "value", |vm, at| Ok(instance_field(vm, receiver(vm, at), 1)));
     define(vm, entry_class, "toString", |vm, at| {
@@ -2123,6 +2173,16 @@ fn install_range(vm: &mut Vm) {
 /// Handles the two things that make slicing fiddly: a descending range reads
 /// backwards, and an exclusive range stops one short of its end.
 fn slice_indices(range: &ObjRange, length: usize) -> Result<Vec<usize>, RuntimeError> {
+    // **An empty range at the end is allowed**, and is checked against the raw
+    // bounds before negative indices are resolved. This is what makes
+    // `list[0..-1]` and `list[0...list.count]` copy a list that may be empty:
+    // without it, a start equal to the length is out of bounds and the idiom
+    // fails on exactly the case it exists for.
+    let end = if range.is_inclusive { -1.0 } else { length as f64 };
+    if range.from == length as f64 && range.to == end {
+        return Ok(Vec::new());
+    }
+
     let resolve = |value: f64| -> Result<isize, RuntimeError> {
         if value != math::trunc(value) {
             return Err(RuntimeError::new("Range start must be an integer."));
@@ -2246,9 +2306,54 @@ fn install_system(vm: &mut Vm) {
         ("Fiber", vm.fiber_class),
         ("Range", vm.range_class),
         ("Sequence", vm.sequence_class),
+        ("MapEntry", vm.map_entry_class),
+        ("MapKeySequence", vm.map_key_sequence_class),
+        ("MapValueSequence", vm.map_value_sequence_class),
         ("String", vm.string_class),
     ] {
         vm.modules[0].define(name, Value::object(class));
+    }
+}
+
+/// Give every core class a metaclass, named after it.
+///
+/// **A class's own class is its metaclass**, so `Object.type.name` is
+/// `"Object metaclass"` rather than `"Class"`. Several core classes had none,
+/// because only the ones with static methods had needed one -- which made
+/// their `type` fall back to `Class` and report the wrong name.
+fn install_metaclasses(vm: &mut Vm) {
+    let classes = [
+        vm.object_class, vm.bool_class, vm.class_class, vm.fiber_class, vm.fn_class,
+        vm.list_class, vm.map_class, vm.map_entry_class, vm.null_class, vm.num_class,
+        vm.range_class, vm.string_class, vm.sequence_class, vm.map_sequence_class,
+        vm.where_sequence_class, vm.take_sequence_class, vm.skip_sequence_class,
+    ];
+    for class in classes {
+        let existing = match vm.heap.get(class) {
+            Some(Object::Class(class)) => class.metaclass,
+            _ => continue,
+        };
+        if existing.is_some() {
+            continue;
+        }
+        let name = match vm.heap.get(class) {
+            Some(Object::Class(class)) => class.name,
+            _ => continue,
+        };
+        let text = match vm.heap.get(name) {
+            Some(Object::String(text)) => text.as_str().unwrap_or("?").to_string(),
+            _ => "?".to_string(),
+        };
+        let metaclass_name = vm
+            .heap
+            .allocate(Object::String(ObjString::from_text(&alloc::format!("{text} metaclass"))));
+        let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+            metaclass_name,
+            Some(vm.class_class),
+        ))));
+        if let Some(Object::Class(class)) = vm.heap.get_mut(class) {
+            class.metaclass = Some(metaclass);
+        }
     }
 }
 
