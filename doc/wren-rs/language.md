@@ -12,8 +12,8 @@ paragraph of the spec rather than at a vague gap.
 | | |
 |---|---|
 | probes | 96 |
-| **works** | **91** |
-| differs | 3 |
+| **works** | **93** |
+| differs | 1 |
 | missing | 2 |
 
 ## By chapter
@@ -21,7 +21,7 @@ paragraph of the spec rather than at a vague gap.
 | chapter | works | differs | missing |
 |---|---|---|---|
 | [Syntax](#syntax) | 8 | 0 | 0 |
-| [Values](#values) | 10 | 2 | 0 |
+| [Values](#values) | 12 | 0 | 0 |
 | [Lists](#lists) | 10 | 0 | 0 |
 | [Maps](#maps) | 8 | 0 | 0 |
 | [Method calls](#method-calls) | 8 | 0 | 0 |
@@ -56,8 +56,8 @@ paragraph of the spec rather than at a vague gap.
 | Scientific notation | works |  |
 | Strings | works |  |
 | Escaping | works |  |
-| Unicode escapes | **differs** | printed "\\u0041\n", spec says "A\n" |
-| Byte escapes | **differs** | printed "\\x41\n", spec says "A\n" |
+| Unicode escapes | works |  |
+| Byte escapes | works |  |
 | Interpolation | works |  |
 | Raw strings | works |  |
 | Ranges | works |  |

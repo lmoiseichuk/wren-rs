@@ -484,7 +484,7 @@ impl<'a> Compiler<'a> {
     /// variable does not affect the module it came from.
     fn import_statement(&mut self) -> Result<(), CompileError> {
         self.consume(TokenKind::String, "Expect a string after 'import'.")?;
-        let path = unescape(self.previous.text(self.source));
+        let path = self.unescaped(self.previous)?;
         let line = self.line();
 
         let path_value = self.vm.new_string(&path);
@@ -796,7 +796,27 @@ impl<'a> Compiler<'a> {
         let can_assign = precedence <= Precedence::Assignment;
         self.prefix(can_assign)?;
 
-        while precedence <= infix_precedence(self.current.kind) {
+        loop {
+            // **A newline before a `.` does not end the expression.** Wren
+            // allows a call chain to be broken across lines, which means
+            // deciding whether a newline is a separator needs one token of
+            // lookahead past it -- so the lexer is cloned and run forward, and
+            // the newline is consumed only if a `.` really follows.
+            if self.check(TokenKind::Line) && precedence <= Precedence::Call {
+                let mut ahead = self.lexer.clone();
+                let mut next = ahead.next_token();
+                while next.kind == TokenKind::Line {
+                    next = ahead.next_token();
+                }
+                if next.kind != TokenKind::Dot {
+                    break;
+                }
+                self.skip_newlines()?;
+            }
+
+            if precedence > infix_precedence(self.current.kind) {
+                break;
+            }
             self.advance()?;
             self.infix(can_assign)?;
         }
@@ -818,7 +838,7 @@ impl<'a> Compiler<'a> {
                 self.emit_constant(Value::num(value), line)
             }
             TokenKind::String => {
-                let text = unescape(token.text(self.source));
+                let text = self.unescaped(token)?;
                 let value = self.vm.new_string(&text);
                 self.emit_constant(value, line)
             }
@@ -1051,8 +1071,9 @@ impl<'a> Compiler<'a> {
                 self.chunk_mut().emit_byte(slot as u8, line);
                 return Ok(());
             }
-            if self.vm.modules[self.module].names.find(&name).is_none() && self.is_this_call(&name) {
-                // Rewind: this is `name = value` on the receiver, a setter.
+            if self.is_this_call(&name) {
+                // `name = value` on the receiver: a setter, for the same
+                // reason and in the same order as the load above.
                 return self.named_call(&name, true, line);
             }
             let index = self.module_variable(&name)?;
@@ -1061,9 +1082,13 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
 
+        // **Locals first, then the implicit receiver, then the module.** The
+        // order matters and is upstream's: a class named `foo` with a method
+        // named `foo` must resolve `foo` inside its own body to the *method*,
+        // not to the class. Checking the module first found the class and got
+        // it backwards.
         if self.resolve_local(&name).is_none()
             && self.resolve_upvalue(&name, self.states.len() - 1).is_none()
-            && self.vm.modules[self.module].names.find(&name).is_none()
             && self.is_this_call(&name)
         {
             return self.named_call(&name, can_assign, line);
@@ -1252,6 +1277,17 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// A string literal's contents, with escapes decoded.
+    ///
+    /// A bad escape is a compile error pointing at the string it is in, which
+    /// is why this is a method: the free function has no token to blame.
+    fn unescaped(&self, token: Token) -> Result<String, CompileError> {
+        unescape(token.text(self.source)).map_err(|message| CompileError {
+            message,
+            line: clamp_line(token.line),
+        })
+    }
+
     fn class_state(&self) -> &ClassState {
         self.classes.last().expect("a class being compiled")
     }
@@ -1373,7 +1409,7 @@ impl<'a> Compiler<'a> {
     /// the same string, at the cost of an intermediate per interpolation.
     fn interpolation(&mut self) -> Result<(), CompileError> {
         let line = clamp_line(self.previous.line);
-        let head = unescape(self.previous.text(self.source));
+        let head = self.unescaped(self.previous)?;
         let value = self.vm.new_string(&head);
         self.emit_constant(value, line)?;
 
@@ -1388,7 +1424,7 @@ impl<'a> Compiler<'a> {
             // there -- what arrives next is already the resumed string: another
             // `Interpolation` if there is a further `%(`, or the final `String`.
             if self.match_token(TokenKind::Interpolation)? {
-                let text = unescape(self.previous.text(self.source));
+                let text = self.unescaped(self.previous)?;
                 let value = self.vm.new_string(&text);
                 self.emit_constant(value, line)?;
                 self.emit_call("+(_)", 1, line)?;
@@ -1396,7 +1432,7 @@ impl<'a> Compiler<'a> {
             }
 
             self.consume(TokenKind::String, "Expect end of string interpolation.")?;
-            let text = unescape(self.previous.text(self.source));
+            let text = self.unescaped(self.previous)?;
             let value = self.vm.new_string(&text);
             self.emit_constant(value, line)?;
             self.emit_call("+(_)", 1, line)?;
@@ -1610,6 +1646,28 @@ impl<'a> Compiler<'a> {
 
         let (full, arity) = self.method_signature()?;
         let line = self.line();
+
+        // **A constructor is a named method taking parentheses.** It cannot be
+        // an operator, a getter, a setter or a subscript, because every one of
+        // those is called on an instance that already exists -- which is the
+        // one thing a constructor does not have.
+        if is_constructor {
+            if is_static {
+                return Err(self.error_at(self.previous, "A constructor cannot be static."));
+            }
+            if full.ends_with("=(_)") {
+                return Err(self.error_at(self.previous, "A constructor cannot be a setter."));
+            }
+            if full.starts_with('[') {
+                return Err(self.error_at(self.previous, "A constructor cannot be a subscript."));
+            }
+            if !full.contains('(') {
+                return Err(self.error_at(self.previous, "A constructor cannot be a getter."));
+            }
+            if !full.chars().next().is_some_and(|first| first.is_alphabetic() || first == '_') {
+                return Err(self.error_at(self.previous, "A constructor cannot be an operator."));
+            }
+        }
         // A constructor's body is an instance method under a name no program
         // can write, and `new` on the metaclass is generated to call it.
         let body_signature = if is_constructor { format!("init {full}") } else { full.clone() };
@@ -1876,9 +1934,10 @@ fn tighter(precedence: Precedence) -> Precedence {
 /// The lexer deliberately leaves them alone — it has no allocator and a token
 /// is a span, so it cannot produce a decoded string. This is where that is
 /// paid for, and it is the only place that knows the escape set.
-fn unescape(raw: &str) -> String {
+fn unescape(raw: &str) -> Result<String, String> {
     let mut out = String::with_capacity(raw.len());
     let mut characters = raw.chars();
+
     while let Some(character) = characters.next() {
         if character != '\\' {
             out.push(character);
@@ -1890,6 +1949,7 @@ fn unescape(raw: &str) -> String {
             Some('t') => out.push('\t'),
             Some('0') => out.push('\0'),
             Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
             Some('\\') => out.push('\\'),
             Some('%') => out.push('%'),
             Some('a') => out.push('\u{7}'),
@@ -1897,16 +1957,53 @@ fn unescape(raw: &str) -> String {
             Some('e') => out.push('\u{1b}'),
             Some('f') => out.push('\u{c}'),
             Some('v') => out.push('\u{b}'),
-            // An unknown escape keeps both characters rather than swallowing
-            // one, so a mistake in a program is visible in its output.
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
+
+            // `\xNN` is a raw byte, which is why it is pushed as one rather
+            // than as a character: a Wren string is bytes, and `\xff` is a
+            // byte that is not valid UTF-8 on its own.
+            Some('x') => {
+                let byte = read_hex(&mut characters, 2, "byte")?;
+                // Pushed through `char` because the output is a Rust `String`;
+                // a lone high byte becomes its Latin-1 character, which
+                // round-trips through the string's bytes for the values a
+                // program can actually write here.
+                out.push(byte as u8 as char);
             }
-            None => out.push('\\'),
+            // `\uNNNN` and `\UNNNNNNNN` are code points.
+            Some('u') => out.push(read_code_point(&mut characters, 4)?),
+            Some('U') => out.push(read_code_point(&mut characters, 8)?),
+
+            // **An unknown escape is an error, not a passthrough.** Keeping
+            // both characters was quietly turning a typo into output.
+            Some(other) => return Err(format!("Invalid escape character '{other}'.")),
+            None => return Err("Invalid escape character ''.".to_string()),
         }
     }
-    out
+    Ok(out)
+}
+
+/// Read exactly `digits` hexadecimal digits.
+fn read_hex(
+    characters: &mut core::str::Chars<'_>,
+    digits: usize,
+    what: &str,
+) -> Result<u32, String> {
+    let mut value = 0u32;
+    for _ in 0..digits {
+        let Some(character) = characters.next() else {
+            return Err(format!("Incomplete {what} escape sequence."));
+        };
+        let Some(digit) = character.to_digit(16) else {
+            return Err(format!("Invalid {what} escape sequence."));
+        };
+        value = value * 16 + digit;
+    }
+    Ok(value)
+}
+
+fn read_code_point(characters: &mut core::str::Chars<'_>, digits: usize) -> Result<char, String> {
+    let value = read_hex(characters, digits, "Unicode")?;
+    char::from_u32(value).ok_or_else(|| "Invalid Unicode escape sequence.".to_string())
 }
 
 

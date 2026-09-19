@@ -169,6 +169,7 @@ impl Token {
 ///
 /// Holds no allocation and borrows nothing but the source, so it is cheap to
 /// construct and cheap to abandon.
+#[derive(Clone)]
 pub struct Lexer<'a> {
     source: &'a str,
     bytes: &'a [u8],
@@ -186,12 +187,21 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    /// Start lexing `source`.
+    ///
+    /// A leading UTF-8 byte order mark is skipped. It carries no information
+    /// in a file that is already known to be UTF-8 -- editors on Windows add
+    /// one anyway -- and leaving it in makes the first token of an otherwise
+    /// valid program an error nobody can see.
     pub fn new(source: &'a str) -> Self {
+        // U+FEFF encoded as UTF-8.
+        let mark: &[u8] = &[0xef, 0xbb, 0xbf];
+        let skip = if source.as_bytes().starts_with(mark) { mark.len() } else { 0 };
         Lexer {
             source,
             bytes: source.as_bytes(),
-            start: 0,
-            current: 0,
+            start: skip,
+            current: skip,
             line: 1,
             interpolation: [0; MAX_INTERPOLATION_NESTING],
             interpolation_depth: 0,

@@ -1142,3 +1142,97 @@ fn an_invalid_map_iterator_is_an_error() {
         "Invalid map iterator."
     );
 }
+
+// --- what the language refuses ----------------------------------------------
+
+#[test]
+fn a_class_cannot_inherit_from_a_built_in() {
+    // Their instances have a representation of their own -- a Num is a double
+    // in the value itself -- so an instance of a subclass would have to be
+    // both that and an object with fields.
+    assert_eq!(
+        error("class Sub is Num {}"),
+        "Class 'Sub' cannot inherit from built-in class 'Num'."
+    );
+    assert_eq!(
+        error("class Sub is String {}"),
+        "Class 'Sub' cannot inherit from built-in class 'String'."
+    );
+}
+
+#[test]
+fn a_class_may_inherit_from_object_and_sequence() {
+    // The two that are not representations, only behaviour.
+    assert_eq!(run("class A is Object { construct new() {} }\nSystem.print(A.new() is A)"), "true\n");
+    assert_eq!(run("class B is Sequence { construct new() {} }\nSystem.print(B.new() is Sequence)"), "true\n");
+}
+
+#[test]
+fn a_constructor_must_be_a_named_method() {
+    // Every other shape is called on an instance that already exists, which is
+    // the one thing a constructor does not have.
+    assert_eq!(error("class A { construct +(o) {} }"), "A constructor cannot be an operator.");
+    assert_eq!(error("class A { construct v { } }"), "A constructor cannot be a getter.");
+    assert_eq!(error("class A { construct v=(x) {} }"), "A constructor cannot be a setter.");
+    assert_eq!(error("class A { construct [i] {} }"), "A constructor cannot be a subscript.");
+    assert_eq!(error("class A { static construct new() {} }"), "A constructor cannot be static.");
+}
+
+#[test]
+fn a_bad_escape_is_a_compile_error() {
+    // It used to keep both characters, which quietly turned a typo into
+    // output.
+    assert_eq!(error("System.print(\"\\q\")"), "Invalid escape character 'q'.");
+    assert_eq!(error("System.print(\"\\x1\")"), "Incomplete byte escape sequence.");
+    assert_eq!(error("System.print(\"\\xzz\")"), "Invalid byte escape sequence.");
+    assert_eq!(error("System.print(\"\\u12\")"), "Incomplete Unicode escape sequence.");
+    assert_eq!(error("System.print(\"\\uzzzz\")"), "Invalid Unicode escape sequence.");
+}
+
+#[test]
+fn good_escapes_still_work() {
+    assert_eq!(run("System.print(\"\\x41\")"), "A\n");
+    assert_eq!(run("System.print(\"\\u0041\")"), "A\n");
+    assert_eq!(run("System.print(\"\\U00000041\")"), "A\n");
+}
+
+// --- syntax that spans lines ------------------------------------------------
+
+#[test]
+fn a_call_chain_may_be_broken_across_lines() {
+    let source = "
+class Chain {
+  construct new() {}
+  a { this }
+  b { this }
+  done { \"chained\" }
+}
+System.print(Chain.new()
+  .a
+  .b
+  .done)
+";
+    assert_eq!(run(source), "chained\n");
+}
+
+#[test]
+fn a_byte_order_mark_is_not_a_token() {
+    // Editors add one; leaving it in made the first token of an otherwise
+    // valid program an error nobody could see.
+    assert_eq!(run("\u{feff}System.print(1)"), "1\n");
+}
+
+#[test]
+fn a_method_wins_over_a_module_variable_of_the_same_name() {
+    // Upstream's resolution order: locals, then the implicit receiver, then
+    // the module. Checking the module first resolved `foo` to the class.
+    let source = "
+class foo {
+  construct new() {}
+  static bar { \"static method\" }
+  baz { bar }
+}
+System.print(foo.bar)
+";
+    assert_eq!(run(source), "static method\n");
+}

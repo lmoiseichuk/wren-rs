@@ -1655,6 +1655,24 @@ impl Vm {
             _ => return Err(RuntimeError::new("Class must inherit from a class.")),
         };
 
+        // **The built-ins cannot be subclassed.** Their instances have a
+        // representation of their own -- a `Num` is a double in the value
+        // itself, a `List` is a vector -- and an instance of a subclass would
+        // have to be both that and an object with fields. Upstream refuses for
+        // the same reason and with this wording.
+        let builtin = [
+            self.bool_class, self.class_class, self.fiber_class, self.fn_class,
+            self.list_class, self.map_class, self.null_class, self.num_class,
+            self.range_class, self.string_class,
+        ];
+        if builtin.contains(&superclass_id) {
+            let child = self.to_string(name);
+            let parent = self.class_name(superclass_id);
+            return Err(RuntimeError::new(format!(
+                "Class '{child}' cannot inherit from built-in class '{parent}'."
+            )));
+        }
+
         let Some(name_id) = name.as_object() else {
             return Err(RuntimeError::new("Class name must be a string."));
         };
