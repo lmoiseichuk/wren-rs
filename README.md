@@ -119,6 +119,39 @@ profiler. The two steps that were *guessed* at — reference counting and a youn
 generation — are the two that are switched off:
 **[`doc/wren-rs/memory.md`](doc/wren-rs/memory.md)**.
 
+### The ceiling on garbage, and why a small part pays nothing for it
+
+`Heap::set_headroom` makes peak memory **the live set plus a constant you
+choose**, instead of half as much again as the live set. Swept across its whole
+range on the same board:
+
+| ceiling | `binary_trees` (1,023 live) | its peak | `method_call` (109 live) |
+|---|---|---|---|
+| ratio, 1.5× *(default)* | 9.106 s | 117,376 B | 2.5185 s |
+| 32 KB | 8.970 s | 121,480 B | 2.5185 s |
+| 16 KB | 10.148 s | 109,004 B | 2.5185 s |
+| 8 KB | 12.211 s | 109,004 B | 2.5185 s |
+| 4 KB | 16.545 s | 109,000 B | 2.5185 s |
+| **1 KB** | 37.916 s | **83,148 B** | **2.5185 s** |
+
+**Read the last column.** `method_call` holds about a hundred objects and does
+not move — not to five decimal places — from the loosest setting to the
+tightest. `binary_trees` holds a thousand-node tree and pays four times over
+for the same ceiling.
+
+That is not a coincidence, it is what tracing costs: **a collection is
+proportional to the live set.** So the parts that most need a tight bound — a
+CH32V006 with 8 KB, where a program holds tens of objects rather than thousands
+— are precisely the ones where tightening it is free. The default stays the
+ratio so the published numbers remain comparable with the C port; a firmware
+that knows its live set should not keep it.
+
+Two more things the curve says. Between 16 KB and 4 KB the peak barely moves
+while the time doubles — below 16 KB it is no longer floating garbage that sets
+the peak but the live set, the field chunks and the tables' high-water mark, so
+there is nothing left to squeeze. And 32 KB is *looser* than 1.5× of this live
+set, which is why it is both slightly faster and slightly larger.
+
 ## The plan
 
 Six steps, each producing something checkable.
