@@ -33,7 +33,7 @@ use alloc::vec::Vec;
 
 use crate::object::{
     ObjClass, ObjClosure, ObjFiber, ObjFn, ObjInstance, ObjList, ObjMap, ObjRange, ObjString,
-    ObjUpvalue, Object, ObjectId, ObjectType,
+    ObjUpvalue, Object, ObjectId, ObjectType, Trace,
 };
 use crate::value::Value;
 
@@ -80,18 +80,163 @@ impl Collection {
     }
 }
 
-/// The object table.
-pub struct Heap {
-    /// `None` is a free slot. `Option<Object>` is the same size as `Object`
-    /// here — the enum has spare discriminants for the niche — so empty slots
-    /// cost nothing extra.
-    slots: Vec<Option<Object>>,
+/// One type's objects: its slots, its free list and its mark bits.
+///
+/// **This is what "one table per type" means.** A slot holds the payload
+/// itself rather than the largest variant of an enum, so a `List` costs the
+/// twelve bytes a list needs instead of the twenty-four a `Range` needs. It
+/// also makes the type free to ask about: it is in the handle, not in a
+/// discriminant that has to be fetched.
+struct Table<T> {
+    slots: Vec<Option<T>>,
     /// Indices of free slots, newest first. A separate stack rather than a
     /// linked list threaded through the slots themselves: the same asymptotics,
     /// none of the aliasing that a threaded list needs `unsafe` to express.
     free: Vec<u32>,
     /// One bit per slot. Cleared at the start of each mark phase.
     marks: Vec<u64>,
+}
+
+impl<T> Table<T> {
+    fn new() -> Table<T> {
+        Table {
+            slots: Vec::new(),
+            free: Vec::new(),
+            marks: Vec::new(),
+        }
+    }
+
+    fn allocate(&mut self, value: T) -> u32 {
+        match self.free.pop() {
+            Some(index) => {
+                self.slots[index as usize] = Some(value);
+                index
+            }
+            None => {
+                let index = self.slots.len();
+                self.slots.push(Some(value));
+                if index / 64 >= self.marks.len() {
+                    self.marks.push(0);
+                }
+                index as u32
+            }
+        }
+    }
+
+    fn get(&self, index: u32) -> Option<&T> {
+        self.slots.get(index as usize)?.as_ref()
+    }
+
+    fn get_mut(&mut self, index: u32) -> Option<&mut T> {
+        self.slots.get_mut(index as usize)?.as_mut()
+    }
+
+    /// What one slot of this table costs, which is the whole point of having
+    /// one table per type.
+    fn slot_size(&self) -> usize {
+        core::mem::size_of::<Option<T>>()
+    }
+
+    fn occupied(&self, index: u32) -> bool {
+        matches!(self.slots.get(index as usize), Some(Some(_)))
+    }
+
+    fn clear_marks(&mut self) {
+        for word in &mut self.marks {
+            *word = 0;
+        }
+    }
+
+    fn is_marked(&self, index: u32) -> bool {
+        let index = index as usize;
+        match self.marks.get(index / 64) {
+            Some(word) => word & (1 << (index % 64)) != 0,
+            None => false,
+        }
+    }
+
+    fn set_mark(&mut self, index: u32) {
+        let index = index as usize;
+        if let Some(word) = self.marks.get_mut(index / 64) {
+            *word |= 1 << (index % 64);
+        }
+    }
+}
+
+/// Run a block once for each of the heap's tables, with `$name` bound to it.
+///
+/// The bodies are generic over the payload type but the tables are not one
+/// type, so this is a macro rather than a loop or a closure. Every place that
+/// has to visit all ten -- clearing marks, sweeping, counting -- uses it, so
+/// adding a type means adding it here and nowhere else.
+macro_rules! each_table {
+    ($heap:expr, $name:ident, $kind:ident, $body:block) => {{
+        let heap = $heap;
+        {
+            let $name = &mut heap.classes;
+            let $kind = ObjectType::Class;
+            $body
+        }
+        {
+            let $name = &mut heap.closures;
+            let $kind = ObjectType::Closure;
+            $body
+        }
+        {
+            let $name = &mut heap.functions;
+            let $kind = ObjectType::Fn;
+            $body
+        }
+        {
+            let $name = &mut heap.instances;
+            let $kind = ObjectType::Instance;
+            $body
+        }
+        {
+            let $name = &mut heap.lists;
+            let $kind = ObjectType::List;
+            $body
+        }
+        {
+            let $name = &mut heap.maps;
+            let $kind = ObjectType::Map;
+            $body
+        }
+        {
+            let $name = &mut heap.ranges;
+            let $kind = ObjectType::Range;
+            $body
+        }
+        {
+            let $name = &mut heap.strings;
+            let $kind = ObjectType::String;
+            $body
+        }
+        {
+            let $name = &mut heap.upvalues;
+            let $kind = ObjectType::Upvalue;
+            $body
+        }
+        {
+            let $name = &mut heap.fibers;
+            let $kind = ObjectType::Fiber;
+            $body
+        }
+    }};
+}
+
+/// The object tables, and the collector over them.
+pub struct Heap {
+    classes: Table<alloc::boxed::Box<ObjClass>>,
+    closures: Table<ObjClosure>,
+    functions: Table<alloc::boxed::Box<ObjFn>>,
+    fibers: Table<alloc::boxed::Box<ObjFiber>>,
+    instances: Table<ObjInstance>,
+    lists: Table<ObjList>,
+    maps: Table<ObjMap>,
+    ranges: Table<ObjRange>,
+    strings: Table<ObjString>,
+    upvalues: Table<ObjUpvalue>,
     live: usize,
     bytes: usize,
     threshold: usize,
@@ -152,9 +297,16 @@ pub struct Profile {
 impl Heap {
     pub fn new() -> Heap {
         Heap {
-            slots: Vec::new(),
-            free: Vec::new(),
-            marks: Vec::new(),
+            classes: Table::new(),
+            closures: Table::new(),
+            functions: Table::new(),
+            fibers: Table::new(),
+            instances: Table::new(),
+            lists: Table::new(),
+            maps: Table::new(),
+            ranges: Table::new(),
+            strings: Table::new(),
+            upvalues: Table::new(),
             live: 0,
             bytes: 0,
             threshold: INITIAL_THRESHOLD,
@@ -166,7 +318,7 @@ impl Heap {
         }
     }
 
-    /// Put an object in the table and hand back a handle to it.
+    /// Put an object in its type's table and hand back a handle to it.
     ///
     /// **This never collects.** Upstream allocates and collects in the same
     /// call, which means any allocation can free an object the caller is part
@@ -177,225 +329,342 @@ impl Heap {
     /// what its roots are. A forgotten temporary root is one of the classic
     /// ways to write a collector bug, and this removes the opportunity rather
     /// than documenting it.
+    ///
+    /// `Object` is the constructor's argument and nothing more: it is taken
+    /// apart here and the payload goes into its own table. Nothing stores one.
     pub fn allocate(&mut self, object: Object) -> ObjectId {
         #[cfg(feature = "profile")]
         {
             self.profile.allocated[object.object_type() as usize] += 1;
-            self.profile.allocated_bytes += object.size_estimate() as u64;
-        }
-        self.bytes += object.size_estimate();
-        #[cfg(feature = "profile")]
-        {
-            // Occupancy is exact and free: every slot that is not on the free
-            // list holds something.
-            let occupied = self.slots.len().saturating_sub(self.free.len()) + 1;
-            self.profile.peak_live = self.profile.peak_live.max(occupied);
-            self.profile.peak_bytes = self.profile.peak_bytes.max(self.bytes);
         }
         self.live += 1;
 
-        match self.free.pop() {
-            Some(index) => {
-                self.slots[index as usize] = Some(object);
-                ObjectId::new(index)
+        // **The cost is the slot this type actually uses**, not the largest
+        // slot any type uses. Charging a flat size here and a per-type size at
+        // the sweep would make the running total disagree with the collector's,
+        // and the growth threshold is set from one and tested against the
+        // other.
+        let (id, cost) = match object {
+            Object::Class(class) => Self::place(&mut self.classes, ObjectType::Class, class),
+            Object::Closure(closure) => {
+                Self::place(&mut self.closures, ObjectType::Closure, closure)
             }
-            None => {
-                let index = self.slots.len() as u32;
-                self.slots.push(Some(object));
-                // One more bit may need one more word.
-                if self.marks.len() * 64 < self.slots.len() {
-                    self.marks.push(0);
-                }
-                ObjectId::new(index)
+            Object::Fn(function) => Self::place(&mut self.functions, ObjectType::Fn, function),
+            Object::Fiber(fiber) => Self::place(&mut self.fibers, ObjectType::Fiber, fiber),
+            Object::Instance(instance) => {
+                Self::place(&mut self.instances, ObjectType::Instance, instance)
             }
+            Object::List(list) => Self::place(&mut self.lists, ObjectType::List, list),
+            Object::Map(map) => Self::place(&mut self.maps, ObjectType::Map, map),
+            Object::Range(range) => Self::place(&mut self.ranges, ObjectType::Range, range),
+            Object::String(string) => Self::place(&mut self.strings, ObjectType::String, string),
+            Object::Upvalue(upvalue) => {
+                Self::place(&mut self.upvalues, ObjectType::Upvalue, upvalue)
+            }
+        };
+
+        self.bytes += cost;
+
+        #[cfg(feature = "profile")]
+        {
+            self.profile.allocated_bytes += cost as u64;
+            let occupied = self.occupancy();
+            self.profile.peak_live = self.profile.peak_live.max(occupied);
+            self.profile.peak_bytes = self.profile.peak_bytes.max(self.bytes);
         }
+        id
     }
 
-    /// Look an object up. `None` if the handle is stale or was never valid.
-    pub fn get(&self, id: ObjectId) -> Option<&Object> {
-        self.slots.get(id.raw() as usize)?.as_ref()
-    }
-
-    /// Look an object up for modification.
-    pub fn get_mut(&mut self, id: ObjectId) -> Option<&mut Object> {
-        self.slots.get_mut(id.raw() as usize)?.as_mut()
+    /// Put a value in its table, and say what the slot plus its contents cost.
+    fn place<T: Trace>(table: &mut Table<T>, kind: ObjectType, value: T) -> (ObjectId, usize) {
+        let cost = table.slot_size() + value.contents_size();
+        (ObjectId::tagged(kind.tag(), table.allocate(value)), cost)
     }
 
     /// Look up an object of a known type.
     ///
-    /// **This is the API the VM should use, not [`get`](Heap::get).** Almost
-    /// every access already knows what it expects -- `match heap.get(id) {
-    /// Some(Object::Class(class)) => ..., _ => return }` was the shape of 140
-    /// sites -- and saying so lets the heap answer without building an enum
-    /// the caller immediately takes apart.
-    ///
-    /// It is also what makes the storage replaceable. With one table per type,
-    /// there is no single `Object` to hand back a reference to; there is a
-    /// `&ObjClass` in the class table. These accessors are the boundary that
-    /// lets that change without touching the VM.
+    /// **This is the API the VM uses.** Almost every access already knows what
+    /// it expects, and saying so means the heap can go straight to that type's
+    /// table -- there is no enum to build and take apart, and no discriminant
+    /// to fetch.
     ///
     /// A handle of the wrong type reads as `None`, exactly as a stale handle
-    /// does. That is the same contract `get` has and the same one upstream's
-    /// `AS_CLASS` does not: there, asking a string for its methods is
-    /// undefined behaviour.
+    /// does, and the check is a comparison of four bits rather than a lookup.
+    /// That is the same contract upstream's `AS_CLASS` does not offer: there,
+    /// asking a string for its methods is undefined behaviour.
     pub fn class(&self, id: ObjectId) -> Option<&ObjClass> {
-        match self.get(id)? {
-            Object::Class(class) => Some(class),
-            _ => None,
+        match id.tag() == ObjectType::Class.tag() {
+            true => self.classes.get(id.index()).map(|class| &**class),
+            false => None,
         }
     }
 
     pub fn class_mut(&mut self, id: ObjectId) -> Option<&mut ObjClass> {
-        match self.get_mut(id)? {
-            Object::Class(class) => Some(class),
-            _ => None,
+        match id.tag() == ObjectType::Class.tag() {
+            true => self.classes.get_mut(id.index()).map(|class| &mut **class),
+            false => None,
         }
     }
 
-    pub fn instance(&self, id: ObjectId) -> Option<&ObjInstance> {
-        match self.get(id)? {
-            Object::Instance(instance) => Some(instance),
-            _ => None,
-        }
-    }
-
-    pub fn instance_mut(&mut self, id: ObjectId) -> Option<&mut ObjInstance> {
-        match self.get_mut(id)? {
-            Object::Instance(instance) => Some(instance),
-            _ => None,
-        }
-    }
-
-    pub fn list(&self, id: ObjectId) -> Option<&ObjList> {
-        match self.get(id)? {
-            Object::List(list) => Some(list),
-            _ => None,
-        }
-    }
-
-    pub fn list_mut(&mut self, id: ObjectId) -> Option<&mut ObjList> {
-        match self.get_mut(id)? {
-            Object::List(list) => Some(list),
-            _ => None,
-        }
-    }
-
-    pub fn map(&self, id: ObjectId) -> Option<&ObjMap> {
-        match self.get(id)? {
-            Object::Map(map) => Some(map),
-            _ => None,
-        }
-    }
-
-    pub fn map_mut(&mut self, id: ObjectId) -> Option<&mut ObjMap> {
-        match self.get_mut(id)? {
-            Object::Map(map) => Some(map),
-            _ => None,
-        }
-    }
-
-    pub fn range(&self, id: ObjectId) -> Option<&ObjRange> {
-        match self.get(id)? {
-            Object::Range(range) => Some(range),
-            _ => None,
-        }
-    }
-
-    pub fn string(&self, id: ObjectId) -> Option<&ObjString> {
-        match self.get(id)? {
-            Object::String(string) => Some(string),
-            _ => None,
-        }
-    }
-
-    pub fn string_mut(&mut self, id: ObjectId) -> Option<&mut ObjString> {
-        match self.get_mut(id)? {
-            Object::String(string) => Some(string),
-            _ => None,
-        }
-    }
-
-    pub fn upvalue(&self, id: ObjectId) -> Option<&ObjUpvalue> {
-        match self.get(id)? {
-            Object::Upvalue(upvalue) => Some(upvalue),
-            _ => None,
-        }
-    }
-
-    pub fn upvalue_mut(&mut self, id: ObjectId) -> Option<&mut ObjUpvalue> {
-        match self.get_mut(id)? {
-            Object::Upvalue(upvalue) => Some(upvalue),
-            _ => None,
-        }
-    }
-
-    /// `Fn` is a keyword, so the accessor is spelled out.
     pub fn function(&self, id: ObjectId) -> Option<&ObjFn> {
-        match self.get(id)? {
-            Object::Fn(function) => Some(function),
-            _ => None,
+        match id.tag() == ObjectType::Fn.tag() {
+            true => self.functions.get(id.index()).map(|function| &**function),
+            false => None,
         }
     }
 
     pub fn function_mut(&mut self, id: ObjectId) -> Option<&mut ObjFn> {
-        match self.get_mut(id)? {
-            Object::Fn(function) => Some(function),
-            _ => None,
-        }
-    }
-
-    pub fn closure(&self, id: ObjectId) -> Option<&ObjClosure> {
-        match self.get(id)? {
-            Object::Closure(closure) => Some(closure),
-            _ => None,
-        }
-    }
-
-    pub fn closure_mut(&mut self, id: ObjectId) -> Option<&mut ObjClosure> {
-        match self.get_mut(id)? {
-            Object::Closure(closure) => Some(closure),
-            _ => None,
+        match id.tag() == ObjectType::Fn.tag() {
+            true => self
+                .functions
+                .get_mut(id.index())
+                .map(|function| &mut **function),
+            false => None,
         }
     }
 
     pub fn fiber(&self, id: ObjectId) -> Option<&ObjFiber> {
-        match self.get(id)? {
-            Object::Fiber(fiber) => Some(fiber),
-            _ => None,
+        match id.tag() == ObjectType::Fiber.tag() {
+            true => self.fibers.get(id.index()).map(|fiber| &**fiber),
+            false => None,
         }
     }
 
     pub fn fiber_mut(&mut self, id: ObjectId) -> Option<&mut ObjFiber> {
-        match self.get_mut(id)? {
-            Object::Fiber(fiber) => Some(fiber),
-            _ => None,
+        match id.tag() == ObjectType::Fiber.tag() {
+            true => self.fibers.get_mut(id.index()).map(|fiber| &mut **fiber),
+            false => None,
         }
     }
 
-    /// What kind of object a handle refers to, without reading the object.
-    ///
-    /// Today this loads the object and reads its discriminant. Once the type
-    /// lives in the handle it will not touch the heap at all, which is what
-    /// makes `class_of` free for every built-in -- one of the four heap
-    /// lookups a method call still costs.
-    pub fn type_of(&self, id: ObjectId) -> Option<ObjectType> {
-        Some(self.get(id)?.object_type())
+    pub fn closure(&self, id: ObjectId) -> Option<&ObjClosure> {
+        match id.tag() == ObjectType::Closure.tag() {
+            true => self.closures.get(id.index()),
+            false => None,
+        }
     }
 
-    /// Every live handle, in allocation order.
+    pub fn closure_mut(&mut self, id: ObjectId) -> Option<&mut ObjClosure> {
+        match id.tag() == ObjectType::Closure.tag() {
+            true => self.closures.get_mut(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn instance(&self, id: ObjectId) -> Option<&ObjInstance> {
+        match id.tag() == ObjectType::Instance.tag() {
+            true => self.instances.get(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn instance_mut(&mut self, id: ObjectId) -> Option<&mut ObjInstance> {
+        match id.tag() == ObjectType::Instance.tag() {
+            true => self.instances.get_mut(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn list(&self, id: ObjectId) -> Option<&ObjList> {
+        match id.tag() == ObjectType::List.tag() {
+            true => self.lists.get(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn list_mut(&mut self, id: ObjectId) -> Option<&mut ObjList> {
+        match id.tag() == ObjectType::List.tag() {
+            true => self.lists.get_mut(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn map(&self, id: ObjectId) -> Option<&ObjMap> {
+        match id.tag() == ObjectType::Map.tag() {
+            true => self.maps.get(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn map_mut(&mut self, id: ObjectId) -> Option<&mut ObjMap> {
+        match id.tag() == ObjectType::Map.tag() {
+            true => self.maps.get_mut(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn range(&self, id: ObjectId) -> Option<&ObjRange> {
+        match id.tag() == ObjectType::Range.tag() {
+            true => self.ranges.get(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn string(&self, id: ObjectId) -> Option<&ObjString> {
+        match id.tag() == ObjectType::String.tag() {
+            true => self.strings.get(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn string_mut(&mut self, id: ObjectId) -> Option<&mut ObjString> {
+        match id.tag() == ObjectType::String.tag() {
+            true => self.strings.get_mut(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn upvalue(&self, id: ObjectId) -> Option<&ObjUpvalue> {
+        match id.tag() == ObjectType::Upvalue.tag() {
+            true => self.upvalues.get(id.index()),
+            false => None,
+        }
+    }
+
+    pub fn upvalue_mut(&mut self, id: ObjectId) -> Option<&mut ObjUpvalue> {
+        match id.tag() == ObjectType::Upvalue.tag() {
+            true => self.upvalues.get_mut(id.index()),
+            false => None,
+        }
+    }
+
+    /// What kind of object a handle names, **from the handle alone**.
+    ///
+    /// No table is touched: the type is four bits of the handle. That is the
+    /// whole dispatch win of one table per type, and it is why this exists
+    /// beside [`type_of`](Heap::type_of) rather than being folded into it --
+    /// `class_of` runs on every method call and does not need to know whether
+    /// the object is still there, only what kind of thing it is.
+    ///
+    /// Says nothing about whether the object is live. A handle that has been
+    /// swept still names the type it used to be.
+    pub fn kind_of(&self, id: ObjectId) -> Option<ObjectType> {
+        ObjectType::from_tag(id.tag())
+    }
+
+    /// What kind of object a handle refers to, or `None` if it refers to
+    /// nothing any more.
+    ///
+    /// The checked form: it reads the type's table to see whether the slot is
+    /// still occupied. Diagnostics and printing want this; the dispatch path
+    /// wants [`kind_of`](Heap::kind_of).
+    pub fn type_of(&self, id: ObjectId) -> Option<ObjectType> {
+        let kind = ObjectType::from_tag(id.tag())?;
+        match self.is_live(id) {
+            true => Some(kind),
+            false => None,
+        }
+    }
+
+    /// Is there still an object under this handle?
+    fn is_live(&self, id: ObjectId) -> bool {
+        let index = id.index();
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => self.classes.occupied(index),
+            Some(ObjectType::Closure) => self.closures.occupied(index),
+            Some(ObjectType::Fn) => self.functions.occupied(index),
+            Some(ObjectType::Fiber) => self.fibers.occupied(index),
+            Some(ObjectType::Instance) => self.instances.occupied(index),
+            Some(ObjectType::List) => self.lists.occupied(index),
+            Some(ObjectType::Map) => self.maps.occupied(index),
+            Some(ObjectType::Range) => self.ranges.occupied(index),
+            Some(ObjectType::String) => self.strings.occupied(index),
+            Some(ObjectType::Upvalue) => self.upvalues.occupied(index),
+            None => false,
+        }
+    }
+
+    /// Push everything the object under `id` refers to onto the work list.
+    fn trace_at(&self, id: ObjectId, gray: &mut Vec<ObjectId>) {
+        let index = id.index();
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => trace_slot(self.classes.get(index), gray),
+            Some(ObjectType::Closure) => trace_slot(self.closures.get(index), gray),
+            Some(ObjectType::Fn) => trace_slot(self.functions.get(index), gray),
+            Some(ObjectType::Fiber) => trace_slot(self.fibers.get(index), gray),
+            Some(ObjectType::Instance) => trace_slot(self.instances.get(index), gray),
+            Some(ObjectType::List) => trace_slot(self.lists.get(index), gray),
+            Some(ObjectType::Map) => trace_slot(self.maps.get(index), gray),
+            Some(ObjectType::Range) => trace_slot(self.ranges.get(index), gray),
+            Some(ObjectType::String) => trace_slot(self.strings.get(index), gray),
+            Some(ObjectType::Upvalue) => trace_slot(self.upvalues.get(index), gray),
+            None => {}
+        }
+    }
+
+    /// Mark the object under `id`; `false` if it was already marked or gone.
+    fn mark_at(&mut self, id: ObjectId) -> bool {
+        let index = id.index();
+        macro_rules! mark {
+            ($table:expr) => {{
+                if !$table.occupied(index) || $table.is_marked(index) {
+                    false
+                } else {
+                    $table.set_mark(index);
+                    true
+                }
+            }};
+        }
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => mark!(self.classes),
+            Some(ObjectType::Closure) => mark!(self.closures),
+            Some(ObjectType::Fn) => mark!(self.functions),
+            Some(ObjectType::Fiber) => mark!(self.fibers),
+            Some(ObjectType::Instance) => mark!(self.instances),
+            Some(ObjectType::List) => mark!(self.lists),
+            Some(ObjectType::Map) => mark!(self.maps),
+            Some(ObjectType::Range) => mark!(self.ranges),
+            Some(ObjectType::String) => mark!(self.strings),
+            Some(ObjectType::Upvalue) => mark!(self.upvalues),
+            None => false,
+        }
+    }
+
+    /// How many slots are occupied, across every table.
+    #[cfg(feature = "profile")]
+    fn occupancy(&self) -> usize {
+        let mut total = 0;
+        total += self.classes.slots.len() - self.classes.free.len();
+        total += self.closures.slots.len() - self.closures.free.len();
+        total += self.functions.slots.len() - self.functions.free.len();
+        total += self.fibers.slots.len() - self.fibers.free.len();
+        total += self.instances.slots.len() - self.instances.free.len();
+        total += self.lists.slots.len() - self.lists.free.len();
+        total += self.maps.slots.len() - self.maps.free.len();
+        total += self.ranges.slots.len() - self.ranges.free.len();
+        total += self.strings.slots.len() - self.strings.free.len();
+        total += self.upvalues.slots.len() - self.upvalues.free.len();
+        total
+    }
+
+    /// Every live handle, table by table.
     ///
     /// **Not a traversal the running VM does.** This exists for the one-off
-    /// passes that have to see the whole heap -- flattening the class
-    /// hierarchy after the core library is installed, and diagnostics. The
-    /// collector does not use it: it walks from roots, which is the point of
-    /// having roots.
-    pub fn ids(&self) -> impl Iterator<Item = ObjectId> + '_ {
-        self.slots.iter().enumerate().filter_map(|(index, slot)| {
-            if slot.is_none() {
-                return None;
-            }
-            Some(ObjectId::new(index as u32))
-        })
+    /// passes that have to see the whole heap -- flattening the class hierarchy
+    /// after the core library is installed, and diagnostics. The collector does
+    /// not use it: it walks from roots, which is the point of having roots.
+    pub fn ids(&self) -> Vec<ObjectId> {
+        let mut out = Vec::new();
+        macro_rules! collect_ids {
+            ($table:expr, $kind:expr) => {
+                for (index, slot) in $table.slots.iter().enumerate() {
+                    if slot.is_some() {
+                        out.push(ObjectId::tagged($kind.tag(), index as u32));
+                    }
+                }
+            };
+        }
+        collect_ids!(self.classes, ObjectType::Class);
+        collect_ids!(self.closures, ObjectType::Closure);
+        collect_ids!(self.functions, ObjectType::Fn);
+        collect_ids!(self.instances, ObjectType::Instance);
+        collect_ids!(self.lists, ObjectType::List);
+        collect_ids!(self.maps, ObjectType::Map);
+        collect_ids!(self.ranges, ObjectType::Range);
+        collect_ids!(self.strings, ObjectType::String);
+        collect_ids!(self.upvalues, ObjectType::Upvalue);
+        collect_ids!(self.fibers, ObjectType::Fiber);
+        out
     }
 
     /// Choose how much the live set may grow before collecting again.
@@ -411,12 +680,6 @@ impl Heap {
         self.growth = (numerator, denominator);
     }
 
-    /// What the collector has been doing. See [`Profile`].
-    #[cfg(feature = "profile")]
-    pub fn profile(&self) -> &Profile {
-        &self.profile
-    }
-
     /// The growth factor in force, as `(numerator, denominator)`.
     pub fn growth(&self) -> (usize, usize) {
         self.growth
@@ -425,6 +688,12 @@ impl Heap {
     /// Where the next collection is due, in estimated live bytes.
     pub fn threshold(&self) -> usize {
         self.threshold
+    }
+
+    /// What the collector has been doing. See [`Profile`].
+    #[cfg(feature = "profile")]
+    pub fn profile(&self) -> &Profile {
+        &self.profile
     }
 
     /// Is the live set big enough that collecting is worth it?
@@ -461,9 +730,9 @@ impl Heap {
         let started = std::time::Instant::now();
         let before = self.live;
 
-        for word in &mut self.marks {
-            *word = 0;
-        }
+        each_table!(&mut *self, table, _kind, {
+            table.clear_marks();
+        });
 
         // Mark. A `Vec` as the work list rather than recursion: a deep object
         // graph would otherwise be a stack overflow, and on a part with 8 KB of
@@ -475,135 +744,61 @@ impl Heap {
             }
         }
 
+        let mut referents: Vec<ObjectId> = Vec::new();
         while let Some(id) = gray.pop() {
-            let index = id.raw() as usize;
-            if index >= self.slots.len() {
+            if !self.mark_at(id) {
                 continue;
             }
-            if self.is_marked(index) {
-                continue;
-            }
-            self.set_mark(index);
             #[cfg(feature = "profile")]
             {
                 self.profile.marked += 1;
             }
-            if let Some(object) = self.slots[index].as_ref() {
-                object.trace(&mut gray);
-            }
+            referents.clear();
+            self.trace_at(id, &mut referents);
+            gray.extend(referents.iter().copied());
         }
 
-        // **What a reference count would have managed on its own.**
-        //
-        // Everything unmarked is about to be freed. A refcounted heap would
-        // have freed some of it the instant the last reference went away, and
-        // leaked the rest -- a cycle keeps its own counts above zero for ever.
-        // Which is which is decided here by simulating the counts: build the
-        // in-degree *within the garbage* (nothing live can point at garbage,
-        // by definition of reachable), then repeatedly remove whatever has no
-        // incoming reference left. What cannot be removed is a cycle, or is
-        // reachable only from one.
-        //
-        // This is the measurement that says whether refcounting can stand
-        // alone or has to keep a tracing collector behind it.
         #[cfg(feature = "profile")]
-        {
-            let mut indegree: Vec<u32> = alloc::vec![0; self.slots.len()];
-            let mut garbage: Vec<usize> = Vec::new();
-            for index in 0..self.slots.len() {
-                if self.slots[index].is_some() && !self.is_marked(index) {
-                    garbage.push(index);
-                }
-            }
+        self.profile_garbage();
 
-            let mut referents: Vec<ObjectId> = Vec::new();
-            for index in &garbage {
-                referents.clear();
-                if let Some(object) = self.slots[*index].as_ref() {
-                    object.trace(&mut referents);
+        // Sweep, one table at a time. Each knows its own slot size, which is
+        // the whole point: a `List` slot is twelve bytes where a `Range` slot
+        // is twenty-four, and neither pays for the other.
+        let mut bytes = 0usize;
+        let mut live = 0usize;
+        let mut slots_seen = 0usize;
+        each_table!(&mut *self, table, _kind, {
+            let slot = table.slot_size();
+            slots_seen += table.slots.len();
+            for index in 0..table.slots.len() {
+                if table.slots[index].is_none() {
+                    continue;
                 }
-                for id in &referents {
-                    let target = id.raw() as usize;
-                    if target < self.slots.len()
-                        && self.slots[target].is_some()
-                        && !self.is_marked(target)
-                    {
-                        indegree[target] += 1;
+                if table.is_marked(index as u32) {
+                    live += 1;
+                    if let Some(value) = table.slots[index].as_mut() {
+                        shrink_settled(value);
+                        bytes += slot + value.contents_size();
                     }
+                } else {
+                    // Dropping the payload releases whatever its `Vec`s held.
+                    table.slots[index] = None;
+                    table.free.push(index as u32);
                 }
             }
-
-            let mut queue: Vec<usize> = garbage
-                .iter()
-                .copied()
-                .filter(|index| indegree[*index] == 0)
-                .collect();
-            let mut acyclic = 0u64;
-            while let Some(index) = queue.pop() {
-                acyclic += 1;
-                referents.clear();
-                if let Some(object) = self.slots[index].as_ref() {
-                    object.trace(&mut referents);
-                }
-                for id in &referents {
-                    let target = id.raw() as usize;
-                    if target < self.slots.len()
-                        && self.slots[target].is_some()
-                        && !self.is_marked(target)
-                    {
-                        indegree[target] = indegree[target].saturating_sub(1);
-                        if indegree[target] == 0 {
-                            queue.push(target);
-                        }
-                    }
-                }
-            }
-            self.profile.garbage_acyclic += acyclic;
-            self.profile.garbage_cyclic += garbage.len() as u64 - acyclic;
-        }
-
-        // Sweep.
-        let mut bytes = 0;
-        let mut live = 0;
-        for index in 0..self.slots.len() {
-            if self.slots[index].is_none() {
-                continue;
-            }
-            if self.is_marked(index) {
-                live += 1;
-                // **Give back what a growing table over-reserved.** A class's
-                // method table is built by repeated `resize`, and a `Vec` that
-                // grows geometrically ends up holding about half as much again
-                // as it uses. Measured across the classes `binary_trees` has
-                // live, that was 14,560 B held for nothing -- 14% of the live
-                // heap, on a part with 320 KB.
-                //
-                // Only classes, and only here. A class is settled by the time
-                // it survives a collection: Wren has no way to add a method
-                // after the body has run, so the table will not grow again. A
-                // list or a string is a different matter -- shrinking one that
-                // is still being appended to would buy a realloc on the next
-                // push and give the memory straight back.
-                if let Some(Object::Class(class)) = self.slots[index].as_mut() {
-                    class.methods.shrink_to_fit();
-                }
-                bytes += self.slots[index].as_ref().map_or(0, Object::size_estimate);
-            } else {
-                // Dropping the `Object` releases whatever its `Vec`s held.
-                self.slots[index] = None;
-                self.free.push(index as u32);
-            }
-        }
+        });
 
         #[cfg(feature = "profile")]
         {
             self.profile.collections += 1;
-            self.profile.slots_swept += self.slots.len() as u64;
+            self.profile.slots_swept += slots_seen as u64;
             self.profile.swept += before.saturating_sub(live) as u64;
             self.profile.live_before += before as u64;
             self.profile.survived += live as u64;
             self.profile.collect_nanos += started.elapsed().as_nanos() as u64;
         }
+        #[cfg(not(feature = "profile"))]
+        let _ = slots_seen;
 
         self.live = live;
         self.bytes = bytes;
@@ -618,12 +813,80 @@ impl Heap {
         }
     }
 
-    fn is_marked(&self, index: usize) -> bool {
-        self.marks[index / 64] & (1 << (index % 64)) != 0
+    /// **What a reference count would have managed on its own.**
+    ///
+    /// Everything unmarked is about to be freed. A refcounted heap would have
+    /// freed some of it the instant the last reference went away, and leaked
+    /// the rest -- a cycle keeps its own counts above zero for ever. Which is
+    /// which is decided here by simulating the counts: build the in-degree
+    /// *within the garbage* (nothing live can point at garbage, by definition
+    /// of reachable), then repeatedly remove whatever has no incoming
+    /// reference left. What cannot be removed is a cycle, or is reachable only
+    /// from one.
+    #[cfg(feature = "profile")]
+    fn profile_garbage(&mut self) {
+        use alloc::collections::BTreeMap;
+
+        let garbage: Vec<ObjectId> = self
+            .ids()
+            .into_iter()
+            .filter(|id| !self.is_marked_at(*id))
+            .collect();
+        let mut indegree: BTreeMap<u32, u32> = BTreeMap::new();
+        for id in &garbage {
+            indegree.entry(id.raw()).or_insert(0);
+        }
+
+        let mut referents: Vec<ObjectId> = Vec::new();
+        for id in &garbage {
+            referents.clear();
+            self.trace_at(*id, &mut referents);
+            for target in &referents {
+                if let Some(count) = indegree.get_mut(&target.raw()) {
+                    *count += 1;
+                }
+            }
+        }
+
+        let mut queue: Vec<u32> = indegree
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(raw, _)| *raw)
+            .collect();
+        let mut acyclic = 0u64;
+        while let Some(raw) = queue.pop() {
+            acyclic += 1;
+            referents.clear();
+            self.trace_at(ObjectId::new(raw), &mut referents);
+            for target in &referents {
+                if let Some(count) = indegree.get_mut(&target.raw()) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        queue.push(target.raw());
+                    }
+                }
+            }
+        }
+        self.profile.garbage_acyclic += acyclic;
+        self.profile.garbage_cyclic += garbage.len() as u64 - acyclic;
     }
 
-    fn set_mark(&mut self, index: usize) {
-        self.marks[index / 64] |= 1 << (index % 64);
+    #[cfg(feature = "profile")]
+    fn is_marked_at(&self, id: ObjectId) -> bool {
+        let index = id.index();
+        match ObjectType::from_tag(id.tag()) {
+            Some(ObjectType::Class) => self.classes.is_marked(index),
+            Some(ObjectType::Closure) => self.closures.is_marked(index),
+            Some(ObjectType::Fn) => self.functions.is_marked(index),
+            Some(ObjectType::Fiber) => self.fibers.is_marked(index),
+            Some(ObjectType::Instance) => self.instances.is_marked(index),
+            Some(ObjectType::List) => self.lists.is_marked(index),
+            Some(ObjectType::Map) => self.maps.is_marked(index),
+            Some(ObjectType::Range) => self.ranges.is_marked(index),
+            Some(ObjectType::String) => self.strings.is_marked(index),
+            Some(ObjectType::Upvalue) => self.upvalues.is_marked(index),
+            None => false,
+        }
     }
 
     /// How many objects are alive.
@@ -631,19 +894,35 @@ impl Heap {
         self.live
     }
 
-    /// Estimated bytes held by live objects. See
-    /// [`Object::size_estimate`](crate::object::Object::size_estimate) for what
-    /// "estimated" is doing there.
+    /// Roughly how many bytes those objects hold.
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// How many collections have run. The number a benchmark should report
-    /// beside a time, since a run that never collected is measuring something
-    /// else.
+    /// How many collections have run.
     pub fn collections(&self) -> usize {
         self.collections
     }
+}
+
+/// Trace whatever is in a slot, if anything is.
+fn trace_slot<T: crate::object::Trace>(slot: Option<&T>, gray: &mut Vec<ObjectId>) {
+    if let Some(value) = slot {
+        value.trace(gray);
+    }
+}
+
+/// Hand back what a settled class's method table over-reserved.
+///
+/// A class's table is built by repeated `resize`, and a `Vec` that grows by
+/// doubling ends up holding about half as much again as it uses. A class is
+/// settled by the time it survives a collection -- Wren cannot add a method
+/// after the body has run -- so this is the cheapest place to give it back.
+///
+/// It is a trait method rather than a `match` so that the sweep can stay
+/// generic over the table's payload; every other type does nothing.
+fn shrink_settled<T: crate::object::Trace>(value: &mut T) {
+    value.settle();
 }
 
 impl Default for Heap {

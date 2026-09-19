@@ -34,6 +34,31 @@ impl ObjectId {
     pub fn raw(self) -> u32 {
         self.0
     }
+
+    /// How many low bits of a handle name the type rather than the object.
+    ///
+    /// Ten types need four. **They are the low bits, not the high ones**, for
+    /// two reasons: a packed method table entry reserves the top bit to say
+    /// "primitive", and a `Value` in a 32-bit-number build has only 21 bits of
+    /// payload to hold a whole handle in. Low bits leave both of those alone
+    /// and simply shorten the index.
+    pub const TAG_BITS: u32 = 4;
+    const TAG_MASK: u32 = (1 << Self::TAG_BITS) - 1;
+
+    /// Build a handle naming both a type and a slot within that type's table.
+    pub fn tagged(tag: u8, index: u32) -> ObjectId {
+        ObjectId((index << Self::TAG_BITS) | (u32::from(tag) & Self::TAG_MASK))
+    }
+
+    /// Which type's table this handle indexes. See `ObjectType::from_tag`.
+    pub fn tag(self) -> u8 {
+        (self.0 & Self::TAG_MASK) as u8
+    }
+
+    /// Where in that table.
+    pub fn index(self) -> u32 {
+        self.0 >> Self::TAG_BITS
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<ObjectId>() == 4);

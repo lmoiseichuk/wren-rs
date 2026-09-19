@@ -630,7 +630,7 @@ impl Vm {
         // `List` is a `List` whatever is in it, so once the type is in the
         // handle this whole path is a shift and a table lookup -- and this is
         // the dispatch path, reached on every method call.
-        match self.heap.type_of(id)? {
+        match self.heap.kind_of(id)? {
             ObjectType::String => Some(self.string_class),
             ObjectType::List => Some(self.list_class),
             ObjectType::Map => Some(self.map_class),

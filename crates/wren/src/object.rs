@@ -37,6 +37,43 @@ pub enum ObjectType {
     Fiber,
 }
 
+impl ObjectType {
+    /// The tag a handle carries for this type.
+    ///
+    /// The enum's own discriminant, named rather than cast at each use so that
+    /// the handle encoding and the profiler's array both point at one place.
+    pub fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// The type a handle's tag names, or `None` if it names nothing.
+    ///
+    /// A handle built by hand -- a bytecode loader, a test -- can carry any
+    /// four bits, so this has to be able to say no rather than index past the
+    /// end of a table list.
+    pub fn from_tag(tag: u8) -> Option<ObjectType> {
+        let kind = match tag {
+            0 => ObjectType::Class,
+            1 => ObjectType::Closure,
+            2 => ObjectType::Fn,
+            3 => ObjectType::Instance,
+            4 => ObjectType::List,
+            5 => ObjectType::Map,
+            6 => ObjectType::Range,
+            7 => ObjectType::String,
+            8 => ObjectType::Upvalue,
+            9 => ObjectType::Fiber,
+            _ => return None,
+        };
+        Some(kind)
+    }
+}
+
+// The tag has to fit in what a handle reserves for it, and the mapping above
+// has to agree with the discriminants. Both are cheap to check and expensive
+// to find out about later.
+const _: () = assert!((ObjectType::Fiber as u32) < (1 << ObjectId::TAG_BITS));
+
 /// A heap object.
 ///
 /// **Only the six types the collector can meaningfully trace today are here.**
@@ -699,6 +736,47 @@ impl ObjFiber {
 pub trait Trace {
     /// Push every object this one refers to onto the collector's work list.
     fn trace(&self, gray: &mut Vec<ObjectId>);
+
+    /// Roughly what this object owns *beyond its slot*, for the collector's
+    /// growth heuristic.
+    ///
+    /// Upstream tracks bytes allocated exactly, because it does every
+    /// allocation itself. Here the `Vec`s inside an object allocate on their
+    /// own, so this is whatever those have reserved -- close enough to decide
+    /// when to collect, and not claimed to be more. The table adds the slot.
+    fn contents_size(&self) -> usize {
+        0
+    }
+
+    /// Give back memory this object over-reserved, now that it has settled.
+    ///
+    /// Called on everything that survives a collection, and a no-op for
+    /// everything except a class: a class's method table is built by repeated
+    /// `resize` and a doubling `Vec` ends up holding about half as much again
+    /// as it uses. A class is settled once it has survived, because Wren
+    /// cannot add a method after the body has run. A list or a string is a
+    /// different matter -- shrinking one that is still being appended to buys
+    /// a realloc on the next push and gives the memory straight back.
+    fn settle(&mut self) {}
+}
+
+/// A boxed payload traces as the payload does.
+///
+/// `Class`, `Fn` and `Fiber` are 48 to 56 bytes and stay behind a pointer, so
+/// their tables hold `Box<T>`; this is what lets the table's own code stay
+/// generic over the two cases.
+impl<T: Trace + ?Sized> Trace for alloc::boxed::Box<T> {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        (**self).trace(gray)
+    }
+
+    fn contents_size(&self) -> usize {
+        (**self).contents_size()
+    }
+
+    fn settle(&mut self) {
+        (**self).settle()
+    }
 }
 
 /// Push a value's handle, if it has one. Every `Trace` body needs this.
@@ -745,6 +823,15 @@ impl Trace for ObjClass {
             }
         }
     }
+
+    fn contents_size(&self) -> usize {
+        // Boxed, so the struct itself is a separate allocation.
+        core::mem::size_of::<ObjClass>() + self.methods.capacity() * core::mem::size_of::<u32>()
+    }
+
+    fn settle(&mut self) {
+        self.methods.shrink_to_fit();
+    }
 }
 
 impl Trace for ObjFn {
@@ -757,6 +844,12 @@ impl Trace for ObjFn {
             gray_value(*constant, gray);
         }
     }
+
+    fn contents_size(&self) -> usize {
+        // The chunk is shared through an `Rc`, so charging its full size to
+        // every closure over it would count the same bytes many times.
+        core::mem::size_of::<ObjFn>()
+    }
 }
 
 impl Trace for ObjClosure {
@@ -765,6 +858,10 @@ impl Trace for ObjClosure {
         for upvalue in &self.upvalues {
             gray.push(*upvalue);
         }
+    }
+
+    fn contents_size(&self) -> usize {
+        self.upvalues.capacity() * core::mem::size_of::<ObjectId>()
     }
 }
 
@@ -793,6 +890,10 @@ impl Trace for ObjFiber {
             gray.push(entry);
         }
     }
+
+    fn contents_size(&self) -> usize {
+        core::mem::size_of::<ObjFiber>() + self.stack.capacity() * core::mem::size_of::<Value>()
+    }
 }
 
 impl Trace for ObjInstance {
@@ -802,6 +903,10 @@ impl Trace for ObjInstance {
             gray_value(*field, gray);
         }
     }
+
+    fn contents_size(&self) -> usize {
+        self.fields.capacity() * core::mem::size_of::<Value>()
+    }
 }
 
 impl Trace for ObjList {
@@ -809,6 +914,10 @@ impl Trace for ObjList {
         for element in &self.elements {
             gray_value(*element, gray);
         }
+    }
+
+    fn contents_size(&self) -> usize {
+        self.elements.capacity() * core::mem::size_of::<Value>()
     }
 }
 
@@ -818,6 +927,10 @@ impl Trace for ObjMap {
             gray_value(entry.key, gray);
             gray_value(entry.value, gray);
         }
+    }
+
+    fn contents_size(&self) -> usize {
+        self.entries.capacity() * core::mem::size_of::<MapEntry>()
     }
 }
 
@@ -829,4 +942,8 @@ impl Trace for ObjRange {
 
 impl Trace for ObjString {
     fn trace(&self, _gray: &mut Vec<ObjectId>) {}
+
+    fn contents_size(&self) -> usize {
+        self.bytes.capacity()
+    }
 }

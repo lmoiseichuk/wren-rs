@@ -157,11 +157,10 @@ fn report_census(vm: &wren::Vm) {
 
     let mut counts: Vec<(ObjectType, usize, usize, usize, usize)> = Vec::new();
     for id in vm.heap.ids() {
-        let Some(object) = vm.heap.get(id) else {
+        let Some(kind) = vm.heap.type_of(id) else {
             continue;
         };
-        let kind = object.object_type();
-        let (used, contents, blocks) = contents_detail(object);
+        let (used, contents, blocks) = contents_detail(&vm.heap, id, kind);
         match counts.iter_mut().find(|(seen, ..)| *seen == kind) {
             Some((_, count, bytes, allocations, wanted)) => {
                 *count += 1;
@@ -220,55 +219,70 @@ fn report_census(vm: &wren::Vm) {
 /// Worth knowing per type rather than in total, because the fix differs: a
 /// class can be shrunk once and never grows again, where a list being built
 /// would only buy a realloc on its next push.
-fn contents_detail(object: &wren::Object) -> (usize, usize, usize) {
-    use wren::Object;
+fn contents_detail(
+    heap: &wren::Heap,
+    id: wren::ObjectId,
+    kind: wren::object::ObjectType,
+) -> (usize, usize, usize) {
+    use wren::object::ObjectType;
 
     const VALUE: usize = 8;
-    fn block(capacity: usize, element: usize) -> (usize, usize) {
-        match capacity {
-            0 => (0, 0),
-            capacity => (capacity * element, 1),
-        }
-    }
-
     fn pair(used: usize, capacity: usize, element: usize) -> (usize, usize, usize) {
-        let (bytes, blocks) = block(capacity, element);
-        (used * element, bytes, blocks)
+        match capacity {
+            0 => (0, 0, 0),
+            capacity => (used * element, capacity * element, 1),
+        }
     }
 
-    match object {
-        Object::Instance(instance) => {
-            pair(instance.fields.len(), instance.fields.capacity(), VALUE)
-        }
-        Object::List(list) => pair(list.elements.len(), list.elements.capacity(), VALUE),
-        Object::String(string) => pair(string.bytes.len(), string.bytes.capacity(), 1),
+    match kind {
+        ObjectType::Instance => match heap.instance(id) {
+            Some(it) => pair(it.fields.len(), it.fields.capacity(), VALUE),
+            None => (0, 0, 0),
+        },
+        ObjectType::List => match heap.list(id) {
+            Some(list) => pair(list.elements.len(), list.elements.capacity(), VALUE),
+            None => (0, 0, 0),
+        },
+        ObjectType::String => match heap.string(id) {
+            Some(string) => pair(string.bytes.len(), string.bytes.capacity(), 1),
+            None => (0, 0, 0),
+        },
+        ObjectType::Map => match heap.map(id) {
+            Some(map) => pair(map.entries.len(), map.entries.capacity(), 16),
+            None => (0, 0, 0),
+        },
         // A method table is one block; the class itself is a second, because
-        // it is boxed.
-        Object::Class(class) => {
-            let (used, bytes, blocks) = pair(class.methods.len(), class.methods.capacity(), 4);
-            (used + 40, bytes + 40, blocks + 1)
-        }
-        Object::Map(map) => pair(map.entries.len(), map.entries.capacity(), 16),
-        Object::Closure(closure) => {
-            let (used, bytes, blocks) =
-                pair(closure.upvalues.len(), closure.upvalues.capacity(), 4);
-            (used + 8, bytes + 8, blocks + 1)
-        }
-        Object::Fn(_) => (28, 28, 1),
-        Object::Fiber(fiber) => {
-            // A fiber's stack reaches a high-water mark and stays there; the
-            // frame vector does the same. Both are slack once the deep call
-            // that needed them has returned.
-            let (used, bytes, blocks) = pair(fiber.stack.len(), fiber.stack.capacity(), VALUE);
-            let frames_used = fiber.frames.len() * 24;
-            let frames_held = fiber.frames.capacity() * 24;
-            (
-                used + frames_used + 40,
-                bytes + frames_held + 40,
-                blocks + 2,
-            )
-        }
-        Object::Range(_) | Object::Upvalue(_) => (0, 0, 0),
+        // it is still boxed.
+        ObjectType::Class => match heap.class(id) {
+            Some(class) => {
+                let (used, bytes, blocks) = pair(class.methods.len(), class.methods.capacity(), 4);
+                (used + 56, bytes + 56, blocks + 1)
+            }
+            None => (0, 0, 0),
+        },
+        // A closure lives in its slot now, so its upvalue vector is its only
+        // separate block.
+        ObjectType::Closure => match heap.closure(id) {
+            Some(closure) => pair(closure.upvalues.len(), closure.upvalues.capacity(), 4),
+            None => (0, 0, 0),
+        },
+        ObjectType::Fn => (48, 48, 1),
+        ObjectType::Fiber => match heap.fiber(id) {
+            Some(fiber) => {
+                // A fiber's stack reaches a high-water mark and stays there;
+                // the frame vector does the same.
+                let (used, bytes, blocks) = pair(fiber.stack.len(), fiber.stack.capacity(), VALUE);
+                let frames_used = fiber.frames.len() * 24;
+                let frames_held = fiber.frames.capacity() * 24;
+                (
+                    used + frames_used + 56,
+                    bytes + frames_held + 56,
+                    blocks + 2,
+                )
+            }
+            None => (0, 0, 0),
+        },
+        ObjectType::Range | ObjectType::Upvalue => (0, 0, 0),
     }
 }
 
@@ -281,8 +295,6 @@ fn contents_detail(object: &wren::Object) -> (usize, usize, usize) {
 /// cluster, which is a fact about the program rather than something to reason
 /// about -- so it is counted here.
 fn report_method_tables(vm: &wren::Vm) {
-    use wren::Object;
-
     // What one entry costs today: `Option<Method>`, 8 bytes on a 32-bit part.
     const ENTRY: usize = 4;
 
@@ -297,7 +309,7 @@ fn report_method_tables(vm: &wren::Vm) {
     let pages = [8usize, 16, 32];
 
     for id in vm.heap.ids() {
-        let Some(Object::Class(class)) = vm.heap.get(id) else {
+        let Some(class) = vm.heap.class(id) else {
             continue;
         };
         classes += 1;
@@ -332,7 +344,7 @@ fn report_method_tables(vm: &wren::Vm) {
     let sparse = {
         let mut total = 0usize;
         for id in vm.heap.ids() {
-            let Some(Object::Class(class)) = vm.heap.get(id) else {
+            let Some(class) = vm.heap.class(id) else {
                 continue;
             };
             let count = class

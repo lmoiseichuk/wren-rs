@@ -19,8 +19,8 @@ fn an_allocated_object_can_be_read_back() {
     let mut heap = Heap::new();
     let handle = heap.allocate(Object::String(ObjString::from_text("hello")));
 
-    match heap.get(handle) {
-        Some(Object::String(text)) => assert_eq!(text.as_str(), Some("hello")),
+    match heap.string(handle) {
+        Some(text) => assert_eq!(text.as_str(), Some("hello")),
         other => panic!("expected a string, got {other:?}"),
     }
     assert_eq!(heap.live(), 1);
@@ -35,14 +35,14 @@ fn a_stale_handle_reads_as_none_rather_than_as_rubbish() {
 
     heap.collect([]);
 
-    assert!(heap.get(doomed).is_none());
+    assert!(heap.type_of(doomed).is_none());
     assert_eq!(heap.live(), 0);
 }
 
 #[test]
 fn a_handle_that_was_never_valid_reads_as_none() {
     let heap = Heap::new();
-    assert!(heap.get(wren::ObjectId::new(9999)).is_none());
+    assert!(heap.type_of(wren::ObjectId::new(9999)).is_none());
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn a_root_keeps_its_object() {
     assert_eq!(report.before, 2);
     assert_eq!(report.after, 1);
     assert_eq!(report.freed(), 1);
-    assert!(heap.get(kept.as_object().unwrap()).is_some());
+    assert!(heap.type_of(kept.as_object().unwrap()).is_some());
 }
 
 #[test]
@@ -73,8 +73,8 @@ fn marking_follows_references() {
     heap.collect([holder]);
 
     assert_eq!(heap.live(), 3);
-    assert!(heap.get(first.as_object().unwrap()).is_some());
-    assert!(heap.get(second.as_object().unwrap()).is_some());
+    assert!(heap.type_of(first.as_object().unwrap()).is_some());
+    assert!(heap.type_of(second.as_object().unwrap()).is_some());
 }
 
 #[test]
@@ -108,12 +108,12 @@ fn an_unreachable_cycle_is_collected() {
     let left = list(&mut heap, &[]);
     let right = list(&mut heap, &[]);
 
-    match heap.get_mut(left.as_object().unwrap()) {
-        Some(Object::List(object)) => object.elements.push(right),
+    match heap.list_mut(left.as_object().unwrap()) {
+        Some(object) => object.elements.push(right),
         other => panic!("expected a list, got {other:?}"),
     }
-    match heap.get_mut(right.as_object().unwrap()) {
-        Some(Object::List(object)) => object.elements.push(left),
+    match heap.list_mut(right.as_object().unwrap()) {
+        Some(object) => object.elements.push(left),
         other => panic!("expected a list, got {other:?}"),
     }
 
@@ -131,12 +131,12 @@ fn a_reachable_cycle_survives() {
     let left = list(&mut heap, &[]);
     let right = list(&mut heap, &[]);
 
-    match heap.get_mut(left.as_object().unwrap()) {
-        Some(Object::List(object)) => object.elements.push(right),
+    match heap.list_mut(left.as_object().unwrap()) {
+        Some(object) => object.elements.push(right),
         _ => unreachable!(),
     }
-    match heap.get_mut(right.as_object().unwrap()) {
-        Some(Object::List(object)) => object.elements.push(left),
+    match heap.list_mut(right.as_object().unwrap()) {
+        Some(object) => object.elements.push(left),
         _ => unreachable!(),
     }
 
@@ -162,8 +162,8 @@ fn an_instance_keeps_its_class_and_fields() {
 
     // instance, class, the class's name string, and the field's string.
     assert_eq!(heap.live(), 4);
-    assert!(heap.get(class).is_some());
-    assert!(heap.get(name.as_object().unwrap()).is_some());
+    assert!(heap.type_of(class).is_some());
+    assert!(heap.type_of(name.as_object().unwrap()).is_some());
 }
 
 fn alloc_fields(values: &[Value]) -> Vec<Value> {
@@ -197,8 +197,10 @@ fn freed_slots_are_reused() {
     assert_eq!(heap.live(), 0);
 
     let kept = string(&mut heap, "kept");
-    // One slot, reused a hundred times over.
-    assert_eq!(kept.as_object().unwrap().raw(), 0);
+    // One slot, reused a hundred times over. The handle's *index* is what
+    // says so -- its low bits name the type's table, so the raw value is not
+    // zero even for the first slot.
+    assert_eq!(kept.as_object().unwrap().index(), 0);
 }
 
 #[test]
