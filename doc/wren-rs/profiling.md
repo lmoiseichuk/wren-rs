@@ -377,6 +377,44 @@ thing worth understanding at this level of detail.
 
 ---
 
+## What one construct costs
+
+The 114-instructions-per-opcode average says nothing about what to change: it
+does not tell you whether a call costs forty or four hundred. `tools/measure-rs.sh
+speed --bin opcost` prices constructs directly. Each program is the same loop
+with one thing added to the body, run at N and 2N iterations with the
+difference taken -- which cancels compilation, start-up and everything else
+that happens once, leaving exactly the loop, N times.
+
+| body | per iteration | over the empty loop | what it adds |
+|---|---|---|---|
+| *(empty loop)* | 733 | — | the `while`, its compare and its increment |
+| `i` | 795 | **62** | `LoadLocal`, `Pop` |
+| `i + i` | 1,025 | **292** | `LoadLocal` ×2, `Call(+)`, `Pop` |
+| `b.get` | 1,245 | **512** | `LoadLocal`, `Call`, `LoadFieldThis`, `Return`, `Pop` |
+| `b.get + b.get` | 1,925 | **1,192** | that twice, plus a `Call(+)` |
+
+Solving those gives the three numbers worth carrying around:
+
+| | machine instructions |
+|---|---|
+| an opcode that only moves a value | **~31** |
+| a primitive call (`a + b`) | **~199** |
+| a closure call and its return | **~410** |
+
+**Thirty-one instructions to move one value** is the number that matters,
+because it is nearly all dispatch rather than work: fetching the byte, the jump
+table, reading an operand, indexing the stack, pushing, and going round. It
+sets the price of everything -- and it is what makes a peephole pass valuable,
+since fusing two opcodes into one saves that whole thirty-one every time it
+fires, whatever the two were.
+
+It was 39 before the collection check moved behind a cached boolean, and the
+empty loop was 814. Pricing the loop again after a change is the quickest way
+to see whether it touched dispatch or only one arm.
+
+---
+
 ## Which benchmark to optimise against, and in what order
 
 The four are not interchangeable, and two of them answer questions the others
