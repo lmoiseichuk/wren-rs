@@ -205,6 +205,7 @@ fn report_census(vm: &wren::Vm) {
         blocks * HEADER
     );
     println!("    per-type tables would save {saved} B of the {live} B of slots ({percent}%)");
+    report_method_tables(vm);
 }
 
 /// What an object's own allocations hold, and how many blocks they are.
@@ -244,4 +245,92 @@ fn contents_of(object: &wren::Object) -> (usize, usize) {
         }
         Object::Range(_) | Object::Upvalue(_) => (0, 0),
     }
+}
+
+/// Price the method tables three ways: as they are, paged, and sparse.
+///
+/// A class's table is a `Vec<Option<Method>>` indexed by *global* method
+/// symbol, so it is as long as the highest symbol the class answers to and
+/// almost all of it is `None`. Whether that is best fixed by paging the symbol
+/// space or by hashing it depends entirely on whether a class's symbols
+/// cluster, which is a fact about the program rather than something to reason
+/// about -- so it is counted here.
+fn report_method_tables(vm: &wren::Vm) {
+    use wren::Object;
+
+    // What one entry costs today: `Option<Method>`, 8 bytes on a 32-bit part.
+    const ENTRY: usize = 8;
+
+    let mut classes = 0usize;
+    let mut today = 0usize;
+    let mut defined = 0usize;
+    let mut longest = 0usize;
+    let mut reserved = 0usize;
+    // Paged: a directory of pointers, plus a full page for each page that
+    // holds at least one method.
+    let mut paged = [0usize; 3];
+    let pages = [8usize, 16, 32];
+
+    for id in vm.heap.ids() {
+        let Some(Object::Class(class)) = vm.heap.get(id) else {
+            continue;
+        };
+        classes += 1;
+        let length = class.methods.len();
+        longest = longest.max(length);
+        today += length * ENTRY;
+        reserved += class.methods.capacity() * ENTRY;
+        defined += class.methods.iter().filter(|slot| slot.is_some()).count();
+
+        for (which, size) in pages.iter().enumerate() {
+            let directory = length.div_ceil(*size);
+            let mut occupied = 0usize;
+            for page in 0..directory {
+                let from = page * size;
+                let to = (from + size).min(length);
+                if class.methods[from..to].iter().any(|slot| slot.is_some()) {
+                    occupied += 1;
+                }
+            }
+            paged[which] += directory * 4 + occupied * size * ENTRY;
+        }
+    }
+
+    // Sparse: an open-addressed table at 50% load, holding symbol and method.
+    let sparse = {
+        let mut total = 0usize;
+        for id in vm.heap.ids() {
+            let Some(Object::Class(class)) = vm.heap.get(id) else {
+                continue;
+            };
+            let count = class.methods.iter().filter(|slot| slot.is_some()).count();
+            let mut capacity = 8usize;
+            while capacity < count * 2 {
+                capacity *= 2;
+            }
+            // 4 bytes of symbol beside each 8-byte entry.
+            total += capacity * (ENTRY + 4);
+        }
+        total
+    };
+
+    println!(
+        "    method tables: {classes} classes, {defined} methods defined, longest table {longest}"
+    );
+    println!("      reserved     {reserved:>8} B  (what the Vecs actually hold)");
+    println!(
+        "      used         {today:>8} B  -- {} B of that is Vec slack",
+        reserved.saturating_sub(today)
+    );
+    for (which, size) in pages.iter().enumerate() {
+        let saved = today.saturating_sub(paged[which]);
+        let percent = (saved * 100).checked_div(today).unwrap_or(0);
+        println!(
+            "      paged/{size:<3}    {:>8} B  saves {saved} B ({percent}%)",
+            paged[which]
+        );
+    }
+    let saved = today.saturating_sub(sparse);
+    let percent = (saved * 100).checked_div(today).unwrap_or(0);
+    println!("      sparse       {sparse:>8} B  saves {saved} B ({percent}%)");
 }

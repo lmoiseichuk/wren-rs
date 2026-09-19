@@ -718,13 +718,25 @@ impl Vm {
         }
         classes.sort_by_key(|(depth, _)| *depth);
 
-        for (_, id) in classes {
-            let parent = match self.heap.get(id) {
+        for (_, id) in &classes {
+            let parent = match self.heap.get(*id) {
                 Some(Object::Class(class)) => class.superclass,
                 _ => None,
             };
             if let Some(parent) = parent {
-                self.inherit_methods(id, parent);
+                self.inherit_methods(*id, parent);
+            }
+        }
+
+        // **Hand back the slack now, not at the first collection.** These
+        // tables were built by repeated `resize` and each one is holding
+        // roughly half as much again as it uses. The collector shrinks class
+        // tables too, but a VM that never collects would carry the waste for
+        // its whole life -- and `Vm::new`'s resident figure is a published
+        // number, so it should be the honest one.
+        for (_, id) in &classes {
+            if let Some(Object::Class(class)) = self.heap.get_mut(*id) {
+                class.methods.shrink_to_fit();
             }
         }
     }
