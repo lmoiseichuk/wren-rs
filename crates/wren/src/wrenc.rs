@@ -507,10 +507,10 @@ pub fn load(vm: &mut Vm, bytes: &[u8]) -> Result<Loaded, LoadError> {
     }
 
     let function = read_function(vm, &mut reader, &symbols, &variables)?;
-    let closure = vm.heap.allocate(Object::Closure(Box::new(ObjClosure {
+    let closure = vm.heap.allocate(Object::Closure(ObjClosure {
         function,
         upvalues: Vec::new(),
-    })));
+    }));
 
     Ok(Loaded {
         closure,

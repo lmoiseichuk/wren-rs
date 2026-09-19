@@ -3043,12 +3043,10 @@ pub fn install_meta(vm: &mut Vm) -> usize {
             owner_class: None,
             module,
         })));
-        let closure = vm
-            .heap
-            .allocate(Object::Closure(Box::new(crate::object::ObjClosure {
-                function,
-                upvalues: Vec::new(),
-            })));
+        let closure = vm.heap.allocate(Object::Closure(crate::object::ObjClosure {
+            function,
+            upvalues: Vec::new(),
+        }));
 
         let base = vm.stack.len();
         vm.stack.push(Value::object(closure));

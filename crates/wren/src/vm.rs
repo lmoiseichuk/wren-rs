@@ -597,10 +597,10 @@ impl Vm {
                 owner_class: None,
                 module: index,
             })));
-            let closure = self.heap.allocate(Object::Closure(Box::new(ObjClosure {
+            let closure = self.heap.allocate(Object::Closure(ObjClosure {
                 function,
                 upvalues: Vec::new(),
-            })));
+            }));
             Ok((index, Some(closure)))
         }
     }
@@ -1373,10 +1373,10 @@ impl Vm {
             owner_class: None,
             module,
         })));
-        let closure = self.heap.allocate(Object::Closure(Box::new(ObjClosure {
+        let closure = self.heap.allocate(Object::Closure(ObjClosure {
             function,
             upvalues: Vec::new(),
-        })));
+        }));
 
         // The module runs in a root fiber, so that `Fiber.yield` at the top
         // level has something to complain about and `Fiber.current` has an
@@ -1500,7 +1500,7 @@ impl Vm {
 
                     let id = self
                         .heap
-                        .allocate(Object::Closure(Box::new(ObjClosure { function, upvalues })));
+                        .allocate(Object::Closure(ObjClosure { function, upvalues }));
                     self.stack.push(Value::object(id));
                 }
                 Op::Class => {

@@ -73,7 +73,14 @@ pub enum Object {
     /// A compiled function body. Boxed for the same reason a class is.
     Fn(Box<ObjFn>),
     /// A function plus the variables it captured.
-    Closure(Box<ObjClosure>),
+    ///
+    /// **Not boxed, unlike the other three composite types.** `ObjClosure` is
+    /// a handle and a vector -- 16 bytes -- which fits inside the 24 that
+    /// `ObjRange` already forces every slot to be, so storing it inline is
+    /// free. Boxing it cost an allocation, its header, and an indirection on
+    /// every call; closures are a fifth of everything this VM allocates, so
+    /// that was about 24 bytes each for nothing.
+    Closure(ObjClosure),
     /// One captured variable. See [`ObjUpvalue`].
     Upvalue(ObjUpvalue),
     /// A coroutine with its own stack and call frames. See [`ObjFiber`].
@@ -110,119 +117,16 @@ impl Object {
     /// or an `ObjectId` means adding it here.
     pub fn trace(&self, gray: &mut Vec<ObjectId>) {
         match self {
-            Object::Class(class) => {
-                gray.push(class.name);
-                if let Some(superclass) = class.superclass {
-                    gray.push(superclass);
-                }
-                // A class's metaclass holds its static methods, and nothing
-                // else refers to it. Forgetting this frees the metaclass out
-                // from under a class that is still in use.
-                if let Some(metaclass) = class.metaclass {
-                    gray.push(metaclass);
-                }
-                // **And the methods themselves.** A method written in Wren is
-                // a closure the method table is the only reference to -- once
-                // the class definition has finished executing, the closure is
-                // gone from the stack. Omitting this compiled and ran and
-                // passed every small test, because nothing collected before
-                // the program was over; it appeared the moment a second class
-                // pushed the heap past its first collection, and presented as
-                // the *first* class's constructor silently doing nothing.
-                //
-                // This is the failure mode the note on `trace` describes, and
-                // it is worth having actually happened: the omission is
-                // invisible until a collection runs at exactly the wrong
-                // moment, which is the hardest kind of bug to go looking for.
-                if let Some(id) = class.attributes.as_object() {
-                    gray.push(id);
-                }
-                for value in &class.static_fields {
-                    if let Some(id) = value.as_object() {
-                        gray.push(id);
-                    }
-                }
-                // A primitive is a Rust function pointer with no heap object
-                // behind it, so only the closures are worth following.
-                for entry in &class.methods {
-                    if let Some(closure) = entry_closure(*entry) {
-                        gray.push(closure);
-                    }
-                }
-            }
-            Object::Fn(function) => {
-                // **A function's constants are references like any other.** A
-                // string literal in a function body is a heap object reachable
-                // only from here; missing it frees the literal out from under
-                // code that is about to load it.
-                for constant in &function.chunk.constants {
-                    if let Some(id) = constant.as_object() {
-                        gray.push(id);
-                    }
-                }
-            }
-            Object::Closure(closure) => {
-                gray.push(closure.function);
-                for upvalue in &closure.upvalues {
-                    gray.push(*upvalue);
-                }
-            }
-            Object::Upvalue(upvalue) => {
-                if let Some(id) = upvalue.closed.as_object() {
-                    gray.push(id);
-                }
-            }
-            Object::Fiber(fiber) => {
-                // A suspended fiber's stack is live even though nothing is
-                // running on it; its frames hold the only reference to the
-                // closures half way through executing.
-                for value in &fiber.stack {
-                    if let Some(id) = value.as_object() {
-                        gray.push(id);
-                    }
-                }
-                for frame in &fiber.frames {
-                    gray.push(frame.closure);
-                }
-                if let Some(caller) = fiber.caller {
-                    gray.push(caller);
-                }
-                if let Some(id) = fiber.error.as_object() {
-                    gray.push(id);
-                }
-                if let Some(entry) = fiber.entry {
-                    gray.push(entry);
-                }
-            }
-            Object::Instance(instance) => {
-                gray.push(instance.class);
-                for field in &instance.fields {
-                    if let Some(id) = field.as_object() {
-                        gray.push(id);
-                    }
-                }
-            }
-            Object::List(list) => {
-                for element in &list.elements {
-                    if let Some(id) = element.as_object() {
-                        gray.push(id);
-                    }
-                }
-            }
-            Object::Map(map) => {
-                for entry in &map.entries {
-                    if let Some(id) = entry.key.as_object() {
-                        gray.push(id);
-                    }
-                    if let Some(id) = entry.value.as_object() {
-                        gray.push(id);
-                    }
-                }
-            }
-            // Neither holds a reference: a range is two numbers, and a string
-            // owns its bytes outright.
-            Object::Range(_) => {}
-            Object::String(_) => {}
+            Object::Class(class) => class.trace(gray),
+            Object::Fn(function) => function.trace(gray),
+            Object::Closure(closure) => closure.trace(gray),
+            Object::Upvalue(upvalue) => upvalue.trace(gray),
+            Object::Fiber(fiber) => fiber.trace(gray),
+            Object::Instance(instance) => instance.trace(gray),
+            Object::List(list) => list.trace(gray),
+            Object::Map(map) => map.trace(gray),
+            Object::Range(range) => range.trace(gray),
+            Object::String(string) => string.trace(gray),
         }
     }
 
@@ -783,4 +687,146 @@ impl ObjFiber {
             catching: false,
         }
     }
+}
+
+/// What the collector needs from a type it stores.
+///
+/// **Per type rather than one match on an enum**, because the heap keeps one
+/// table per type and a table has no enum to match on. It is also where the
+/// rule lives that the note on [`Object::trace`] describes: a type that
+/// forgets to report a reference here is a use-after-free in any other
+/// language and a silently missing object in this one.
+pub trait Trace {
+    /// Push every object this one refers to onto the collector's work list.
+    fn trace(&self, gray: &mut Vec<ObjectId>);
+}
+
+/// Push a value's handle, if it has one. Every `Trace` body needs this.
+fn gray_value(value: Value, gray: &mut Vec<ObjectId>) {
+    if let Some(id) = value.as_object() {
+        gray.push(id);
+    }
+}
+
+impl Trace for ObjClass {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        gray.push(self.name);
+        if let Some(superclass) = self.superclass {
+            gray.push(superclass);
+        }
+        // A class's metaclass holds its static methods, and nothing else
+        // refers to it. Forgetting this frees the metaclass out from under a
+        // class that is still in use.
+        if let Some(metaclass) = self.metaclass {
+            gray.push(metaclass);
+        }
+        gray_value(self.attributes, gray);
+        for value in &self.static_fields {
+            gray_value(*value, gray);
+        }
+        // **And the methods themselves.** A method written in Wren is a
+        // closure the method table is the only reference to -- once the class
+        // definition has finished executing, the closure is gone from the
+        // stack. Omitting this compiled and ran and passed every small test,
+        // because nothing collected before the program was over; it appeared
+        // the moment a second class pushed the heap past its first collection,
+        // and presented as the *first* class's constructor silently doing
+        // nothing.
+        //
+        // That is the failure mode this trait's note describes, and it is
+        // worth having actually happened: the omission is invisible until a
+        // collection runs at exactly the wrong moment.
+        //
+        // A primitive is a Rust function pointer with no heap object behind
+        // it, so only the closures are worth following.
+        for entry in &self.methods {
+            if let Some(closure) = entry_closure(*entry) {
+                gray.push(closure);
+            }
+        }
+    }
+}
+
+impl Trace for ObjFn {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        // **A function's constants are references like any other.** A string
+        // literal in a function body is a heap object reachable only from
+        // here; missing it frees the literal out from under code that is about
+        // to load it.
+        for constant in &self.chunk.constants {
+            gray_value(*constant, gray);
+        }
+    }
+}
+
+impl Trace for ObjClosure {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        gray.push(self.function);
+        for upvalue in &self.upvalues {
+            gray.push(*upvalue);
+        }
+    }
+}
+
+impl Trace for ObjUpvalue {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        gray_value(self.closed, gray);
+    }
+}
+
+impl Trace for ObjFiber {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        // A suspended fiber's stack is live even though nothing is running on
+        // it; its frames hold the only reference to the closures half way
+        // through executing.
+        for value in &self.stack {
+            gray_value(*value, gray);
+        }
+        for frame in &self.frames {
+            gray.push(frame.closure);
+        }
+        if let Some(caller) = self.caller {
+            gray.push(caller);
+        }
+        gray_value(self.error, gray);
+        if let Some(entry) = self.entry {
+            gray.push(entry);
+        }
+    }
+}
+
+impl Trace for ObjInstance {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        gray.push(self.class);
+        for field in &self.fields {
+            gray_value(*field, gray);
+        }
+    }
+}
+
+impl Trace for ObjList {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        for element in &self.elements {
+            gray_value(*element, gray);
+        }
+    }
+}
+
+impl Trace for ObjMap {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        for entry in &self.entries {
+            gray_value(entry.key, gray);
+            gray_value(entry.value, gray);
+        }
+    }
+}
+
+// Neither holds a reference: a range is two numbers, and a string owns its
+// bytes outright.
+impl Trace for ObjRange {
+    fn trace(&self, _gray: &mut Vec<ObjectId>) {}
+}
+
+impl Trace for ObjString {
+    fn trace(&self, _gray: &mut Vec<ObjectId>) {}
 }
