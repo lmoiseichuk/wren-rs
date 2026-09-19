@@ -20,7 +20,7 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::bytecode::{Chunk, Op};
+use crate::bytecode::{code, Chunk};
 #[cfg(feature = "compiler")]
 use crate::compiler;
 use crate::core;
@@ -1713,20 +1713,16 @@ impl Vm {
                 self.previous_chunk = here;
             }
 
-            let Some(op) = Op::from_byte(byte) else {
-                return Err(Self::bad_opcode(byte, chunk.line_at(at)));
-            };
-
-            match op {
-                Op::Constant => {
+            match byte {
+                code::CONSTANT => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
                     self.stack.push(chunk.constants[index]);
                 }
-                Op::Null => self.stack.push(Value::NULL),
-                Op::False => self.stack.push(Value::FALSE),
-                Op::True => self.stack.push(Value::TRUE),
-                Op::LoadLocal => {
+                code::NULL => self.stack.push(Value::NULL),
+                code::FALSE => self.stack.push(Value::FALSE),
+                code::TRUE => self.stack.push(Value::TRUE),
+                code::LOAD_LOCAL => {
                     let slot = chunk.code[ip] as usize;
                     ip += 1;
                     self.stack.push(self.stack[base + slot]);
@@ -1735,21 +1731,21 @@ impl Vm {
                 // two instructions it replaces, so the operands sit where they
                 // always did and there is a dead byte where the second
                 // opcode was. See the note on them in `bytecode.rs`.
-                Op::LoadLocalConstant => {
+                code::LOAD_LOCAL_CONSTANT => {
                     let slot = chunk.code[ip] as usize;
                     let index = chunk.read_short(ip + 2) as usize;
                     ip += 4;
                     self.stack.push(self.stack[base + slot]);
                     self.stack.push(chunk.constants[index]);
                 }
-                Op::LoadLocalPair => {
+                code::LOAD_LOCAL_PAIR => {
                     let first = chunk.code[ip] as usize;
                     let second = chunk.code[ip + 2] as usize;
                     ip += 3;
                     self.stack.push(self.stack[base + first]);
                     self.stack.push(self.stack[base + second]);
                 }
-                Op::StoreFieldThisPop => {
+                code::STORE_FIELD_THIS_POP => {
                     let index = chunk.code[ip] as usize;
                     ip += 2;
                     // Popping first rather than storing and then popping: the
@@ -1759,41 +1755,41 @@ impl Vm {
                     let receiver = self.stack[base];
                     self.set_field(receiver, base, index, value)?;
                 }
-                Op::StoreLocal => {
+                code::STORE_LOCAL => {
                     let slot = chunk.code[ip] as usize;
                     ip += 1;
                     self.stack[base + slot] = *self.stack.last().unwrap();
                 }
-                Op::LoadModuleVar => {
+                code::LOAD_MODULE_VAR => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
                     self.stack.push(self.modules[module].values[index]);
                 }
-                Op::StoreModuleVar => {
+                code::STORE_MODULE_VAR => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
                     self.modules[module].values[index] = *self.stack.last().unwrap();
                 }
-                Op::Pop => {
+                code::POP => {
                     self.stack.pop();
                 }
-                Op::LoadUpvalue => {
+                code::LOAD_UPVALUE => {
                     let slot = chunk.code[ip] as usize;
                     ip += 1;
                     let value = self.read_upvalue(base, slot)?;
                     self.stack.push(value);
                 }
-                Op::StoreUpvalue => {
+                code::STORE_UPVALUE => {
                     let slot = chunk.code[ip] as usize;
                     ip += 1;
                     let value = *self.stack.last().unwrap();
                     self.write_upvalue(slot, value)?;
                 }
-                Op::CloseUpvalue => {
+                code::CLOSE_UPVALUE => {
                     self.close_upvalues(self.stack.len() - 1);
                     self.stack.pop();
                 }
-                Op::Closure => {
+                code::CLOSURE => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
                     let function = chunk.constants[index]
@@ -1820,7 +1816,7 @@ impl Vm {
                         .allocate(Object::Closure(ObjClosure { function, upvalues }));
                     self.stack.push(Value::object(id));
                 }
-                Op::Class => {
+                code::CLASS => {
                     let declared = chunk.code[ip] as usize;
                     ip += 1;
                     let superclass = self.stack.pop().unwrap_or(Value::NULL);
@@ -1828,34 +1824,34 @@ impl Vm {
                     let class = self.make_class(name, superclass, declared)?;
                     self.stack.push(class);
                 }
-                Op::MethodInstance | Op::MethodStatic => {
+                code::METHOD_INSTANCE | code::METHOD_STATIC => {
                     let symbol = chunk.read_short(ip) as usize;
                     ip += 2;
                     let class = self.stack.pop().unwrap_or(Value::NULL);
                     let body = self.stack.pop().unwrap_or(Value::NULL);
-                    self.bind_method(class, body, symbol, op == Op::MethodStatic)?;
+                    self.bind_method(class, body, symbol, byte == code::METHOD_STATIC)?;
                 }
-                Op::LoadFieldThis => {
+                code::LOAD_FIELD_THIS => {
                     let index = chunk.code[ip] as usize;
                     ip += 1;
                     let value = self.field_of(self.stack[base], base, index)?;
                     self.stack.push(value);
                 }
-                Op::StoreFieldThis => {
+                code::STORE_FIELD_THIS => {
                     let index = chunk.code[ip] as usize;
                     ip += 1;
                     let value = *self.stack.last().unwrap();
                     let receiver = self.stack[base];
                     self.set_field(receiver, base, index, value)?;
                 }
-                Op::LoadField => {
+                code::LOAD_FIELD => {
                     let index = chunk.code[ip] as usize;
                     ip += 1;
                     let receiver = self.stack.pop().unwrap_or(Value::NULL);
                     let value = self.field_of(receiver, base, index)?;
                     self.stack.push(value);
                 }
-                Op::StoreField => {
+                code::STORE_FIELD => {
                     let index = chunk.code[ip] as usize;
                     ip += 1;
                     // **The value is on top, the receiver below it.** The
@@ -1868,18 +1864,18 @@ impl Vm {
                     self.set_field(receiver, base, index, value)?;
                     self.stack.push(value);
                 }
-                Op::Construct => {
+                code::CONSTRUCT => {
                     let class = self.stack[base];
                     let instance = self.instantiate(class)?;
                     self.stack[base] = instance;
                 }
-                Op::Call | Op::Super => {
+                code::CALL | code::SUPER => {
                     let arity = chunk.code[ip] as usize;
                     ip += 1;
                     let symbol = chunk.read_short(ip) as usize;
                     ip += 2;
 
-                    let start_from = if op == Op::Super {
+                    let start_from = if byte == code::SUPER {
                         self.frames
                             .last()
                             .and_then(|frame| self.function_of(frame.closure))
@@ -2032,20 +2028,20 @@ impl Vm {
                         }
                     }
                 }
-                Op::LoadStaticField => {
+                code::LOAD_STATIC_FIELD => {
                     let index = chunk.code[ip] as usize;
                     ip += 1;
                     let value = self.static_field(index);
                     self.stack.push(value);
                 }
-                Op::StoreStaticField => {
+                code::STORE_STATIC_FIELD => {
                     let index = chunk.code[ip] as usize;
                     ip += 1;
                     let value = *self.stack.last().unwrap();
                     self.set_static_field(index, value)?;
                 }
-                Op::SetAttributes => self.set_attributes(),
-                Op::ImportModule => {
+                code::SET_ATTRIBUTES => self.set_attributes(),
+                code::IMPORT_MODULE => {
                     let index = chunk.read_short(ip) as usize;
                     ip += 2;
                     let name = self.to_string(chunk.constants[index]);
@@ -2097,7 +2093,7 @@ impl Vm {
                         },
                     }
                 }
-                Op::ImportVariable => {
+                code::IMPORT_VARIABLE => {
                     let module_name = chunk.read_short(ip) as usize;
                     let variable_name = chunk.read_short(ip + 2) as usize;
                     ip += 4;
@@ -2112,19 +2108,19 @@ impl Vm {
                     let value = self.imported_variable(&module_name, &variable, chunk.line_at(at))?;
                     self.stack.push(value);
                 }
-                Op::Return | Op::End | Op::LoadLocalReturn | Op::LoadFieldThisReturn => {
+                code::RETURN | code::END | code::LOAD_LOCAL_RETURN | code::LOAD_FIELD_THIS_RETURN => {
                     // **The fused returns skip the stack entirely.** Pushing a
                     // value so that the next instruction can pop it is what
                     // the pair did; having one instruction, the value goes
                     // straight into the result.
-                    let result = match op {
-                        Op::End => Value::NULL,
-                        Op::LoadLocalReturn => {
+                    let result = match byte {
+                        code::END => Value::NULL,
+                        code::LOAD_LOCAL_RETURN => {
                             let slot = chunk.code[ip] as usize;
                             ip += 2;
                             self.stack[base + slot]
                         }
-                        Op::LoadFieldThisReturn => {
+                        code::LOAD_FIELD_THIS_RETURN => {
                             let index = chunk.code[ip] as usize;
                             ip += 2;
                             self.field_of(self.stack[base], base, index)?
@@ -2200,16 +2196,16 @@ impl Vm {
                     base = frame.base;
                     module = frame.module;
                 }
-                Op::Jump => {
+                code::JUMP => {
                     let offset = chunk.read_short(ip) as usize;
                     ip += 2 + offset;
                 }
-                Op::Loop => {
+                code::LOOP => {
                     let offset = chunk.read_short(ip) as usize;
                     ip += 2;
                     ip -= offset;
                 }
-                Op::JumpIf => {
+                code::JUMP_IF => {
                     let offset = chunk.read_short(ip) as usize;
                     ip += 2;
                     let condition = self.stack.pop().unwrap_or(Value::NULL);
@@ -2217,7 +2213,7 @@ impl Vm {
                         ip += offset;
                     }
                 }
-                Op::And => {
+                code::AND => {
                     let offset = chunk.read_short(ip) as usize;
                     ip += 2;
                     if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
@@ -2226,7 +2222,7 @@ impl Vm {
                         self.stack.pop();
                     }
                 }
-                Op::Or => {
+                code::OR => {
                     let offset = chunk.read_short(ip) as usize;
                     ip += 2;
                     if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
@@ -2235,6 +2231,14 @@ impl Vm {
                         ip += offset;
                     }
                 }
+
+                // **The byte that is not an opcode.** Matching the raw
+                // byte costs the exhaustiveness a `match Op` gave for
+                // free: an opcode with no arm above arrives here rather
+                // than failing to compile. `bytecode::code` carries the
+                // note about adding one, and the exhaustive `byte_of` in
+                // its test module is what makes the omission visible.
+                _ => return Err(Self::bad_opcode(byte, chunk.line_at(at))),
             }
 
 

@@ -184,6 +184,122 @@ pub enum Op {
     LoadFieldThisReturn = 39,
 }
 
+/// The opcodes as plain bytes, for matching the instruction stream directly.
+///
+/// **One jump table rather than two.** The interpreter decoded a byte into an
+/// `Op` and then matched on the `Op`: a switch whose result feeds a switch.
+/// Matching the byte itself is one table, and the `Option` that carried "not
+/// an opcode" between them becomes the `_` arm that was needed anyway.
+pub mod code {
+    use super::Op;
+
+    pub const CONSTANT: u8 = Op::Constant as u8;
+    pub const NULL: u8 = Op::Null as u8;
+    pub const FALSE: u8 = Op::False as u8;
+    pub const TRUE: u8 = Op::True as u8;
+    pub const LOAD_LOCAL: u8 = Op::LoadLocal as u8;
+    pub const STORE_LOCAL: u8 = Op::StoreLocal as u8;
+    pub const LOAD_MODULE_VAR: u8 = Op::LoadModuleVar as u8;
+    pub const STORE_MODULE_VAR: u8 = Op::StoreModuleVar as u8;
+    pub const POP: u8 = Op::Pop as u8;
+    pub const CALL: u8 = Op::Call as u8;
+    pub const JUMP: u8 = Op::Jump as u8;
+    pub const LOOP: u8 = Op::Loop as u8;
+    pub const JUMP_IF: u8 = Op::JumpIf as u8;
+    pub const AND: u8 = Op::And as u8;
+    pub const OR: u8 = Op::Or as u8;
+    pub const RETURN: u8 = Op::Return as u8;
+    pub const END: u8 = Op::End as u8;
+    pub const CLOSURE: u8 = Op::Closure as u8;
+    pub const LOAD_UPVALUE: u8 = Op::LoadUpvalue as u8;
+    pub const STORE_UPVALUE: u8 = Op::StoreUpvalue as u8;
+    pub const CLOSE_UPVALUE: u8 = Op::CloseUpvalue as u8;
+    pub const CLASS: u8 = Op::Class as u8;
+    pub const METHOD_INSTANCE: u8 = Op::MethodInstance as u8;
+    pub const METHOD_STATIC: u8 = Op::MethodStatic as u8;
+    pub const LOAD_FIELD_THIS: u8 = Op::LoadFieldThis as u8;
+    pub const STORE_FIELD_THIS: u8 = Op::StoreFieldThis as u8;
+    pub const LOAD_FIELD: u8 = Op::LoadField as u8;
+    pub const STORE_FIELD: u8 = Op::StoreField as u8;
+    pub const CONSTRUCT: u8 = Op::Construct as u8;
+    pub const SET_ATTRIBUTES: u8 = Op::SetAttributes as u8;
+    pub const LOAD_STATIC_FIELD: u8 = Op::LoadStaticField as u8;
+    pub const STORE_STATIC_FIELD: u8 = Op::StoreStaticField as u8;
+    pub const IMPORT_MODULE: u8 = Op::ImportModule as u8;
+    pub const IMPORT_VARIABLE: u8 = Op::ImportVariable as u8;
+    pub const SUPER: u8 = Op::Super as u8;
+    pub const LOAD_LOCAL_CONSTANT: u8 = Op::LoadLocalConstant as u8;
+    pub const LOAD_LOCAL_PAIR: u8 = Op::LoadLocalPair as u8;
+    pub const LOAD_LOCAL_RETURN: u8 = Op::LoadLocalReturn as u8;
+    pub const STORE_FIELD_THIS_POP: u8 = Op::StoreFieldThisPop as u8;
+    pub const LOAD_FIELD_THIS_RETURN: u8 = Op::LoadFieldThisReturn as u8;
+}
+
+#[cfg(test)]
+mod opcode_bytes {
+    use super::*;
+
+    /// Every opcode's byte, as an exhaustive match.
+    ///
+    /// **The point of it is the compile error.** `Vm::run_frames` matches raw
+    /// bytes, which costs the exhaustiveness a `match op` gave for free; a new
+    /// `Op` variant has to be given an arm here, which is where it learns that
+    /// `code` needs a constant and the interpreter needs a case.
+    fn byte_of(op: Op) -> u8 {
+        match op {
+            Op::Constant => code::CONSTANT,
+            Op::Null => code::NULL,
+            Op::False => code::FALSE,
+            Op::True => code::TRUE,
+            Op::LoadLocal => code::LOAD_LOCAL,
+            Op::StoreLocal => code::STORE_LOCAL,
+            Op::LoadModuleVar => code::LOAD_MODULE_VAR,
+            Op::StoreModuleVar => code::STORE_MODULE_VAR,
+            Op::Pop => code::POP,
+            Op::Call => code::CALL,
+            Op::Jump => code::JUMP,
+            Op::Loop => code::LOOP,
+            Op::JumpIf => code::JUMP_IF,
+            Op::And => code::AND,
+            Op::Or => code::OR,
+            Op::Return => code::RETURN,
+            Op::End => code::END,
+            Op::Closure => code::CLOSURE,
+            Op::LoadUpvalue => code::LOAD_UPVALUE,
+            Op::StoreUpvalue => code::STORE_UPVALUE,
+            Op::CloseUpvalue => code::CLOSE_UPVALUE,
+            Op::Class => code::CLASS,
+            Op::MethodInstance => code::METHOD_INSTANCE,
+            Op::MethodStatic => code::METHOD_STATIC,
+            Op::LoadFieldThis => code::LOAD_FIELD_THIS,
+            Op::StoreFieldThis => code::STORE_FIELD_THIS,
+            Op::LoadField => code::LOAD_FIELD,
+            Op::StoreField => code::STORE_FIELD,
+            Op::Construct => code::CONSTRUCT,
+            Op::SetAttributes => code::SET_ATTRIBUTES,
+            Op::LoadStaticField => code::LOAD_STATIC_FIELD,
+            Op::StoreStaticField => code::STORE_STATIC_FIELD,
+            Op::ImportModule => code::IMPORT_MODULE,
+            Op::ImportVariable => code::IMPORT_VARIABLE,
+            Op::Super => code::SUPER,
+            Op::LoadLocalConstant => code::LOAD_LOCAL_CONSTANT,
+            Op::LoadLocalPair => code::LOAD_LOCAL_PAIR,
+            Op::LoadLocalReturn => code::LOAD_LOCAL_RETURN,
+            Op::StoreFieldThisPop => code::STORE_FIELD_THIS_POP,
+            Op::LoadFieldThisReturn => code::LOAD_FIELD_THIS_RETURN,
+        }
+    }
+
+    #[test]
+    fn the_constants_are_the_discriminants() {
+        for byte in 0..=u8::MAX {
+            if let Some(op) = Op::from_byte(byte) {
+                assert_eq!(byte_of(op), byte, "{op:?} decodes from a byte it is not");
+            }
+        }
+    }
+}
+
 impl Op {
     /// Decode a byte, or `None` if it is not an opcode.
     ///
