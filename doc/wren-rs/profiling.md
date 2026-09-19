@@ -406,6 +406,41 @@ Use it when the collector *is* the subject.
 
 ---
 
+## Two things the counter refused
+
+Both of these looked obviously right, were written, passed the suite, and were
+thrown away because instructions retired went **up**. Neither would have been
+settled by the clock: both are under one per cent, which is well inside what
+placement moves.
+
+**Upstream's result placement.** A primitive's result goes into the receiver's
+slot and the stack top drops -- `args[0] = result; stackTop -= numArgs - 1` --
+where this VM truncates and then pushes, paying a capacity test. Adopting it
+cost 0.17% more work on `method_call` and 0.38% more on `binary_trees`.
+
+The reason is instructive. Upstream can write the slot unconditionally because
+a call that re-enters the interpreter is a *different method type* there
+(`METHOD_FUNCTION_CALL`), and never reaches that code. Here `Fn.call` and the
+Sequence methods taking a block are ordinary primitives, so they can return
+with the stack shorter than the receiver slot -- without a length test this was
+an index-out-of-bounds on every closure call. That test is the whole saving and
+then some. **An optimisation copied from another implementation carries its
+surrounding design with it**, and the part that made it free was somewhere else
+in the file.
+
+**Hoisting a value computed twice.** `let receiver_at = self.stack.len() -
+arity - 1` appears on both sides of a `class_of` call, and `class_of` takes
+`&self`, so the compiler cannot prove the stack did not move and recomputes it.
+Computing it once before the branch cost 0.49% more on `method_call` and 0.96%
+more on `fib`.
+
+Recomputing two arithmetic instructions is cheaper than keeping a value live
+across a call, because live across a call means spilled and reloaded. The
+compiler was already making the better choice, and "this is computed twice" is
+not on its own a reason to change it.
+
+---
+
 ## The protocol, as it now stands
 
 | the change is… | measure it by |
