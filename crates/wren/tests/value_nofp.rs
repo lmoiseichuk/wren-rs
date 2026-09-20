@@ -1,11 +1,11 @@
 //! The value representation without floating point.
 //!
-//! The mirror of `value.rs` for the `no-fp` feature, and a separate file for
+//! The mirror of `value.rs` for the `nofp` feature, and a separate file for
 //! the same reason that one is: the *answers* differ. There is no NaN to box
 //! against, so a number is tagged by its low bit, a handle by the sign bit,
 //! and every singleton is an even word with neither — which is what makes the
 //! three kinds impossible to read as each other.
-#![cfg(feature = "no-fp")]
+#![cfg(feature = "nofp")]
 
 use wren::value::Num;
 use wren::{ObjectId, Value};

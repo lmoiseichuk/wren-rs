@@ -2191,7 +2191,7 @@ impl Vm {
                                     // divide by zero." as an error a program
                                     // can catch.
                                     NUM_DIV | NUM_MOD
-                                        if cfg!(feature = "no-fp") && b == (0 as crate::value::Num) =>
+                                        if cfg!(feature = "nofp") && b == (0 as crate::value::Num) =>
                                     {
                                         None
                                     }
@@ -3210,7 +3210,7 @@ pub fn resolve_module(importer: &str, name: &str) -> String {
 /// 22 KB. `i32`'s `Display` is a division loop. There is no `nan`, no
 /// `infinity` and no negative zero to spell, because an integer has none of
 /// them.
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 fn format_number(value: crate::value::Num) -> String {
     let mut text = String::new();
     let mut digits = value.unsigned_abs();
@@ -3236,7 +3236,7 @@ fn format_number(value: crate::value::Num) -> String {
     text
 }
 
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn format_number(value: crate::value::Num) -> String {
     // Wren spells these out rather than using C's "inf"/"-inf"/"nan", so a
     // program's output is the same on every platform -- C leaves the spelling
@@ -3294,13 +3294,13 @@ fn format_number(value: crate::value::Num) -> String {
 /// while an `f32` still holds integers exactly to 16,777,216; nine would stop
 /// `0.1` printing as `0.1`. Eight is the value that keeps both.
 #[cfg(not(feature = "f32"))]
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const SIGNIFICANT: usize = 14;
 #[cfg(feature = "f32")]
 const SIGNIFICANT: usize = 8;
 
 /// Strip the trailing zeros `%g` removes, and the point if nothing follows it.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn trim_trailing_zeros(text: &str) -> String {
     if !text.contains('.') {
         return text.to_string();

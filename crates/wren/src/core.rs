@@ -649,13 +649,13 @@ fn install_num(vm: &mut Vm) {
     arithmetic!(vm, class, "+(_)", a, b, Value::num(a + b));
     arithmetic!(vm, class, "-(_)", a, b, Value::num(a - b));
     arithmetic!(vm, class, "*(_)", a, b, Value::num(a * b));
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     arithmetic!(vm, class, "/(_)", a, b, Value::num(a / b));
     // **Integer division by zero is an error, not an infinity.** A float
     // build answers `infinity` because IEEE says so and Wren exposes it; an
     // integer build has no such value, and Rust's `/` would panic -- which is
     // the one answer a scripting language must never give.
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     define(vm, class, "/(_)", |vm, at| {
         let left = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
         let right = number_argument(vm, at, 1)?;
@@ -668,9 +668,9 @@ fn install_num(vm: &mut Vm) {
     });
     // Wren's `%` follows C's fmod: the result takes the sign of the dividend,
     // which is *not* what Rust's `rem_euclid` does.
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     arithmetic!(vm, class, "%(_)", a, b, Value::num(a % b));
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     define(vm, class, "%(_)", |vm, at| {
         let left = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
         let right = number_argument(vm, at, 1)?;
@@ -880,7 +880,7 @@ fn install_num_extras(vm: &mut Vm) {
         Ok(Value::num(clamped))
     });
 
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     {
         define(vm, class, "truncate", |vm, at| {
             Ok(Value::num(math::trunc(
@@ -934,7 +934,7 @@ fn install_num_extras(vm: &mut Vm) {
     // neither -- so the answers are constants rather than computations, and
     // the methods stay defined so a program that asks gets Wren's answer
     // rather than a missing method.
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     {
         define(vm, class, "truncate", |vm, at| Ok(receiver(vm, at)));
         define(vm, class, "fraction", |_, _| Ok(Value::num(0)));
@@ -975,7 +975,7 @@ fn install_num_extras(vm: &mut Vm) {
     // neither they are undefined, and `1.sin` reports "Num does not implement
     // 'sin'" -- an answer the caller can see, rather than one from a series
     // that is quietly wrong in the digits Wren prints.
-    #[cfg(all(any(feature = "std", feature = "libm"), not(feature = "no-fp")))]
+    #[cfg(all(any(feature = "std", feature = "libm"), not(feature = "nofp")))]
     {
         use crate::math::real;
 
@@ -1067,7 +1067,7 @@ fn install_num_extras(vm: &mut Vm) {
         // text is a number, and "no" is an answer. A number too large to
         // represent is different -- the text *is* a number, and quietly
         // answering `infinity` would be a wrong one.
-        #[cfg(not(feature = "no-fp"))]
+        #[cfg(not(feature = "nofp"))]
         match parsed {
             Some(value) if value.is_infinite() => {
                 Err(RuntimeError::new("Number literal is too large."))
@@ -1079,7 +1079,7 @@ fn install_num_extras(vm: &mut Vm) {
         // a range, and `parse` already said no to anything outside it. The
         // difference between "not a number" and "too large" is kept by
         // asking whether the text looked numeric at all.
-        #[cfg(feature = "no-fp")]
+        #[cfg(feature = "nofp")]
         match parsed {
             Some(value) if value > crate::value::NUM_MAX => {
                 Err(RuntimeError::new("Number literal is too large."))
@@ -1093,7 +1093,7 @@ fn install_num_extras(vm: &mut Vm) {
     // defined without floating point.** Asking for one reports "Num
     // metaclass does not implement 'pi'", which is an answer a caller can
     // see -- rather than rounding pi to 3 and being quietly wrong.
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     {
         define(vm, metaclass, "pi", |_, _| {
             Ok(Value::num(core::f64::consts::PI as Num))
@@ -1112,25 +1112,25 @@ fn install_num_extras(vm: &mut Vm) {
     // `largest` and `smallest` mean what they say in either build: the
     // biggest and the smallest positive number this `Num` can hold. For
     // integers that is the 31-bit range the tag leaves.
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     {
         define(vm, metaclass, "largest", |_, _| Ok(Value::num(Num::MAX)));
         define(vm, metaclass, "smallest", |_, _| {
             Ok(Value::num(Num::MIN_POSITIVE))
         });
     }
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     {
         define(vm, metaclass, "largest", |_, _| {
             Ok(Value::num(crate::value::NUM_MAX))
         });
         define(vm, metaclass, "smallest", |_, _| Ok(Value::num(1)));
     }
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     define(vm, metaclass, "minSafeInteger", |_, _| {
         Ok(Value::num(-9007199254740991.0))
     });
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     define(vm, metaclass, "minSafeInteger", |_, _| {
         Ok(Value::num(-crate::value::NUM_MAX - 1))
     });
@@ -2554,7 +2554,7 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
         let normalised = if number == ZERO { ZERO } else { number };
         // Redundant in a 64-bit build and required in a 32-bit one, which is
         // why the lint is silenced rather than the cast removed.
-        #[cfg(not(feature = "no-fp"))]
+        #[cfg(not(feature = "nofp"))]
         {
             #[allow(clippy::unnecessary_cast)]
             let bits = normalised.to_bits() as u64;
@@ -2568,7 +2568,7 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
         // scatter for nothing by folding a double's bits; this has to ask.
         //
         // MurmurHash3's finalizer: two multiplies and three shifts.
-        #[cfg(feature = "no-fp")]
+        #[cfg(feature = "nofp")]
         {
             let mut bits = normalised as u32;
             bits ^= bits >> 16;
@@ -2599,14 +2599,14 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
             // Widened before folding: the shift below is an overflow when a
             // `Num` is 32 bits, where the fold should simply do nothing.
             #[allow(clippy::unnecessary_cast)]
-            #[cfg(not(feature = "no-fp"))]
+            #[cfg(not(feature = "nofp"))]
             let from = range.from.to_bits() as u64;
-            #[cfg(feature = "no-fp")]
+            #[cfg(feature = "nofp")]
             let from = range.from as u64;
             #[allow(clippy::unnecessary_cast)]
-            #[cfg(not(feature = "no-fp"))]
+            #[cfg(not(feature = "nofp"))]
             let to = range.to.to_bits() as u64;
-            #[cfg(feature = "no-fp")]
+            #[cfg(feature = "nofp")]
             let to = range.to as u64;
             (from as u32)
                 ^ ((from >> 32) as u32)

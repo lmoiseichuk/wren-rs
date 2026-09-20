@@ -21,28 +21,28 @@ use crate::value::Num;
 // removed because the shared code -- indexing, iteration, range walking --
 // calls them on values that are conceptually numbers, not floats, and would
 // otherwise need a `cfg` at every call site.
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 pub fn abs(x: Num) -> Num {
     x.wrapping_abs()
 }
 
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 pub fn trunc(x: Num) -> Num {
     x
 }
 
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 pub fn floor(x: Num) -> Num {
     x
 }
 
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 pub fn ceil(x: Num) -> Num {
     x
 }
 
 /// Integer square root by Newton's method, which needs no floating point.
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 pub fn sqrt(x: Num) -> Num {
     if x <= 0 {
         return 0;
@@ -58,27 +58,27 @@ pub fn sqrt(x: Num) -> Num {
 
 // `std`'s methods exist on both `f32` and `f64`, so one definition covers
 // either width.
-#[cfg(all(feature = "std", not(feature = "no-fp")))]
+#[cfg(all(feature = "std", not(feature = "nofp")))]
 pub fn abs(x: Num) -> Num {
     x.abs()
 }
 
-#[cfg(all(feature = "std", not(feature = "no-fp")))]
+#[cfg(all(feature = "std", not(feature = "nofp")))]
 pub fn trunc(x: Num) -> Num {
     x.trunc()
 }
 
-#[cfg(all(feature = "std", not(feature = "no-fp")))]
+#[cfg(all(feature = "std", not(feature = "nofp")))]
 pub fn floor(x: Num) -> Num {
     x.floor()
 }
 
-#[cfg(all(feature = "std", not(feature = "no-fp")))]
+#[cfg(all(feature = "std", not(feature = "nofp")))]
 pub fn ceil(x: Num) -> Num {
     x.ceil()
 }
 
-#[cfg(all(feature = "std", not(feature = "no-fp")))]
+#[cfg(all(feature = "std", not(feature = "nofp")))]
 pub fn sqrt(x: Num) -> Num {
     x.sqrt()
 }
@@ -91,27 +91,27 @@ pub fn sqrt(x: Num) -> Num {
 // `f32` result. Writing a second bit-twiddling implementation to save a
 // conversion on the path that has no libm would be trading a tested thing for
 // an untested one.
-#[cfg(all(not(feature = "std"), not(feature = "no-fp")))]
+#[cfg(all(not(feature = "std"), not(feature = "nofp")))]
 pub fn abs(x: Num) -> Num {
     fallback::abs(x as f64) as Num
 }
 
-#[cfg(all(not(feature = "std"), not(feature = "no-fp")))]
+#[cfg(all(not(feature = "std"), not(feature = "nofp")))]
 pub fn trunc(x: Num) -> Num {
     fallback::trunc(x as f64) as Num
 }
 
-#[cfg(all(not(feature = "std"), not(feature = "no-fp")))]
+#[cfg(all(not(feature = "std"), not(feature = "nofp")))]
 pub fn floor(x: Num) -> Num {
     fallback::floor(x as f64) as Num
 }
 
-#[cfg(all(not(feature = "std"), not(feature = "no-fp")))]
+#[cfg(all(not(feature = "std"), not(feature = "nofp")))]
 pub fn ceil(x: Num) -> Num {
     fallback::ceil(x as f64) as Num
 }
 
-#[cfg(all(not(feature = "std"), not(feature = "no-fp")))]
+#[cfg(all(not(feature = "std"), not(feature = "nofp")))]
 pub fn sqrt(x: Num) -> Num {
     fallback::sqrt(x as f64) as Num
 }
@@ -125,7 +125,7 @@ pub fn sqrt(x: Num) -> Num {
 /// with neither simply does not define the methods. That reports `Num does not
 /// implement 'sin'`, which a caller can see, instead of an answer they cannot
 /// check.
-#[cfg(all(any(feature = "std", feature = "libm"), not(feature = "no-fp")))]
+#[cfg(all(any(feature = "std", feature = "libm"), not(feature = "nofp")))]
 pub mod real {
     use crate::value::Num;
 

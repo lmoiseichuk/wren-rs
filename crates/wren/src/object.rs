@@ -589,7 +589,7 @@ impl ObjInstance {
 // Kept separate rather than folded into the block above with `cfg!`, because
 // the point of these assertions is that a reader can see what each build
 // actually costs without reasoning about a conditional.
-#[cfg(all(target_pointer_width = "32", any(feature = "f32", feature = "no-fp")))]
+#[cfg(all(target_pointer_width = "32", any(feature = "f32", feature = "nofp")))]
 mod layout_f32 {
     use super::*;
 
@@ -617,7 +617,7 @@ mod layout_f32 {
     const _: () = assert!(core::mem::size_of::<Box<ObjClass>>() == 4);
 }
 
-#[cfg(all(target_pointer_width = "32", not(feature = "f32"), not(feature = "no-fp")))]
+#[cfg(all(target_pointer_width = "32", not(feature = "f32"), not(feature = "nofp")))]
 mod layout {
     use super::*;
 

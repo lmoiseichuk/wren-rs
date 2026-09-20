@@ -29,7 +29,7 @@ fn error(source: &str) -> String {
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn arithmetic_and_precedence() {
     assert_eq!(run("System.print(1 + 2)"), "3\n");
     assert_eq!(run("System.print(2 + 3 * 4)"), "14\n");
@@ -51,7 +51,7 @@ fn modulo_takes_the_sign_of_the_dividend() {
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn integral_numbers_print_without_a_decimal_point() {
     // The single most visible formatting rule in the language: Wren has one
     // numeric type, but `1` prints as `1` rather than `1.0`.
@@ -71,7 +71,7 @@ fn unary_minus_binds_looser_than_a_call() {
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn number_methods() {
     assert_eq!(run("System.print(2.5.floor)"), "2\n");
     assert_eq!(run("System.print(2.5.ceil)"), "3\n");
@@ -703,7 +703,7 @@ System.print(f.error)
 #[cfg(not(feature = "f32"))]
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn numbers_use_fourteen_significant_digits() {
     // %.14g, which is what makes `0.1 + 0.2` print as `0.3` rather than as
     // `0.30000000000000004`.
@@ -714,7 +714,7 @@ fn numbers_use_fourteen_significant_digits() {
 #[cfg(not(feature = "f32"))]
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn very_large_and_small_numbers_use_exponential_notation() {
     assert_eq!(run("System.print(1e300)"), "1e+300\n");
     assert_eq!(run("System.print(1e-300)"), "1e-300\n");
@@ -722,7 +722,7 @@ fn very_large_and_small_numbers_use_exponential_notation() {
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn the_special_values_have_wren_spellings() {
     assert_eq!(run("System.print(1/0)"), "infinity\n");
     assert_eq!(run("System.print(-1/0)"), "-infinity\n");
@@ -731,7 +731,7 @@ fn the_special_values_have_wren_spellings() {
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn negative_zero_keeps_its_sign() {
     assert_eq!(run("System.print(-0.0)"), "-0\n");
     assert_eq!(run("System.print((-0.5).truncate)"), "-0\n");
@@ -1121,7 +1121,7 @@ fn sequence_predicates() {
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn take_and_skip_reject_a_bad_count() {
     assert_eq!(
         error("(1..3).take(-1)"),
@@ -1241,7 +1241,7 @@ System.print(m.count)
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn negative_zero_and_zero_are_the_same_key() {
     // They are `==`, so they must hash alike or one would be unreachable.
     assert_eq!(
@@ -1269,7 +1269,7 @@ System.print(total)
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn an_invalid_map_iterator_is_an_error() {
     // **Two different faults, two different messages.** Past the end of the
     // table is a bad index; inside it but pointing at an empty slot is an
@@ -1426,7 +1426,7 @@ fn string_methods_reject_a_non_string_argument() {
 
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn from_code_point_checks_its_range() {
     assert_eq!(
         error("String.fromCodePoint(-1)"),
@@ -1850,7 +1850,7 @@ fn operators_that_are_not_numeric_still_dispatch() {
 /// comparison against NaN is false.
 #[test]
 // Fractions, negative zero and `%g` formatting are float facts.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 fn inlined_arithmetic_matches_the_primitive() {
     assert_eq!(run("System.print(7 % 3)"), "1\n");
     assert_eq!(run("System.print(-7 % 3)"), "-1\n", "sign of the dividend");

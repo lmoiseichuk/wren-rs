@@ -95,7 +95,21 @@ f32 = []
 #
 # It is for a part like a CH32V006 -- 62 KB of flash, 8 KB of RAM -- where a
 # sensor counts millivolts and percentages and never needed a double.
-no-fp = []
+nofp = []
+# **µwren: the whole intent in one word.**
+#
+# `nofp` on its own is additive, and Cargo has no way for a feature to switch
+# another *off* -- so enabling it beside the defaults still drags `std` and
+# the compiler in, which is exactly backwards for the part it exists for.
+# This names the combination a small target actually wants:
+#
+#     wren = { default-features = false, features = ["uwren"] }
+#
+# `no_std`, an allocator, integers only, and no compiler -- a device runs
+# bytecode built on a host. Measured on an ESP32-C6 that is 312,340 B of
+# image against 373,814 B, and a VM holding 7,036 B rather than 21,060 B once
+# its core is tailored to one program's manifest.
+uwren = ["alloc", "nofp"]
 # **Counters in the collector, for deciding what to replace it with.** Off by
 # default and never shipped: it adds a tally to every allocation and, at every
 # collection, a refcount simulation over the garbage to work out how much of it

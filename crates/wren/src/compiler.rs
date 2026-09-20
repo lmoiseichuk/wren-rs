@@ -1170,14 +1170,14 @@ impl<'a> Compiler<'a> {
                 // one as a digit string is a mistake rather than a way to
                 // spell it -- and silently turning 10^200 digits into
                 // `infinity` hides the mistake.
-                #[cfg(not(feature = "no-fp"))]
+                #[cfg(not(feature = "nofp"))]
                 if value.is_infinite() {
                     return Err(self.error_at(token, "Number literal is too large."));
                 }
                 // An integer build has no infinity to overflow into; the
                 // lexer's parse already refused anything outside the range,
                 // and `token.number` returned `None` for it.
-                #[cfg(feature = "no-fp")]
+                #[cfg(feature = "nofp")]
                 if value > crate::value::NUM_MAX {
                     return Err(self.error_at(token, "Number literal is too large."));
                 }

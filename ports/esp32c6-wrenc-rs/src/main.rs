@@ -61,7 +61,22 @@ fn main() -> ! {
 }
 
 fn run_one(name: &str, bytes: &[u8]) {
-    let mut vm = Vm::new();
+    // **The VM is built for this program.** Its `.wrenc` names every method
+    // it can call, so the core library is installed to that list rather than
+    // in full -- see `Vm::with_core_methods`. What that saves is RAM, and on
+    // a part with kilobytes it is most of what the VM holds.
+    let before_vm = esp_alloc::HEAP.free();
+    let manifest = match wren::wrenc::manifest(bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            println!("{name:<14} MANIFEST ERROR: {}", error.message());
+            return;
+        }
+    };
+    let asked = manifest.signatures.len();
+    let mut vm = Vm::with_core_methods(&manifest.signatures);
+    let resident = before_vm.saturating_sub(esp_alloc::HEAP.free());
+    println!("{name:<14} tailored to {asked} methods, VM resident {resident} B");
     let origin = Instant::now();
     vm.set_clock(move || origin.elapsed().as_micros() as f64 / 1_000_000.0);
 

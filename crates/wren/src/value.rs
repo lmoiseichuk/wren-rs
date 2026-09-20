@@ -52,13 +52,13 @@ use crate::handle::ObjectId;
 /// **`f64` is the language**, and the default. `f32` is a build for parts that
 /// cannot afford doubles, and it is not Wren: see the module docs above and
 /// `doc/wren-rs/design.md`.
-#[cfg(not(any(feature = "f32", feature = "no-fp")))]
+#[cfg(not(any(feature = "f32", feature = "nofp")))]
 pub type Num = f64;
-#[cfg(all(feature = "f32", not(feature = "no-fp")))]
+#[cfg(all(feature = "f32", not(feature = "nofp")))]
 pub type Num = f32;
-/// **Integers only** -- see the `no-fp` feature. 31 bits, not 32: one bit
+/// **Integers only** -- see the `nofp` feature. 31 bits, not 32: one bit
 /// pays for the tag that NaN boxing used to get out of the exponent field.
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 pub type Num = i32;
 
 /// What a `Num` primitive answers when its receiver is not a number.
@@ -69,20 +69,20 @@ pub type Num = i32;
 /// something has to be written in the `None` arm. A float build says `NaN`
 /// because that is the float answer to a question with no answer; an integer
 /// build has no such value and says zero.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 pub const NOT_A_NUMBER: Num = Num::NAN;
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 pub const NOT_A_NUMBER: Num = 0;
 
 /// The largest number an integer build can hold: thirty-one bits, signed.
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 pub const NUM_MAX: Num = i32::MAX >> 1;
 
 /// The unsigned integer of the same width as [`Num`], which is what a `Value`
 /// actually stores.
-#[cfg(not(any(feature = "f32", feature = "no-fp")))]
+#[cfg(not(any(feature = "f32", feature = "nofp")))]
 type Bits = u64;
-#[cfg(any(feature = "f32", feature = "no-fp"))]
+#[cfg(any(feature = "f32", feature = "nofp"))]
 type Bits = u32;
 
 /// The sign bit. Set on a `Value` means the payload is an object handle.
@@ -91,9 +91,9 @@ type Bits = u32;
 /// there must fit in 48 bits. Here the payload is a table index, so the
 /// constraint is academic — but keeping the layout identical means the two
 /// implementations can be read against each other.
-#[cfg(not(any(feature = "f32", feature = "no-fp")))]
+#[cfg(not(any(feature = "f32", feature = "nofp")))]
 const SIGN_BIT: Bits = 1 << 63;
-#[cfg(any(feature = "f32", feature = "no-fp"))]
+#[cfg(any(feature = "f32", feature = "nofp"))]
 const SIGN_BIT: Bits = 1 << 31;
 
 /// A quiet NaN with two extra bits set.
@@ -107,15 +107,15 @@ const SIGN_BIT: Bits = 1 << 31;
 /// The `f32` constant is the same three fields in the narrower layout:
 /// exponent all ones (`0x7f80_0000`), the quiet bit (`0x0040_0000`) and the
 /// bit below it (`0x0020_0000`).
-#[cfg(not(any(feature = "f32", feature = "no-fp")))]
+#[cfg(not(any(feature = "f32", feature = "nofp")))]
 const QNAN: Bits = 0x7ffc_0000_0000_0000;
-#[cfg(all(feature = "f32", not(feature = "no-fp")))]
+#[cfg(all(feature = "f32", not(feature = "nofp")))]
 const QNAN: Bits = 0x7fe0_0000;
 /// **There is no NaN to box against without floating point.** An integer
 /// build tags instead: bit 0 set means a number, the sign bit means a handle,
 /// and the singletons are small even words. This constant stays at zero so
 /// the shared `QNAN | TAG_*` spellings below still mean what they say.
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const QNAN: Bits = 0;
 
 /// How much of a tagged value is left over to hold a handle.
@@ -126,38 +126,38 @@ const QNAN: Bits = 0;
 /// A heap that large would need 40 MB of slots, which is not a part this build
 /// exists for, but [`Value::object`] asserts it in debug builds rather than
 /// silently aliasing two objects onto one handle.
-#[cfg(not(any(feature = "f32", feature = "no-fp")))]
+#[cfg(not(any(feature = "f32", feature = "nofp")))]
 const PAYLOAD: Bits = 0xffff_ffff;
-#[cfg(all(feature = "f32", not(feature = "no-fp")))]
+#[cfg(all(feature = "f32", not(feature = "nofp")))]
 const PAYLOAD: Bits = (1 << 21) - 1;
 /// A handle is shifted up by one so its low bit is clear, and the sign bit
 /// marks it -- so thirty bits are left, which is 1,073,741,823 objects.
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const PAYLOAD: Bits = (1 << 30) - 1;
 
 /// The low bits that distinguish the singletons, when the sign bit is clear.
 const MASK_TAG: Bits = 7;
 
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const TAG_NAN: Bits = 0;
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const TAG_NULL: Bits = 1;
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const TAG_FALSE: Bits = 2;
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const TAG_TRUE: Bits = 3;
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const TAG_UNDEFINED: Bits = 4;
 
 // **Even, and without the sign bit**, so a singleton can never be mistaken
 // for a number (low bit set) or for a handle (sign bit set).
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const TAG_NULL: Bits = 2;
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const TAG_FALSE: Bits = 4;
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const TAG_TRUE: Bits = 6;
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const TAG_UNDEFINED: Bits = 8;
 
 /// A Wren value: a number, a boolean, null, or a handle to a heap object.
@@ -191,7 +191,7 @@ impl Value {
     /// No tagging happens: a double that is not a NaN already means itself.
     /// A NaN that arrives here stays a NaN and is still a number — the extra
     /// bit in [`QNAN`] is what keeps it from colliding with a tag.
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     pub fn num(value: Num) -> Value {
         Value(value.to_bits())
     }
@@ -203,7 +203,7 @@ impl Value {
     /// which is what an integer type does everywhere else; saturating would be
     /// a different and more surprising answer, and checking would cost the
     /// hot path.
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     pub fn num(value: Num) -> Value {
         Value(((value as Bits) << 1) | 1)
     }
@@ -218,7 +218,7 @@ impl Value {
     }
 
     /// A handle to a heap object.
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     pub fn object(id: ObjectId) -> Value {
         debug_assert!(
             u64::from(id.raw()) <= u64::from(PAYLOAD),
@@ -230,7 +230,7 @@ impl Value {
 
     /// A handle, shifted up one so its low bit is clear and marked by the
     /// sign bit -- neither of which a number or a singleton ever has.
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     pub fn object(id: ObjectId) -> Value {
         debug_assert!(
             u64::from(id.raw()) <= u64::from(PAYLOAD),
@@ -244,19 +244,19 @@ impl Value {
     ///
     /// Anything that is not a quiet NaN is a double. This is the check the
     /// interpreter makes most often, which is why it is two instructions.
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     pub fn is_num(self) -> bool {
         (self.0 & QNAN) != QNAN
     }
 
     /// One instruction: the low bit is the tag.
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     pub fn is_num(self) -> bool {
         (self.0 & 1) == 1
     }
 
     /// Is this a handle to a heap object?
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     pub fn is_object(self) -> bool {
         (self.0 & (QNAN | SIGN_BIT)) == (QNAN | SIGN_BIT)
     }
@@ -264,7 +264,7 @@ impl Value {
     /// **Both bits, not just the sign.** A negative number sets the sign bit
     /// too -- `-1` encodes as `0xffff_ffff` -- so a handle is the sign bit
     /// *and* a clear low bit, which is what separates it from every number.
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     pub fn is_object(self) -> bool {
         (self.0 & (SIGN_BIT | 1)) == SIGN_BIT
     }
@@ -295,7 +295,7 @@ impl Value {
     /// tested first. Returning an `Option` instead costs nothing once inlined
     /// and removes a whole class of mistake, so the unchecked form is not
     /// offered.
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     pub fn as_num(self) -> Option<Num> {
         if self.is_num() {
             Some(Num::from_bits(self.0))
@@ -305,7 +305,7 @@ impl Value {
     }
 
     /// An arithmetic shift, so the sign comes back with the value.
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     pub fn as_num(self) -> Option<Num> {
         if self.is_num() {
             Some((self.0 as i32) >> 1)
@@ -315,7 +315,7 @@ impl Value {
     }
 
     /// The object handle this holds, or `None` if it is not one.
-    #[cfg(not(feature = "no-fp"))]
+    #[cfg(not(feature = "nofp"))]
     pub fn as_object(self) -> Option<ObjectId> {
         if self.is_object() {
             // A truncation when `Bits` is `u64`, an identity when it is
@@ -326,7 +326,7 @@ impl Value {
         }
     }
 
-    #[cfg(feature = "no-fp")]
+    #[cfg(feature = "nofp")]
     pub fn as_object(self) -> Option<ObjectId> {
         if self.is_object() {
             Some(ObjectId::new(((self.0 & !SIGN_BIT) >> 1) as u32))
@@ -379,9 +379,9 @@ impl Value {
 impl core::fmt::Debug for Value {
     fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match () {
-            #[cfg(not(feature = "no-fp"))]
+            #[cfg(not(feature = "nofp"))]
             _ if self.is_num() => write!(out, "Num({})", Num::from_bits(self.0)),
-            #[cfg(feature = "no-fp")]
+            #[cfg(feature = "nofp")]
             _ if self.is_num() => write!(out, "Num({})", (self.0 as i32) >> 1),
             _ if self.is_null() => write!(out, "Null"),
             _ if self.is_true() => write!(out, "True"),
@@ -398,35 +398,35 @@ impl core::fmt::Debug for Value {
 /// `TAG_NAN` exists in upstream to name the untagged-NaN case explicitly.
 /// Nothing reads it, but leaving it out would make the tag list look like it
 /// starts at one by accident rather than because zero is spoken for.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const _: () = assert!(TAG_NAN == 0);
 const _: () = assert!(MASK_TAG == 7);
 
 // The whole reason for NaN tagging: a tagged enum would be sixteen bytes, and
 // every stack slot, list element and instance field would pay the difference.
 // An integer build gets the same four bytes from a tag in the low bit.
-#[cfg(not(any(feature = "f32", feature = "no-fp")))]
+#[cfg(not(any(feature = "f32", feature = "nofp")))]
 const _: () = assert!(core::mem::size_of::<Value>() == 8);
-#[cfg(any(feature = "f32", feature = "no-fp"))]
+#[cfg(any(feature = "f32", feature = "nofp"))]
 const _: () = assert!(core::mem::size_of::<Value>() == 4);
 
 // The tags have to fit under the quiet bits, or a singleton would read back as
 // a different one. Cheap to check and expensive to discover.
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const _: () = assert!(TAG_UNDEFINED <= MASK_TAG);
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const _: () = assert!(QNAN & MASK_TAG == 0);
-#[cfg(not(feature = "no-fp"))]
+#[cfg(not(feature = "nofp"))]
 const _: () = assert!(PAYLOAD & QNAN == 0);
 
 // **An integer build's invariants are different and worth stating.** A number
 // has its low bit set, a handle has the sign bit, and every singleton has
 // neither -- so no two can ever be read as each other.
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const _: () = assert!(TAG_NULL & 1 == 0 && TAG_FALSE & 1 == 0);
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const _: () = assert!(TAG_TRUE & 1 == 0 && TAG_UNDEFINED & 1 == 0);
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const _: () = assert!(TAG_UNDEFINED & SIGN_BIT == 0);
-#[cfg(feature = "no-fp")]
+#[cfg(feature = "nofp")]
 const _: () = assert!(PAYLOAD << 1 & SIGN_BIT == 0);

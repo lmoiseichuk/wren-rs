@@ -9,7 +9,7 @@
 //! integer, a 32-bit handle — so the whole file is skipped in an `f32` build,
 //! which has its own in `value_f32.rs`. Making them width-generic would have
 //! meant asserting whichever answer the build gives, which is not a test.
-#![cfg(all(not(feature = "f32"), not(feature = "no-fp")))]
+#![cfg(all(not(feature = "f32"), not(feature = "nofp")))]
 
 use wren::object::ObjectId;
 use wren::Value;
