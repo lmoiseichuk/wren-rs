@@ -1795,20 +1795,6 @@ impl Vm {
         }
     }
 
-    /// Every value the collector must treat as reachable.
-    ///
-    /// **Getting this list wrong is the classic collector bug**, and it fails
-    /// silently: an object missed here is freed while still in use, and what
-    /// breaks is whatever happens to reuse the slot, somewhere else entirely.
-    /// So the rule is to enumerate every place a `Value` can hide rather than
-    /// to reason about which ones "must" already be reachable.
-    ///
-    /// Note what is *not* here: a Rust local holding a freshly allocated
-    /// object. There is no way to enumerate those, which is why `Heap::allocate`
-    /// never collects and the check happens between instructions, where the
-    /// only live references are the ones below.
-    /// only live references are the ones below.
-    ///
     /// Collect the young generation.
     ///
     /// **The handles go into a buffer the VM keeps.** This runs whenever the
@@ -1824,6 +1810,18 @@ impl Vm {
         self.root_handles = buffer;
     }
 
+    /// Every value the collector must treat as reachable.
+    ///
+    /// **Getting this list wrong is the classic collector bug**, and it fails
+    /// silently: an object missed here is freed while still in use, and what
+    /// breaks is whatever happens to reuse the slot, somewhere else entirely.
+    /// So the rule is to enumerate every place a `Value` can hide rather than
+    /// to reason about which ones "must" already be reachable.
+    ///
+    /// Note what is *not* here: a Rust local holding a freshly allocated
+    /// object. There is no way to enumerate those, which is why `Heap::allocate`
+    /// never collects and the check happens between instructions, where the
+    /// only live references are the ones below.
     fn roots(&self) -> Vec<Value> {
         let mut roots = self.stack.clone();
         for module in &self.modules {
@@ -2458,7 +2456,7 @@ impl Vm {
                     let count = Chunk::inline_operand(unit) as usize;
                     let index = unsafe { *ip } as usize;
                     ip = unsafe { ip.add(1) };
-                    let function = chunk.constants[index]
+                    let function = constants[index]
                         .as_object()
                         .ok_or_else(|| RuntimeError::new("Closure constant is not a function."))?;
 
@@ -2823,7 +2821,7 @@ impl Vm {
                 code::IMPORT_MODULE => {
                     let index = unsafe { *ip } as usize;
                     ip = unsafe { ip.add(1) };
-                    let name = self.to_string(chunk.constants[index]);
+                    let name = self.to_string(constants[index]);
                     // Resolved against the module doing the importing.
                     let name = resolve_module(&self.modules[module].name, &name);
 
@@ -2837,9 +2835,6 @@ impl Vm {
                             // return value lands where this instruction's
                             // result would have, so nothing special is needed
                             // on the way back.
-                            if let Some(frame) = self.frames.last_mut() {
-                                frame.ip = offset_of!(ip);
-                            }
                             // **Assigned, not `let`.** A fresh binding here
                             // would shadow the loop's `base` for this arm only,
                             // so the module body would run against the caller's
@@ -2880,12 +2875,12 @@ impl Vm {
                     let variable_name = unsafe { *ip.add(1) } as usize;
                     ip = unsafe { ip.add(2) };
 
-                    let module_name = self.to_string(chunk.constants[module_name]);
+                    let module_name = self.to_string(constants[module_name]);
                     // The same resolution, or the `for` clause would look the
                     // module up under the name as written rather than the one
                     // it was loaded under.
                     let module_name = resolve_module(&self.modules[module].name, &module_name);
-                    let variable = self.to_string(chunk.constants[variable_name]);
+                    let variable = self.to_string(constants[variable_name]);
 
                     let value = self.imported_variable(&module_name, &variable, chunk.line_at(offset_of!(at)))?;
                     self.stack.push(value);
