@@ -3043,7 +3043,14 @@ impl Vm {
                         return Ok(result);
                     }
 
-                    self.stack.push(result);
+                    // **Room by a simpler argument than the frames' own.**
+                    // `truncate(base)` above left the length at `base`, and
+                    // the capacity was at least the length it had before that
+                    // -- which was more than `base`, because slot `base` held
+                    // the receiver. So the slot exists and this cannot grow.
+                    // Reached only when there is a caller to return to; the
+                    // outermost return leaves by the branch above.
+                    self.push_reserved(result);
                     // **The return path.** This ran twice per call before --
                     // closure to function to chunk, and again for the module --
                     // and is now two field reads and a refcount bump.
