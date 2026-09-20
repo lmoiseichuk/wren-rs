@@ -6,6 +6,8 @@
 #   tools/measure-rs.sh size                   # the footprint profile
 #   tools/measure-rs.sh speed --pad 4          # ...at a chosen code placement
 #   tools/measure-rs.sh speed --bin counters   # a different binary in the port
+#   tools/measure-rs.sh speed --slot-block 256 # blocked slot tables, this size
+#   tools/measure-rs.sh speed --features f32   # any cargo feature of the port
 #
 # **Why this exists rather than `cargo run`.** The port's cargo runner is
 # `espflash flash --monitor`, which never exits: it flashes, prints, and then
@@ -31,12 +33,16 @@ BOARD=""
 BIN=""
 PAD=""
 LOG=""
+FEATURES=""
+SLOT_BLOCK=""
 
 while (( $# )); do
     case "$1" in
         size|speed) PROFILE="$1" ;;
         --pad) PAD="${2:-}"; shift ;;
         --bin) BIN="${2:-}"; shift ;;
+        --features) FEATURES="${2:-}"; shift ;;
+        --slot-block) SLOT_BLOCK="${2:-}"; shift ;;
         --log) LOG="${2:-}"; shift ;;
         --board) BOARD="${2:-}"; shift ;;
         -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -62,6 +68,16 @@ cd "$PORT_DIR" || exit 1
 
 BUILD=(cargo build --profile "$PROFILE")
 [[ -n "$BIN" ]] && BUILD+=(--bin "$BIN")
+
+# **A block size implies blocked tables.** Asking for one in a build that has
+# no blocks is refused on the device by an assertion, which is a slow way to
+# find out; adding the feature here is what the caller meant.
+if [[ -n "$SLOT_BLOCK" ]]; then
+    export WREN_SLOT_BLOCK="$SLOT_BLOCK"
+    [[ ",$FEATURES," == *",blocked-slots,"* ]] || FEATURES="${FEATURES:+$FEATURES,}blocked-slots"
+    echo "slot block: $SLOT_BLOCK slots"
+fi
+[[ -n "$FEATURES" ]] && BUILD+=(--features "$FEATURES")
 
 # **A placement override replaces the whole flag list, it does not add to it.**
 # `RUSTFLAGS` wins over `.cargo/config.toml` outright rather than merging, so

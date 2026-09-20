@@ -426,3 +426,92 @@ fn every_slot_type_costs_nothing_for_being_optional() {
         "a type with no niche should grow -- if it does not, this test proves nothing"
     );
 }
+
+/// The block size is a start-up setting, and it is checked rather than trusted.
+///
+/// An index is split into a block and an offset with a shift and a mask, so a
+/// size that is not a power of two has no shift to be. And handles are flat
+/// indices across the whole table: moving the shift under a table that already
+/// holds objects would move every one of them, so the only safe moment is
+/// before the first allocation.
+#[cfg(feature = "blocked-slots")]
+#[test]
+fn a_slot_block_is_a_power_of_two_chosen_before_the_first_allocation() {
+    let mut heap = Heap::new();
+    assert!(!heap.set_slot_block(0), "a block of nothing holds nothing");
+    assert!(!heap.set_slot_block(24), "not a power of two, so not a shift");
+    assert!(
+        !heap.set_slot_block(wren::heap::MAX_SLOT_BLOCK * 2),
+        "past the cap, so a typo rather than an intention"
+    );
+
+    assert!(heap.set_slot_block(8), "a power of two under the cap");
+    assert_eq!(heap.slot_block(), Some(8));
+
+    string(&mut heap, "and now the table holds something");
+    assert!(
+        !heap.set_slot_block(64),
+        "the shift cannot move under live handles"
+    );
+    assert_eq!(heap.slot_block(), Some(8), "and the refusal changed nothing");
+}
+
+/// Whatever the block size, a handle still names the object it was given for.
+///
+/// This is the property the split arithmetic has to have and the one a wrong
+/// shift or mask breaks silently: every index lands in its own slot, across
+/// block boundaries, and again after the blocks have been given back and
+/// remade from the free list.
+#[cfg(feature = "blocked-slots")]
+#[test]
+fn every_block_size_reads_its_objects_back() {
+    for block in [1_usize, 2, 8, 32, 256] {
+        let mut heap = Heap::new();
+        assert!(heap.set_slot_block(block), "block of {block}");
+
+        // Twice over: the second round allocates into indices the first round
+        // freed, which is what makes a dropped block again.
+        for round in 0..2 {
+            let mut handles = alloc_round(&mut heap, round);
+            for (index, handle) in handles.drain(..).enumerate() {
+                let expected = format!("round {round} string {index}");
+                match heap.string(handle) {
+                    Some(text) => assert_eq!(
+                        text.as_str(),
+                        Some(expected.as_str()),
+                        "block {block}, round {round}, slot {index}"
+                    ),
+                    other => panic!("block {block}, round {round}, slot {index}: {other:?}"),
+                }
+            }
+            // Nothing is held, so the sweep frees all of it and every block
+            // with it.
+            heap.collect([]);
+            assert_eq!(heap.live(), 0, "block {block}, round {round}");
+        }
+    }
+}
+
+/// 300 strings, enough to span several blocks at every size tried above.
+#[cfg(feature = "blocked-slots")]
+fn alloc_round(heap: &mut Heap, round: usize) -> Vec<wren::ObjectId> {
+    (0..300)
+        .map(|index| {
+            heap.allocate(Object::String(ObjString::from_text(&format!(
+                "round {round} string {index}"
+            ))))
+        })
+        .collect()
+}
+
+/// Without the feature there are no blocks, and the setting says so.
+#[cfg(not(feature = "blocked-slots"))]
+#[test]
+fn a_flat_table_has_no_block_to_size() {
+    let mut heap = Heap::new();
+    assert!(
+        !heap.set_slot_block(8),
+        "nothing to set, and it should not pretend otherwise"
+    );
+    assert_eq!(heap.slot_block(), None);
+}

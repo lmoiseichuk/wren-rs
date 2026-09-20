@@ -441,7 +441,22 @@ pub struct Vm {
 
 impl Vm {
     pub fn new() -> Vm {
-        let mut heap = Heap::new();
+        Vm::with_heap(Heap::new())
+    }
+
+    /// A VM over a heap that has already been configured.
+    ///
+    /// **Some heap settings can only be made while the heap is empty**, and
+    /// building a VM fills it: the core classes and their names are the first
+    /// two dozen objects in every program. [`Heap::set_slot_block`] is one of
+    /// those settings, because it decides how a handle is split into a block
+    /// and an offset and every handle already given out assumes the old
+    /// split. So a caller that wants one hands the heap over rather than
+    /// reaching for it afterwards, when it is too late.
+    ///
+    /// Everything settable at any time -- the growth factor, the headroom --
+    /// is still settable through `vm.heap` after this returns.
+    pub fn with_heap(mut heap: Heap) -> Vm {
 
         // The classes have to exist before anything can be dispatched on, and
         // they refer to their own names, so the names are allocated first.

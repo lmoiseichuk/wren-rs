@@ -21,6 +21,7 @@ use esp_backtrace as _;
 use esp_hal::main;
 use esp_hal::time::{Duration, Instant};
 use esp_println::println;
+use wren::heap::Heap;
 use wren::Vm;
 
 // The image header the chip's bootloader looks for.
@@ -46,6 +47,45 @@ const HEAP_BYTES: usize = 320 * 1024;
 /// half as much again as the live set.
 const HEADROOM: Option<usize> = None;
 
+/// How many slots one block of a slot table holds.
+///
+/// **The best size is a property of the program**, which is why the library
+/// takes it at start-up rather than fixing it: a program that allocates a lot
+/// wants a large block, because then the tail of a part-filled one is a
+/// rounding error and what is saved is a pointer per block instead of one per
+/// slot; a program that allocates almost nothing wants a small one, because
+/// that tail is most of what it holds and there are ten tables paying it.
+/// `doc/wren-rs/memory.md` carries the measurements.
+///
+/// `None` leaves the library's default. Set `WREN_SLOT_BLOCK` at build time
+/// to sweep it -- `build.rs` is what makes the sweep actually rebuild.
+const SLOT_BLOCK: Option<usize> = match option_env!("WREN_SLOT_BLOCK") {
+    Some(text) => Some(decimal(text)),
+    None => None,
+};
+
+/// `usize::from_str_radix` is not a const function, and this has to be one.
+///
+/// A build-time constant cannot be parsed by the standard library at compile
+/// time, so the four lines are written out. Anything that is not a decimal
+/// number stops the build here rather than becoming a wrong block size --
+/// `set_slot_block` refuses a nonsense value anyway, but refusing it in the
+/// compiler is better than refusing it on the device.
+const fn decimal(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut value = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        assert!(
+            bytes[index] >= b'0' && bytes[index] <= b'9',
+            "WREN_SLOT_BLOCK must be a decimal number"
+        );
+        value = value * 10 + (bytes[index] - b'0') as usize;
+        index += 1;
+    }
+    value
+}
+
 /// The benchmarks, in the order the published table lists them.
 const BENCHMARKS: &[(&str, &str)] = &[
     ("binary_trees", include_str!("../../../benchmarks/wren/binary_trees.wren")),
@@ -63,12 +103,16 @@ fn main() -> ! {
     println!("wren-rs on ESP32-C6");
     println!("profile      : {}", if cfg!(debug_assertions) { "debug" } else { "release" });
     println!("heap         : {HEAP_BYTES} B");
+    match fresh_vm().heap.slot_block() {
+        Some(slots) => println!("slot block   : {slots} slots"),
+        None => println!("slot block   : flat tables"),
+    }
     println!();
 
     // What one VM costs before it has run anything, which is the figure to set
     // beside the C port's 83,036 B resident.
     let before_vm = esp_alloc::HEAP.free();
-    let probe = Vm::new();
+    let probe = fresh_vm();
     let resident = before_vm.saturating_sub(esp_alloc::HEAP.free());
     drop(probe);
     println!("[vm] resident {resident} B");
@@ -83,12 +127,30 @@ fn main() -> ! {
     loop {}
 }
 
+/// A VM whose heap is set up the way this build asked for.
+///
+/// **The block size has to be chosen before the heap holds anything**, and
+/// building a VM fills it -- the core classes and their names are the first
+/// two dozen objects in any program. So the heap is made here, set, and handed
+/// over; reaching for `vm.heap` afterwards would be too late and the setter
+/// would refuse.
+fn fresh_vm() -> Vm {
+    let mut heap = Heap::new();
+    if let Some(slots) = SLOT_BLOCK {
+        assert!(
+            heap.set_slot_block(slots),
+            "WREN_SLOT_BLOCK must be a power of two, and the build needs the blocked-slots feature"
+        );
+    }
+    Vm::with_heap(heap)
+}
+
 /// Compile and run one benchmark, reporting what it cost.
 fn run_one(name: &str, source: &str) {
     // A fresh VM per benchmark, so one program's garbage is never another's
     // starting condition -- the C port restarts the board between runs for the
     // same reason.
-    let mut vm = Vm::new();
+    let mut vm = fresh_vm();
     // **A fixed heap wants a fixed ceiling on garbage.** The default growth
     // factor is upstream's 1.5x, which lets a program hold half as much
     // garbage again as it is using -- a ratio, on a part whose total is a

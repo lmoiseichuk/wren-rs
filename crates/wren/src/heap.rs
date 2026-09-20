@@ -128,16 +128,25 @@ impl Collection {
 /// twelve bytes a list needs instead of the twenty-four a `Range` needs. It
 /// also makes the type free to ask about: it is in the handle, not in a
 /// discriminant that has to be fetched.
-/// How many slots one block of a table holds.
+/// How many slots one block of a table holds, by default.
 ///
-/// **Thirty-two, measured.** Simulated over the benchmarks' heaps at the end
-/// of a run, blocks of 16 would give back 5,568 bytes of `binary_trees`'
-/// slots, 32 gives 4,992, 64 gives 4,608 and 128 gives 3,072 -- free slots
-/// cluster, but not tightly, so a smaller block reclaims more and costs more
-/// block pointers. `list_build` gives back nothing at any size, because it
-/// frees nothing.
+/// **The right size depends on the shape of the program**, so it is settable
+/// at start-up with [`Heap::set_slot_block`] rather than fixed here. A big
+/// block wastes less on pointers and more on rounding -- a table holding four
+/// objects still pays for a whole one, and there are ten tables -- and a
+/// small block is the other way about and gives memory back in finer steps.
+/// The measurements are in `doc/wren-rs/memory.md`.
 #[cfg(feature = "blocked-slots")]
-const SLOT_BLOCK: usize = 32;
+pub const SLOT_BLOCK: usize = 32;
+
+/// The largest block a caller may ask for.
+///
+/// A block is filled in the moment its first slot is taken, so an outsized
+/// one is paid for by a table holding a single object. Four thousand slots
+/// is already far past anything measured to help; the cap is here so that a
+/// typo at start-up is refused rather than turned into a large allocation.
+#[cfg(feature = "blocked-slots")]
+pub const MAX_SLOT_BLOCK: usize = 4096;
 
 struct Table<T> {
     /// Slots, in blocks of [`SLOT_BLOCK`].
@@ -154,6 +163,15 @@ struct Table<T> {
     /// object access is the hottest path in the VM.
     #[cfg(feature = "blocked-slots")]
     blocks: Vec<Vec<Option<T>>>,
+    /// The block size, as a shift.
+    ///
+    /// **A shift, not a size**, because an index has to be split into a block
+    /// and an offset on every object access: `index >> shift` and
+    /// `index & mask` are one instruction each, where a division by a runtime
+    /// value is not. Settable only before anything is allocated -- see
+    /// [`Heap::set_slot_block`].
+    #[cfg(feature = "blocked-slots")]
+    shift: u32,
     /// One flat run of slots, which only ever grows.
     #[cfg(not(feature = "blocked-slots"))]
     blocks: Vec<Option<T>>,
@@ -201,6 +219,8 @@ impl<T> Table<T> {
     fn new() -> Table<T> {
         Table {
             blocks: Vec::new(),
+            #[cfg(feature = "blocked-slots")]
+            shift: SLOT_BLOCK.trailing_zeros(),
             addressed: 0,
             free: Vec::new(),
             marks: Vec::new(),
@@ -249,14 +269,15 @@ impl<T> Table<T> {
         // this far or because it was dropped when it emptied.
         #[cfg(feature = "blocked-slots")]
         {
-            let block = index / SLOT_BLOCK;
+            let block = index >> self.shift;
             if self.blocks.len() <= block {
                 self.blocks.resize_with(block + 1, Vec::new);
             }
             if self.blocks[block].is_empty() {
-                self.blocks[block] = (0..SLOT_BLOCK).map(|_| None).collect();
+                self.blocks[block] = (0..self.block()).map(|_| None).collect();
             }
-            self.blocks[block][index % SLOT_BLOCK] = Some(value);
+            let offset = index & self.mask();
+            self.blocks[block][offset] = Some(value);
         }
         #[cfg(not(feature = "blocked-slots"))]
         {
@@ -266,6 +287,20 @@ impl<T> Table<T> {
             self.blocks[index] = Some(value);
         }
         index as u32
+    }
+
+    /// How many slots one block of this table holds.
+    #[cfg(feature = "blocked-slots")]
+    #[inline(always)]
+    fn block(&self) -> usize {
+        1 << self.shift
+    }
+
+    /// The mask that takes an index down to its offset within a block.
+    #[cfg(feature = "blocked-slots")]
+    #[inline(always)]
+    fn mask(&self) -> usize {
+        self.block() - 1
     }
 
     /// How many slots this table addresses.
@@ -278,15 +313,20 @@ impl<T> Table<T> {
     #[inline(always)]
     fn slot(&self, index: usize) -> Option<&Option<T>> {
         #[cfg(feature = "blocked-slots")]
-        return self.blocks.get(index / SLOT_BLOCK)?.get(index % SLOT_BLOCK);
+        return self.blocks.get(index >> self.shift)?.get(index & self.mask());
         #[cfg(not(feature = "blocked-slots"))]
         return self.blocks.get(index);
     }
 
     #[inline(always)]
     fn slot_mut(&mut self, index: usize) -> Option<&mut Option<T>> {
+        // Both halves have to be worked out before `blocks` is borrowed
+        // mutably: `self.mask()` is a borrow of `self` in its own right, and
+        // the borrow checker will not have the two overlap.
         #[cfg(feature = "blocked-slots")]
-        return self.blocks.get_mut(index / SLOT_BLOCK)?.get_mut(index % SLOT_BLOCK);
+        let (block, offset) = (index >> self.shift, index & self.mask());
+        #[cfg(feature = "blocked-slots")]
+        return self.blocks.get_mut(block)?.get_mut(offset);
         #[cfg(not(feature = "blocked-slots"))]
         return self.blocks.get_mut(index);
     }
@@ -300,14 +340,14 @@ impl<T> Table<T> {
     /// indices makes the block again; until one does, the memory is back.
     #[cfg(feature = "blocked-slots")]
     fn release(&mut self, index: usize) {
-        let block = index / SLOT_BLOCK;
+        let (block, offset) = (index >> self.shift, index & self.mask());
         let Some(slots) = self.blocks.get_mut(block) else {
             return;
         };
         if slots.is_empty() {
             return;
         }
-        slots[index % SLOT_BLOCK] = None;
+        slots[offset] = None;
         if slots.iter().all(Option::is_none) {
             self.blocks[block] = Vec::new();
         }
@@ -333,7 +373,7 @@ impl<T> Table<T> {
         while self.blocks.last().is_some_and(Vec::is_empty) {
             self.blocks.pop();
         }
-        let addressed = self.blocks.len() * SLOT_BLOCK;
+        let addressed = self.blocks.len() << self.shift;
         if addressed >= self.addressed {
             return;
         }
@@ -1448,11 +1488,11 @@ impl Heap {
         macro_rules! walk {
             ($table:expr, $slot:expr) => {{
                 let table = $table;
-                addressed += table.slots().div_ceil(SLOT_BLOCK);
+                addressed += table.slots().div_ceil(table.block());
                 for block in &table.blocks {
                     match block.is_empty() {
                         false => held += 1,
-                        true => given_back += SLOT_BLOCK * $slot,
+                        true => given_back += table.block() * $slot,
                     }
                 }
             }};
@@ -1595,6 +1635,63 @@ impl Heap {
     /// The ceiling on floating garbage, if one is set.
     pub fn headroom(&self) -> Option<usize> {
         self.headroom
+    }
+
+    /// How many slots one block of a slot table holds.
+    ///
+    /// **The best size is a property of the program, not of the port.** A
+    /// program that allocates little wants a small block, because the tail of
+    /// a part-filled block is pure waste and there are ten tables paying it:
+    /// `fib` and `method_call` hold a few dozen objects between them and lose
+    /// measurably to a block of 32. A program that allocates a lot wants a
+    /// large one, because then the rounding is a rounding error and what is
+    /// left is one pointer per block instead of one per slot: `binary_trees`
+    /// and `list_build` hold thousands. There is no size that is right for
+    /// both, so it is set here, by whoever knows what is about to run.
+    ///
+    /// Must be a power of two -- an index is split with a shift and a mask,
+    /// which is one instruction each on the hot path -- and no larger than
+    /// [`MAX_SLOT_BLOCK`].
+    ///
+    /// **Settable only before anything is allocated.** Handles are flat
+    /// indices, so changing the shift under a table that already holds
+    /// objects would move every one of them; the guard is the reason this is
+    /// a start-up setting and not a knob. Returns whether it took: `false`
+    /// for a size that is not a power of two, one that is too large, a heap
+    /// that has already allocated, or a build without the `blocked-slots`
+    /// feature, where there are no blocks to size.
+    pub fn set_slot_block(&mut self, slots: usize) -> bool {
+        #[cfg(not(feature = "blocked-slots"))]
+        {
+            let _ = slots;
+            false
+        }
+        #[cfg(feature = "blocked-slots")]
+        {
+            if slots == 0 || !slots.is_power_of_two() || slots > MAX_SLOT_BLOCK {
+                return false;
+            }
+            let mut empty = true;
+            each_table!(&mut *self, table, _kind, {
+                empty &= table.slots() == 0;
+            });
+            if !empty {
+                return false;
+            }
+            let shift = slots.trailing_zeros();
+            each_table!(&mut *self, table, _kind, {
+                table.shift = shift;
+            });
+            true
+        }
+    }
+
+    /// How many slots one block holds, or `None` when slots are not blocked.
+    pub fn slot_block(&self) -> Option<usize> {
+        #[cfg(not(feature = "blocked-slots"))]
+        return None;
+        #[cfg(feature = "blocked-slots")]
+        return Some(self.classes.block());
     }
 
     /// The growth factor in force, as `(numerator, denominator)`.

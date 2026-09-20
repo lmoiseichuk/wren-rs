@@ -20,6 +20,13 @@ publish = false
 # bare-metal firmware into `cargo test` at the top level.
 [workspace]
 
+# **Passed through rather than set here**, so one port can be measured both
+# ways. `blocked-slots` puts a table's slots in blocks that go back to the
+# allocator when they empty; `tools/measure-rs.sh --features blocked-slots`
+# builds it that way, and `WREN_SLOT_BLOCK` sizes the block.
+[features]
+blocked-slots = ["wren/blocked-slots"]
+
 [dependencies]
 # This port compiles on the device, so it takes the compiler.
 wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "libm", "compiler"] }

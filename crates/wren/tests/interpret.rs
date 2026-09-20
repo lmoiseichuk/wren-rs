@@ -1701,3 +1701,45 @@ fn several_upvalues_are_captured_in_order() {
     .expect("it runs");
     assert_eq!(vm.output_str().trim(), "7");
 }
+
+// --- heap settings that have to precede the first allocation ---------------
+
+/// A block size set on the heap survives being handed to a VM.
+///
+/// **Building a VM fills its heap** -- the core classes and their names are
+/// the first two dozen objects in any program -- so `set_slot_block` is
+/// already too late by the time `Vm::new` returns. `Vm::with_heap` is the way
+/// to ask for one, and this is the test that it actually arrives, rather than
+/// being quietly reset to the default.
+#[cfg(feature = "blocked-slots")]
+#[test]
+fn a_heap_carries_its_block_size_into_the_vm() {
+    let mut heap = wren::heap::Heap::new();
+    assert!(heap.set_slot_block(8), "an empty heap takes the setting");
+
+    let mut vm = Vm::with_heap(heap);
+    assert_eq!(vm.heap.slot_block(), Some(8), "and keeps it");
+
+    // Enough objects to fill many blocks, held and then let go, so that blocks
+    // are made, given back and made again under a non-default split.
+    let source = r#"
+        var total = 0
+        for (round in 1..3) {
+            var items = []
+            for (i in 1..400) { items.add("item %(i)") }
+            for (item in items) { total = total + item.count }
+        }
+        System.print(total)
+    "#;
+    match vm.interpret(source) {
+        // 400 strings of "item " plus the digits of 1..400, three times over:
+        // 3 x (400 x 5 + 9 + 90 x 2 + 301 x 3).
+        Ok(()) => assert_eq!(vm.output_str(), "9276\n"),
+        Err(error) => panic!("line {}: {}", error.line(), error.message()),
+    }
+
+    assert!(
+        !vm.heap.set_slot_block(16),
+        "and refuses to move once the VM's own objects are in it"
+    );
+}
