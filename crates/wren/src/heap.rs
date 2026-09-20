@@ -557,6 +557,16 @@ pub struct Heap {
     upvalues: Table<ObjUpvalue>,
     live: usize,
     bytes: usize,
+    /// The most `bytes` has ever been.
+    ///
+    /// **Peak is the number a fixed part lives or dies by**, and it is the one
+    /// nothing could read in a shipping build: the profile feature tracks it
+    /// but needs `std`, which a firmware does not have. Residual memory after
+    /// a run says nothing about whether the run fitted.
+    ///
+    /// One compare and one store per allocation, and none on the
+    /// interpreter's hot path.
+    peak: usize,
     threshold: usize,
     /// The growth factor, as a fraction. See [`GROWTH_NUMERATOR`].
     growth: (usize, usize),
@@ -712,6 +722,7 @@ impl Heap {
             upvalues: Table::new(),
             live: 0,
             bytes: 0,
+            peak: 0,
             threshold: INITIAL_THRESHOLD,
             growth: (GROWTH_NUMERATOR, GROWTH_DENOMINATOR),
             headroom: None,
@@ -814,6 +825,7 @@ impl Heap {
         }
 
         self.bytes += cost;
+        self.peak = self.peak.max(self.bytes);
         self.refresh_due();
         #[cfg(feature = "profile")]
         {
@@ -2169,6 +2181,11 @@ impl Heap {
     /// Roughly how many bytes those objects hold.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// The most those objects have ever held, which is what has to fit.
+    pub fn peak_bytes(&self) -> usize {
+        self.peak
     }
 
     /// How many collections have run.

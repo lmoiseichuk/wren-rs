@@ -98,6 +98,7 @@ fn run_one(name: &str, bytes: &[u8]) {
     let outcome = vm.run_closure(loaded.closure);
     let wall: Duration = started.elapsed();
     let free_after = esp_alloc::HEAP.free();
+    let peak = vm.heap.peak_bytes();
 
     match outcome {
         Ok(()) => {
@@ -113,7 +114,7 @@ fn run_one(name: &str, bytes: &[u8]) {
                 .unwrap_or("")
                 .into();
             println!(
-                "{name:<14} elapsed: {reported:<20} wall {} us  load {} us  heap {} B",
+                "{name:<14} elapsed: {reported:<20} wall {} us  load {} us  heap {} B  peak {peak} B",
                 wall.as_micros(),
                 load_time.as_micros(),
                 free_before.saturating_sub(free_after)
