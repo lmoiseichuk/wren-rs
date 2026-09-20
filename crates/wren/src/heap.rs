@@ -1664,6 +1664,40 @@ impl Heap {
         out
     }
 
+    /// What each kind of live object owns beyond its slot, by kind.
+    ///
+    /// **This is the number that decides whether a core could live in flash.**
+    /// A class's method table and a string's text are the two things a
+    /// built-at-startup core pays for in RAM that a core frozen into
+    /// `.rodata` would not -- so knowing which of them is the larger says
+    /// which half of that change is worth attempting first.
+    #[cfg(feature = "census")]
+    pub fn contents_census(&self) -> alloc::vec::Vec<(&'static str, usize, usize)> {
+        use crate::object::Trace;
+        let mut out = alloc::vec::Vec::new();
+        macro_rules! row {
+            ($name:literal, $table:expr) => {{
+                let mut count = 0;
+                let mut bytes = 0;
+                for index in 0..$table.slots() {
+                    if let Some(Some(value)) = $table.slot(index) {
+                        count += 1;
+                        bytes += value.contents_size();
+                    }
+                }
+                out.push(($name, count, bytes));
+            }};
+        }
+        row!("Class", self.classes);
+        row!("String", self.strings);
+        row!("Fn", self.functions);
+        row!("Closure", self.closures);
+        row!("List", self.lists);
+        row!("Map", self.maps);
+        row!("Instance", self.instances);
+        out
+    }
+
     /// Every live handle, table by table.
     ///
     /// **Not a traversal the running VM does.** This exists for the one-off

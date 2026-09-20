@@ -604,6 +604,79 @@ still worth reserving from the manifest -- but they are no longer the larger
 half.
 
 
+#### Sizing the core to the bytecode
+
+The manifest's *other* table is the variable list, and it answers a different
+question from the signature list: which core classes the program can name at
+all. A `List` only ever arrives through its own class -- a literal compiles to
+a load of that module variable -- so a manifest that never says `List` is a
+program that can never hold one, whatever methods it calls. `List`, `Map` and
+`Fiber` go on that test. `Range` is the case that shows why both tables are
+needed: `1..5` names no variable, and its class is owed to the `..(_)` in the
+signature table instead.
+
+[`Vm::with_manifest`] takes both. Against `Vm::with_core_methods`, which sees
+only signatures and so keeps every class, on `fib`:
+
+| | classes | at VM init | after load | peak |
+|---|---|---|---|---|
+| signatures only | 27 | 7,296 B | 8,284 B | 11,464 B |
+| whole manifest | 21 | 6,420 B | 7,408 B | 10,532 B |
+
+Blocks fall from 143 to 124 and the arena's overhead with them, 2,235 B to
+1,894 B -- a second saving that comes free with the first, because fewer
+objects mean fewer of the small blocks the reuse rule rounds up.
+
+**A class a manifest rules out keeps `object_class` in its field** rather than
+becoming an `Option`, which leaves sixty-odd use sites alone. The price is that
+any code comparing a class field against another has to ask `Vm::built` first,
+and one place did not: the built-in-inheritance check tested `superclass`
+against a list holding `list_class`, so with `List` absent that list contained
+`Object` and every user class in the program was refused -- `fib`'s own `Fib`
+included. `a_ruled_out_class_is_not_a_built_in` in `tests/interpret.rs` is that
+case.
+
+Two accounting notes came out of measuring this. `Heap::bytes` undercounts a
+class: a method table is charged at `allocate`, and both `install` and
+`flatten_class_hierarchy` grow it afterwards without telling the heap. The
+per-kind walk in `Heap::contents_census` is the direct measurement and says
+1,472 B against the 1,301 B `bytes` implies. It is the collector's scheduling
+number rather than a footprint, so this is a scheduling bias and not a leak --
+but it biases the wrong way, holding off a collection that the live set has
+already earned.
+
+#### Where the RAM is now, and the case for a core in flash
+
+At VM init, of 6,420 bytes:
+
+| | bytes |
+|---|---|
+| 21 `ObjClass` structs and their method tables | 1,472 |
+| 21 class-name strings | 209 |
+| `Class` and `String` slot tables | 640 |
+| `modules` -- the core namespace | 703 |
+| `method_names`, `primitives` | 412 |
+| the arena's overhead and block records | 2,390 |
+
+**About 2,320 bytes of that is core classes that are the same on every boot**
+-- the same names, the same method tables, decided by a manifest that was
+fixed when the image was built. Nothing about them needs to be in RAM. Freezing
+them into `.rodata` is the largest single lever left, and it is roughly the
+whole of what a CH32V006 is still short by.
+
+What stands in the way is three representation choices, each of which would
+have to grow a borrowed form: `ObjString` owns a `Vec<u8>` where a core class
+name is a `&'static str`; `ObjClass` owns a `Vec<u32>` method table where a
+tailored core's is computable at build time; and an `ObjectId` is an index into
+a heap table, so a static class needs a handle the rest of the VM can use
+without the heap owning it. The collector is the easy part -- a permanently
+live object needs no marking at all.
+
+That suggests doing it in stages rather than at once, cheapest first: static
+name strings (209 B, and the `String` table shrinks with them), then static
+method tables once symbol assignment is done at build time, then the class
+objects themselves. Only the last needs the handle space split.
+
 ### What is left worth building
 
 Nothing from the list that used to stand here: chunked slot tables are built

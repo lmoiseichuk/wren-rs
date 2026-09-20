@@ -105,8 +105,17 @@ fn breakdown(vm: &Vm, baseline: usize) {
     for (_, slots, free, size) in vm.heap.slot_census() {
         occupied += (slots - free) * size;
     }
+    // Live objects per table, so the slot lines below can say how much of the
+    // capacity is actually holding something.
+    let live_slots = vm.heap.slot_census();
     let contents = vm.heap.bytes().saturating_sub(occupied);
     println!("  object contents (strings, method tables) {contents:>8}");
+    for (kind, count, bytes) in vm.heap.contents_census() {
+        if bytes == 0 {
+            continue;
+        }
+        println!("    {kind:<10} {count:>3} objects owning        {bytes:>6}");
+    }
     asked += contents;
 
     // Slot vectors and the bookkeeping sized from them. An empty table costs
@@ -117,7 +126,19 @@ fn breakdown(vm: &Vm, baseline: usize) {
         if table + bookkeeping == 0 {
             continue;
         }
-        println!("  {name:<20} slots {table:>8}  + {bookkeeping} bookkeeping");
+        let held = live_slots
+            .iter()
+            .find(|(kind, ..)| *kind == name)
+            .map(|(_, slots, free, _)| slots - free)
+            .unwrap_or(0);
+        let room = live_slots
+            .iter()
+            .find(|(kind, ..)| *kind == name)
+            .map(|(_, slots, ..)| *slots)
+            .unwrap_or(0);
+        println!(
+            "  {name:<12} slots {table:>6} + {bookkeeping:>3} books   {held} of {room} slots used"
+        );
         slots += table;
         books += bookkeeping;
     }
@@ -125,7 +146,7 @@ fn breakdown(vm: &Vm, baseline: usize) {
 
     println!("-----------------------------------------------------");
     let mut on_the_stack = 0;
-    for (name, bytes) in vm.memory_census() {
+    for (name, bytes, used, room) in vm.memory_census() {
         if bytes == 0 {
             continue;
         }
@@ -133,11 +154,14 @@ fn breakdown(vm: &Vm, baseline: usize) {
         // Real RAM either way and worth seeing, but it must not be added to a
         // total the allocator is going to be asked to confirm.
         if name == "Vm struct" {
-            println!("  {name:<38} {bytes:>10}  (stack, not heap)");
+            println!("  {name:<20} {bytes:>8}                (stack, not heap)");
             on_the_stack = bytes;
             continue;
         }
-        println!("  {name:<38} {bytes:>10}");
+        match room {
+            0 => println!("  {name:<20} {bytes:>8}"),
+            _ => println!("  {name:<20} {bytes:>8}   {used} of {room} used"),
+        }
         asked += bytes;
     }
 
@@ -214,7 +238,7 @@ fn main() -> ! {
     let baseline = ALLOCATOR.stats().0;
     report("before the VM");
 
-    let mut vm = Vm::with_core_methods(&manifest.signatures);
+    let mut vm = Vm::with_manifest(&manifest);
     report("after the VM");
     #[cfg(feature = "census")]
     breakdown(&vm, baseline);

@@ -582,7 +582,36 @@ impl Vm {
     /// for a method outside the list reports it missing, which is the honest
     /// answer and the one a caller can see.
     pub fn with_core_methods(signatures: &[alloc::string::String]) -> Vm {
-        Vm::build(Heap::new(), Some(signatures.to_vec()))
+        Vm::build(Heap::new(), Some(signatures.to_vec()), None)
+    }
+
+    /// A VM tailored to a whole manifest: its methods *and* its variables.
+    ///
+    /// **The variable table says which core classes a program can name**, and
+    /// that is a different question from which methods it calls. A program
+    /// gets a `List` by writing a list literal or `List.new()`, and both
+    /// compile to a load of the `List` module variable -- so a manifest that
+    /// does not name `List` is a program that can never hold one, whatever
+    /// methods it calls. `List`, `Map` and `Fiber` are built only when named.
+    ///
+    /// `Range` is the exception that shows why the two tables are both
+    /// needed: `1..5` names no variable at all, so its class is owed to the
+    /// `..(_)` in the *signature* table.
+    ///
+    /// Knowing both also means every table the VM builds can be sized once
+    /// instead of doubled into -- which matters most on
+    /// [`uheap`](crate::uheap), where the block a doubling leaves behind is
+    /// reused whole and its slack never comes back.
+    ///
+    /// Passing signatures alone through [`Vm::with_core_methods`] keeps every
+    /// class, because a caller that cannot say what the program names is not
+    /// one to guess for.
+    pub fn with_manifest(manifest: &crate::wrenc::Manifest) -> Vm {
+        Vm::build(
+            Heap::new(),
+            Some(manifest.signatures.clone()),
+            Some(manifest.variables.clone()),
+        )
     }
 
     /// A VM over a heap that has already been configured.
@@ -598,10 +627,18 @@ impl Vm {
     /// Everything settable at any time -- the growth factor, the headroom --
     /// is still settable through `vm.heap` after this returns.
     pub fn with_heap(heap: Heap) -> Vm {
-        Vm::build(heap, None)
+        Vm::build(heap, None, None)
     }
 
-    fn build(mut heap: Heap, core_filter: Option<alloc::vec::Vec<alloc::string::String>>) -> Vm {
+    /// `variables` is the manifest's variable table, or `None` when the caller
+    /// could not say -- in which case every core class is built, as it always
+    /// was. Nothing below changes for a `None` in both arguments, which is
+    /// every build that is not tailoring itself to one program.
+    fn build(
+        mut heap: Heap,
+        core_filter: Option<alloc::vec::Vec<alloc::string::String>>,
+        variables: Option<alloc::vec::Vec<alloc::string::String>>,
+    ) -> Vm {
 
         // The classes have to exist before anything can be dispatched on, and
         // they refer to their own names, so the names are allocated first.
@@ -620,19 +657,51 @@ impl Vm {
         let object_class = class_named(&mut heap, "Object", None);
         let root = Some(object_class);
 
+        // **A class a program cannot reach is not built, and its field keeps
+        // `object_class` rather than becoming an `Option`.** Nothing reads
+        // such a field: the only code that would is a method that was not
+        // installed either. That keeps sixty-odd use sites unchanged, and
+        // `Vm::built` is how `core::install` tells the two apart.
+        let maybe_class = |heap: &mut Heap, name: &str, parent, wanted: bool| match wanted {
+            true => class_named(heap, name, parent),
+            false => object_class,
+        };
+
+        // **Whether a program can even name a class.** `None` means the
+        // caller did not say, and then everything is built exactly as before.
+        let named = |class: &str| match &variables {
+            None => true,
+            Some(names) => names.iter().any(|name| name == class),
+        };
+        // Signatures answer the classes a program reaches without naming:
+        // `1..5` makes a `Range` out of an operator, not a variable.
+        let calls = |signature: &str| match &core_filter {
+            None => true,
+            Some(filter) => filter.iter().any(|name| name == signature),
+        };
+
         let num_class = class_named(&mut heap, "Num", root);
         let bool_class = class_named(&mut heap, "Bool", root);
         let null_class = class_named(&mut heap, "Null", root);
+        // `String` stays unconditional: `toString` is in `core::ALWAYS` and
+        // the interpreter itself makes strings, so no manifest can rule it out.
         let string_class = class_named(&mut heap, "String", root);
-        let list_class = class_named(&mut heap, "List", root);
-        let map_class = class_named(&mut heap, "Map", root);
-        let range_class = class_named(&mut heap, "Range", root);
+        // A list or a map only ever arrives through its own class -- a literal
+        // compiles to a load of that variable -- so a manifest that does not
+        // name one is a program that cannot hold one.
+        let reachable_list = named("List");
+        let reachable_map = named("Map");
+        let reachable_range = named("Range") || calls("..(_)") || calls("...(_)");
+        let reachable_fiber = named("Fiber");
         // Reparented below, once `Sequence` exists -- the classes have to be
         // created before it because `class_named` needs somewhere to put the
         // name string first.
         let class_class = class_named(&mut heap, "Class", root);
         let fn_class = class_named(&mut heap, "Fn", root);
-        let fiber_class = class_named(&mut heap, "Fiber", root);
+        let list_class = maybe_class(&mut heap, "List", root, reachable_list);
+        let map_class = maybe_class(&mut heap, "Map", root, reachable_map);
+        let range_class = maybe_class(&mut heap, "Range", root, reachable_range);
+        let fiber_class = maybe_class(&mut heap, "Fiber", root, reachable_fiber);
         let sequence_class = class_named(&mut heap, "Sequence", root);
         let iterable = Some(sequence_class);
 
@@ -648,14 +717,8 @@ impl Vm {
         // `object_class` rather than becoming an `Option`: nothing reads it,
         // because the only code that would is the method that was not
         // installed. That keeps sixty-odd use sites unchanged.
-        let wants = |signature: &str| match &core_filter {
-            None => true,
-            Some(filter) => filter.iter().any(|name| name == signature),
-        };
-        let library_class = |heap: &mut Heap, name: &str, parent, wanted: bool| match wanted {
-            true => class_named(heap, name, parent),
-            false => object_class,
-        };
+        let wants = calls;
+        let library_class = maybe_class;
 
         let map_entry_class =
             library_class(&mut heap, "MapEntry", root, wants("iteratorValue(_)"));
@@ -740,8 +803,13 @@ impl Vm {
             #[cfg(feature = "profile")]
             previous_depth: usize::MAX,
         };
-        // `List`, `Map`, `Range` and `String` are sequences.
+        // `List`, `Map`, `Range` and `String` are sequences -- but only the
+        // ones that were built. An unreachable class is `object_class`, and
+        // reparenting that would put `Sequence` above the root of everything.
         for class in [list_class, map_class, range_class, string_class] {
+            if class == object_class {
+                continue;
+            }
             if let Some(class) = vm.heap.class_mut(class) {
                 class.superclass = Some(sequence_class);
             }
@@ -941,19 +1009,42 @@ impl Vm {
     /// Paired with [`Heap::memory_census`] and `Heap::bytes` it accounts for
     /// everything a `Vm` has asked the allocator for, which is what a fixed
     /// heap's own total can then be checked against.
+    ///
+    /// Each row is `(what, bytes, in use, room for)` -- the last two in
+    /// entries rather than bytes, and zero where the question does not apply.
+    /// **The gap between them is the doubling overshoot**, which on a heap
+    /// that cannot split a reused hole is paid for twice: once in the slack
+    /// itself and again in the block the reallocation left behind.
     #[cfg(feature = "census")]
-    pub fn memory_census(&self) -> alloc::vec::Vec<(&'static str, usize)> {
+    pub fn memory_census(&self) -> alloc::vec::Vec<(&'static str, usize, usize, usize)> {
         use ::core::mem::size_of;
         let mut out = alloc::vec::Vec::new();
 
-        out.push(("Vm struct", size_of::<Vm>()));
-        out.push(("stack", self.stack.capacity() * size_of::<Value>()));
-        out.push(("frames", self.frames.capacity() * size_of::<Frame>()));
+        out.push(("Vm struct", size_of::<Vm>(), 0, 0));
+        out.push((
+            "stack",
+            self.stack.capacity() * size_of::<Value>(),
+            self.stack.len(),
+            self.stack.capacity(),
+        ));
+        out.push((
+            "frames",
+            self.frames.capacity() * size_of::<Frame>(),
+            self.frames.len(),
+            self.frames.capacity(),
+        ));
         out.push((
             "primitives",
             self.primitives.capacity() * size_of::<crate::object::Primitive>(),
+            self.primitives.len(),
+            self.primitives.capacity(),
         ));
-        out.push(("method_names", self.method_names.footprint()));
+        out.push((
+            "method_names",
+            self.method_names.footprint(),
+            self.method_names.len(),
+            self.method_names.capacity(),
+        ));
 
         // Every module carries its own name table and variable vector, and
         // module zero is the core -- which is where the core's classes are
@@ -964,17 +1055,26 @@ impl Vm {
                 + module.names.footprint()
                 + module.values.capacity() * size_of::<Value>();
         }
-        out.push(("modules", modules));
+        out.push((
+            "modules",
+            modules,
+            self.modules[0].values.len(),
+            self.modules[0].values.capacity(),
+        ));
 
         out.push((
             "open_upvalues",
             self.open_upvalues.capacity() * size_of::<ObjectId>(),
+            self.open_upvalues.len(),
+            self.open_upvalues.capacity(),
         ));
         out.push((
             "root_handles",
             self.root_handles.capacity() * size_of::<ObjectId>(),
+            self.root_handles.len(),
+            self.root_handles.capacity(),
         ));
-        out.push(("output", self.output.capacity()));
+        out.push(("output", self.output.capacity(), self.output.len(), self.output.capacity()));
 
         // Read once during `install` and then dead weight for the life of the
         // VM, which is worth seeing rather than assuming.
@@ -985,8 +1085,25 @@ impl Vm {
             }
             None => 0,
         };
-        out.push(("core_filter", filter));
+        let held = match &self.core_filter {
+            Some(names) => names.len(),
+            None => 0,
+        };
+        out.push(("core_filter", filter, held, held));
         out
+    }
+
+    /// Whether a core class was built, or is standing in as `Object`.
+    ///
+    /// **A manifest can rule a class out entirely** -- see
+    /// [`Vm::with_manifest`] -- and then its field holds `object_class`. The
+    /// installers have to ask, because defining `add(_)` on a stand-in would
+    /// define it on `Object`, where every value in the program would answer
+    /// to it. `core::ALWAYS` makes that a live hazard rather than a
+    /// theoretical one: `count` and `iterate(_)` are installed whatever the
+    /// manifest says.
+    pub fn built(&self, class: ObjectId) -> bool {
+        class != self.object_class
     }
 
     /// What `System.print` has written so far.
@@ -3021,7 +3138,15 @@ impl Vm {
             self.range_class,
             self.string_class,
         ];
-        if builtin.contains(&superclass_id) {
+        // **A stand-in is not a built-in.** A class a manifest ruled out holds
+        // `object_class`, so a bare `contains` would match `Object` itself and
+        // refuse every user class in the program -- `Fib` included. `built`
+        // is what separates a class that exists from a field that points at
+        // the root because nothing filled it.
+        if builtin
+            .iter()
+            .any(|&class| self.built(class) && class == superclass_id)
+        {
             let child = self.to_string(name);
             let parent = self.class_name(superclass_id);
             return Err(RuntimeError::new(format!(

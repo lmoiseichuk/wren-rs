@@ -278,7 +278,9 @@ pub fn install(vm: &mut Vm) {
     install_object(vm);
     install_class(vm);
     install_fn(vm);
-    install_fiber(vm);
+    if vm.built(vm.fiber_class) {
+        install_fiber(vm);
+    }
     install_num(vm);
     install_bool(vm);
     install_null(vm);
@@ -291,12 +293,21 @@ pub fn install(vm: &mut Vm) {
     install_num_extras(vm);
     #[cfg(feature = "sequence")]
     install_sequence(vm);
-    install_list(vm);
-    #[cfg(feature = "list_extras")]
-    install_list_extras(vm);
+    // **Skipped entirely when the class was not built.** A manifest that never
+    // names `List` leaves `vm.list_class` standing in as `Object`, and these
+    // would then define `add(_)`, `count` and the rest on the root class.
+    if vm.built(vm.list_class) {
+        install_list(vm);
+        #[cfg(feature = "list_extras")]
+        install_list_extras(vm);
+    }
     #[cfg(feature = "map")]
-    install_map(vm);
-    install_range(vm);
+    if vm.built(vm.map_class) {
+        install_map(vm);
+    }
+    if vm.built(vm.range_class) {
+        install_range(vm);
+    }
     install_system(vm);
     // Last, so that a class which made its own metaclass keeps it.
     install_metaclasses(vm);

@@ -1933,3 +1933,35 @@ fn a_vm_built_from_a_manifest_runs_that_program_and_nothing_else() {
         ),
     }
 }
+
+/// A manifest that never names `List` must still let a program declare a class.
+///
+/// **The regression this guards.** A class a manifest rules out keeps
+/// `object_class` in its field, and the built-in-inheritance check compared
+/// `superclass` against that list directly -- so with `List` absent the check
+/// matched `Object`, and every user class in the program was refused with
+/// "cannot inherit from built-in class 'Object'". `fib` declares one class and
+/// names no list, which is exactly the shape that failed.
+#[test]
+fn a_ruled_out_class_is_not_a_built_in() {
+    use wren::wrenc::Manifest;
+
+    let manifest = Manifest {
+        signatures: ["get(_)", "print(_)", "<(_)", "-(_)", "+(_)"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+        // No `List`, no `Map`, no `Fiber` -- the three a manifest can remove.
+        variables: ["Fib", "System"].iter().map(|name| name.to_string()).collect(),
+        source_digest: [0; 32],
+    };
+
+    let mut vm = wren::Vm::with_manifest(&manifest);
+    assert!(!vm.built(vm.list_class), "List should not have been built");
+
+    let source = "class Fib {\n  static get(n) {\n    if (n < 2) return n\n    return get(n - 1) + get(n - 2)\n  }\n}\nSystem.print(Fib.get(10))\n";
+    match vm.interpret(source) {
+        Ok(()) => assert_eq!(vm.output_str().trim(), "55"),
+        Err(error) => panic!("tailored VM refused a user class: {error:?}"),
+    }
+}

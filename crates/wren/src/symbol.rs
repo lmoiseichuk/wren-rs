@@ -22,6 +22,12 @@ impl SymbolTable {
     /// `"iteratorValue(_)"` is a 16-byte buffer plus the 12 bytes of the
     /// `String` that points at it. Interning 160 of them is the reason a VM
     /// that has run nothing still holds kilobytes.
+    /// How many names this table has room for before it reallocates.
+    #[cfg(feature = "census")]
+    pub fn capacity(&self) -> usize {
+        self.names.capacity()
+    }
+
     #[cfg(feature = "census")]
     pub fn footprint(&self) -> usize {
         self.names.capacity() * core::mem::size_of::<String>()
