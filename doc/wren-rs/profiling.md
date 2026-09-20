@@ -563,6 +563,78 @@ The padding, `seal` and `code_len` are not in the tree.
 
 ---
 
+## A full-Wren pass over the top ten opcodes
+
+Counted with `op-profile` over all four benchmarks, three runs. The counts are
+a property of the bytecode, so the three agreed exactly -- which is worth
+running anyway, because a disagreement would mean the profiler and not the
+program. 10,428,514 instructions in total:
+
+| | opcode | total | share |
+|---|---|---|---|
+| 1 | `Call` | 3,696,226 | 35.44% |
+| 2 | `LoadLocalPair` | 1,030,338 | 9.88% |
+| 3 | `JumpIf` | 1,021,004 | 9.79% |
+| 4 | `LoadLocalConstant` | 948,959 | 9.10% |
+| 5 | `Constant` | 790,317 | 7.58% |
+| 6 | `LoadLocalReturn` | 545,158 | 5.23% |
+| 7 | `Return` | 524,494 | 5.03% |
+| 8 | `LoadFieldThis` | 378,056 | 3.63% |
+| 9 | `LoadLocal` | 281,425 | 2.70% |
+| 10 | `StoreFieldThisPop` | 278,718 | 2.67% |
+
+### What the counter is good for at this size
+
+Two runs of the *same binary* differed by 67 instructions in 426 million --
+one part in six million. That is what makes a 0.3% result meaningful here, and
+it was worth establishing before trusting any of the numbers below.
+
+### What was kept
+
+**The field offset in a local, and the constant pool beside the code.**
+`field_offset` was already on the frame rather than walked out of the heap, but
+every field instruction still reached `self.frames.last()` for it. `constants`
+was reached through the `Rc` and then the `Vec` on a sixth of all instructions.
+Both are now locals in `run_frames`, beside `base`, `module` and `units`.
+
+| | `binary_trees` | `fib` | `list_build` | `method_call` | all four |
+|---|---|---|---|---|---|
+| field offset only | −0.32% | **+1.24%** | −0.07% | −0.96% | +0.44% |
+| constants only | +0.13% | +0.50% | −0.29% | +0.14% | +0.31% |
+| **both** | **−0.81%** | +0.31% | **−0.85%** | **−1.50%** | **−0.30%** |
+
+**Neither is worth having alone, and together they are.** Each on its own is a
+net loss across the four; the pair wins on three of them. `fib` is the one that
+does not improve, and it is the benchmark that touches no field at all -- so it
+pays the register for `field_offset` and gets nothing back. Why adding a second
+hoisted slice then *reduces* `fib`'s regression, from +1.24% to +0.31%, is a
+register-allocation effect and not something the source makes visible.
+
+The lesson is the one this page keeps arriving at from a new direction:
+**the unit of measurement is the combination that ships, not the idea.**
+
+### What was refused, again
+
+Two changes were written, measured, and found to be already in the list below:
+writing a primitive's result into the receiver's slot instead of truncating and
+pushing, and hoisting the `receiver_at` that is computed twice. Both were
+refused by an earlier pass, for reasons recorded here, and both measured as
+losses again -- within a tenth of a per cent of the numbers already written
+down.
+
+That is a good sign for the instrument and a bad use of a day. **Read the
+refused list before optimising, not after.** It is the section immediately
+below this one, and it exists precisely so that a plausible idea does not have
+to be paid for twice.
+
+### What was refused as a no-op
+
+Fetching the field offset through `get` rather than `last().map_or` -- removing
+an `Option` branch that the compiler turns out to have already removed.
+Identical instruction counts, to within the noise floor established above. The
+same shape as the operand-window result further down: *the cost being removed
+had already been removed.*
+
 ## The method cache, built twice and refused
 
 `find_method` was the largest named item in the profile of `fib` -- 7 samples

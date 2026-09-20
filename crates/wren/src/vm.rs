@@ -536,6 +536,29 @@ fn code_units<'a>(chunk: &Rc<Chunk>) -> &'a [u16] {
     unsafe { ::core::slice::from_raw_parts(chunk.code.as_ptr(), chunk.code.len()) }
 }
 
+/// The chunk's constants, on the same terms as [`code_units`].
+///
+/// **Why this is worth a second one.** `Constant` and `LoadLocalConstant` are
+/// a sixth of everything the benchmarks here execute, and each reached the
+/// pool through the `Rc` and then through the `Vec` -- a pointer chase and two
+/// loads before the index. Hoisting the slice beside `units` makes it the same
+/// shape as the code: a pointer and a length already in registers.
+///
+/// # Safety
+///
+/// Identical to [`code_units`], and for the same reasons: `constants` is
+/// written only by `bytecode.rs` during compilation, through `&mut self`, and
+/// a `Chunk` reachable through an `Rc` is immutable in fact -- there is no
+/// `Rc::get_mut`, no `make_mut` and no interior mutability in the crate. The
+/// caller must hold the `Rc` while it reads, which in `run_frames` is `chunk`,
+/// moved in step by `follow_chunk!`.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn chunk_constants<'a>(chunk: &Rc<Chunk>) -> &'a [Value] {
+    // SAFETY: as documented above.
+    unsafe { ::core::slice::from_raw_parts(chunk.constants.as_ptr(), chunk.constants.len()) }
+}
+
 impl Vm {
     /// Record which method symbols name arithmetic on two numbers.
     ///
@@ -2174,11 +2197,21 @@ impl Vm {
             .last()
             .and_then(|frame| self.function_of(frame.closure))
             .map_or(0, |function| function.module);
+        // **And the field offset, for the same reason as `module`.** It was
+        // already on the frame rather than walked out of the heap, but every
+        // `x` and every `x = ...` still reached `self.frames.last()` for it --
+        // a length, a branch and two loads before the field access itself. It
+        // is fixed for as long as a frame runs, so it belongs here with the
+        // others; `field_of` and `set_field` take it as an argument now
+        // instead of fetching it.
+        let mut field_offset = self.current_field_offset();
 
         // The code, in registers rather than re-read every instruction; see
         // `code_units`. Named `units` because `code` is already the module of
         // opcode constants this loop matches on.
         let mut units: &[u16] = code_units(&chunk);
+        // The constant pool, hoisted on the same terms; see `chunk_constants`.
+        let mut constants: &[Value] = chunk_constants(&chunk);
         // **The instruction pointer is a pointer.** As a unit index it cost a
         // shift and an add to turn into an address on every fetch, plus its
         // own increment -- `sll a2, s7, 1`, `add a2, a2, s3`, `add s8, s7, 1`
@@ -2199,6 +2232,7 @@ impl Vm {
             ($next:expr) => {{
                 let next = $next;
                 units = code_units(&next);
+                constants = chunk_constants(&next);
                 start = units.as_ptr();
                 chunk = next;
             }};
@@ -2276,7 +2310,7 @@ impl Vm {
                 code::CONSTANT => {
                     let index = unsafe { *ip } as usize;
                     ip = unsafe { ip.add(1) };
-                    self.stack.push(chunk.constants[index]);
+                    self.stack.push(constants[index]);
                 }
                 code::NULL => self.stack.push(Value::NULL),
                 code::FALSE => self.stack.push(Value::FALSE),
@@ -2298,7 +2332,7 @@ impl Vm {
                     let index = unsafe { *ip.add(1) } as usize;
                     ip = unsafe { ip.add(2) };
                     self.stack.push(self.stack[base + slot]);
-                    self.stack.push(chunk.constants[index]);
+                    self.stack.push(constants[index]);
                 }
                 code::LOAD_LOCAL_PAIR => {
                     let first = Chunk::inline_operand(unit) as usize;
@@ -2317,7 +2351,7 @@ impl Vm {
                     // reads off the stack.
                     let value = self.stack.pop().unwrap_or(Value::NULL);
                     let receiver = self.stack[base];
-                    self.set_field(receiver, base, index, value)?;
+                    self.set_field(receiver, field_offset, index, value)?;
                 }
                 code::STORE_LOCAL => {
                     let slot = Chunk::inline_operand(unit) as usize;
@@ -2397,19 +2431,19 @@ impl Vm {
                 }
                 code::LOAD_FIELD_THIS => {
                     let index = Chunk::inline_operand(unit) as usize;
-                    let value = self.field_of(self.stack[base], base, index)?;
+                    let value = self.field_of(self.stack[base], field_offset, index)?;
                     self.stack.push(value);
                 }
                 code::STORE_FIELD_THIS => {
                     let index = Chunk::inline_operand(unit) as usize;
                     let value = *self.stack.last().unwrap();
                     let receiver = self.stack[base];
-                    self.set_field(receiver, base, index, value)?;
+                    self.set_field(receiver, field_offset, index, value)?;
                 }
                 code::LOAD_FIELD => {
                     let index = Chunk::inline_operand(unit) as usize;
                     let receiver = self.stack.pop().unwrap_or(Value::NULL);
-                    let value = self.field_of(receiver, base, index)?;
+                    let value = self.field_of(receiver, field_offset, index)?;
                     self.stack.push(value);
                 }
                 code::STORE_FIELD => {
@@ -2421,7 +2455,7 @@ impl Vm {
                     // an expression, so the value is what stays.
                     let value = self.stack.pop().unwrap_or(Value::NULL);
                     let receiver = self.stack.pop().unwrap_or(Value::NULL);
-                    self.set_field(receiver, base, index, value)?;
+                    self.set_field(receiver, field_offset, index, value)?;
                     self.stack.push(value);
                 }
                 code::CONSTRUCT => {
@@ -2538,6 +2572,7 @@ impl Vm {
                                 ip = unsafe { start.add(next_ip) };
                                 base = next_base;
                                 module = self.current_module();
+                                field_offset = self.current_field_offset();
                                 continue 'interpret;
                             }
                             None => unreachable!("deliver_error returns or switches"),
@@ -2562,6 +2597,7 @@ impl Vm {
                                 ip = unsafe { start.add(next_ip) };
                                         base = next_base;
                                         module = self.current_module();
+                                        field_offset = self.current_field_offset();
                                         continue 'interpret;
                                     }
                                     None => unreachable!("deliver_error returns or switches"),
@@ -2596,6 +2632,7 @@ impl Vm {
                                 ip = unsafe { start.add(next_ip) };
                                             base = next_base;
                                             module = self.current_module();
+                                            field_offset = self.current_field_offset();
                                             continue 'interpret;
                                         }
                                         None => unreachable!("deliver_error returns or switches"),
@@ -2610,6 +2647,7 @@ impl Vm {
                                 ip = unsafe { start.add(frame.ip) };
                                 base = frame.base;
                                 module = frame.module;
+                                field_offset = frame.field_offset as usize;
                                 continue 'interpret;
                             }
                             self.stack.push(value);
@@ -2647,6 +2685,16 @@ impl Vm {
                                 // dropping it, so nothing is released here.
                                 let next = target.chunk;
                                 units = code_units(&next);
+                                // **Every slice hoisted out of the chunk has
+                                // to move here too.** This is a hand-inlined
+                                // `follow_chunk!` -- it cannot use the macro,
+                                // which drops the old chunk where this one
+                                // hands it back to be parked -- and adding
+                                // `constants` to the macro without adding it
+                                // here read the *callee's* constants against
+                                // the caller's pool, which showed up as
+                                // `fib` calling `+` with a non-number.
+                                constants = chunk_constants(&next);
                                 start = units.as_ptr();
                                 ::core::mem::replace(&mut chunk, next)
                             };
@@ -2665,6 +2713,7 @@ impl Vm {
                             ip = start;
                             base = receiver_at;
                             module = target.module;
+                            field_offset = target.field_offset as usize;
                         }
                     }
                 }
@@ -2717,6 +2766,7 @@ impl Vm {
                             follow_chunk!(self.push_frame(closure, base)?);
                             ip = start;
                             module = self.module_of(closure);
+                            field_offset = self.current_field_offset();
                             continue;
                         }
                         Err(error) => match self.deliver_error(error, offset_of!(ip), chunk.clone())? {
@@ -2726,6 +2776,7 @@ impl Vm {
                                 ip = unsafe { start.add(next_ip) };
                                 base = next_base;
                                 module = self.current_module();
+                                field_offset = self.current_field_offset();
                                 continue;
                             }
                             None => unreachable!("deliver_error returns or switches"),
@@ -2762,7 +2813,7 @@ impl Vm {
                         code::LOAD_FIELD_THIS_RETURN => {
                             let index = Chunk::inline_operand(unit) as usize;
                             ip = unsafe { ip.add(1) };
-                            self.field_of(self.stack[base], base, index)?
+                            self.field_of(self.stack[base], field_offset, index)?
                         }
                         _ => self.stack.pop().unwrap_or(Value::NULL),
                     };
@@ -2811,6 +2862,7 @@ impl Vm {
                             ip = unsafe { start.add(frame.ip) };
                             base = frame.base;
                             module = frame.module;
+                            field_offset = frame.field_offset as usize;
                             continue;
                         }
                         if finished {
@@ -2836,6 +2888,7 @@ impl Vm {
                     ip = unsafe { start.add(frame.ip) };
                     base = frame.base;
                     module = frame.module;
+                    field_offset = frame.field_offset as usize;
                 }
                 code::JUMP => {
                     let offset = unsafe { *ip } as usize;
@@ -3092,8 +3145,14 @@ impl Vm {
     }
 
     /// The field offset the currently running method was bound with.
-    fn field_of(&self, receiver: Value, _base: usize, index: usize) -> Result<Value, RuntimeError> {
-        let offset = self.current_field_offset();
+    /// A field of `receiver`, `offset` being the running frame's field base.
+    ///
+    /// **The offset is passed rather than fetched.** It is fixed for as long
+    /// as a frame runs, and the interpreter already keeps it in a local beside
+    /// `base` and `module` -- reaching back through `self.frames.last()` for
+    /// it cost a length, a branch and two loads on every field access, of
+    /// which the benchmarks here do about three quarters of a million.
+    fn field_of(&self, receiver: Value, offset: usize, index: usize) -> Result<Value, RuntimeError> {
         let Some(id) = receiver.as_object() else {
             return Err(RuntimeError::new(
                 "Cannot access a field outside of a class.",
@@ -3107,14 +3166,14 @@ impl Vm {
         }
     }
 
+    /// Store into a field of `receiver`; see [`Vm::field_of`] on `offset`.
     fn set_field(
         &mut self,
         receiver: Value,
-        _base: usize,
+        offset: usize,
         index: usize,
         value: Value,
     ) -> Result<(), RuntimeError> {
-        let offset = self.current_field_offset();
         let Some(id) = receiver.as_object() else {
             return Err(RuntimeError::new(
                 "Cannot access a field outside of a class.",
