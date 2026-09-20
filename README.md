@@ -86,8 +86,37 @@ What the table says to remove, largest first:
   interpreter's 23,962 B.
 
 That is a route to roughly 55 KB, which fits a CH32V006's flash and leaves
-little for the program — so µwren is a smaller *language*, not a smaller
-build of this one, and it stays a separate deliverable.
+little for the program. Two changes go further, and both are changes to the
+*language* rather than to this build of it — which is what makes µwren a
+separate deliverable rather than a feature flag.
+
+**No floating point at all — 34,654 B, and it is not in the figures above.**
+Those counted `wren`-crate symbols; this is Rust's own `core`, linked because
+Wren has one numeric type and it is an `f64`:
+
+| | bytes |
+|---|---|
+| `dec2flt::POWER_OF_FIVE_128` — one table, for parsing decimals | 10,416 |
+| Dragon and Grisu, shortest and exact formatting | 13,700 |
+| `f64::from_str` | 3,712 |
+| `CACHED_POW10`, `digits_to_dec_str`, the `fmt::float` entry points | 6,826 |
+
+`--features f32` narrows this; it does not remove it, because an `f32` still
+formats and still parses. An integer-only µwren removes all of it — and takes
+the NaN tagging with it, because that representation *is* an `f64` bit
+pattern, so the value type would become a tagged 32-bit word. Between this and
+`Num`'s own 15,008 B, **arithmetic that is not floating point is the single
+largest saving available**, worth more than the whole core library.
+
+**And the compiler already knows what a program uses.** A `.wrenc` names every
+method signature it calls and every class it touches — that is what the symbol
+and variable tables in the file *are*. Emitting that as a manifest beside the
+bytecode would let a firmware build link only the core it needs: `core::install`
+is 9,306 B of signature strings and one binding call per method, and it shrinks
+in exact proportion to what the manifest asks for. A program that never sorts a
+list does not need `Sequence`; one that never interpolates does not need most of
+`String`; and neither has to be decided by hand or by a cargo feature, because
+the program already said.
 
 What *does* transfer to a small part today, because it was built for one:
 
@@ -219,56 +248,6 @@ the peak but the live set, the field chunks and the tables' high-water mark, so
 there is nothing left to squeeze. And 32 KB is *looser* than 1.5× of this live
 set, which is why it is both slightly faster and slightly larger.
 
-## The plan
-
-Six steps, each producing something checkable.
-
-**1 — the reference on the board.** Upstream Wren, unmodified, on the ESP32-C6,
-flashable and talking over a TTY. This is not the deliverable; it is the
-*control*.
-
-What it controls for is worth stating plainly, because it is the actual question
-this project asks: **the delta between C written by people over years and Rust
-written by a language model in an afternoon.** Wren's C is careful, tuned and
-mature. If the Rust comes out larger and slower, that is the honest result and
-the interesting one — it says where the gap is. If it comes out competitive, that
-is only meaningful because the same benchmark ran on the same board against the
-same reference.
-
-Upstream is a git submodule at `vendor/wren`, pinned and **never modified**.
-
-**2 — MicroPython as the baseline.** Flash it on the same board and measure
-start-up time, a benchmark set, and steady-state RAM. MicroPython is the thing
-people actually reach for on these parts, so it is the number worth beating —
-or worth honestly losing to, in which case that is the finding.
-
-**3 — the Rust VM.** Re-implement: lexer, compiler, bytecode VM, GC. `no_std`,
-allocator-pluggable, feature-gated so a part with 8 KB can leave out what it
-cannot afford. Host-tested throughout; the board is where it is confirmed, not
-where it is developed.
-
-**4 — bytecode.** Compile ahead of time on a host and ship the bytecode, so a
-constrained part never carries the compiler. This is what makes CH32-class
-targets possible at all.
-
-**5 — measure.** Size, speed and memory against both step 1 and step 2, on real
-hardware. Publish the deltas.
-
-**6 — speculative: a hot-spot VM.** Translate hot bytecode chunks to native
-RISC-V. Interesting, unproven, and explicitly last — it only makes sense once
-there is something whose hot paths are worth finding.
-
-## Why the order
-
-Steps 1 and 2 produce no Rust and are tempting to skip. They are first because
-**a performance claim without a baseline is not a claim.** "Faster than
-MicroPython" means nothing until MicroPython has been run on this board, with
-these benchmarks, and written down.
-
-Step 4 before step 6 for the same reason: shipping bytecode is a large, certain
-win in flash and RAM, and a JIT is a speculative win in speed. Do the certain
-one first.
-
 ## Layout
 
 ```
@@ -279,11 +258,11 @@ doc/examples/   a worked node in Wren, and the bytecode built from it
 doc/wren/       what upstream Wren and MicroPython measured
 doc/wren-rs/    why the Rust implementation is built the way it is
 ports/          one directory per (board, implementation) pair
-  esp32c6-wren/          step 1, the C reference
-  esp32c6-micropython/   step 2, the baseline
-  esp32c6-wren-rs/       step 3, the deliverable
-  esp32c6-wrenc-rs/      step 4, the same benchmarks with no compiler linked
-  esp32c6-wren-boot/     step 4, a node that looks for boot and main
+  esp32c6-wren/          the C reference
+  esp32c6-micropython/   the baseline
+  esp32c6-wren-rs/       the deliverable
+  esp32c6-wrenc-rs/      the same benchmarks with no compiler linked
+  esp32c6-wren-boot/     a node that looks for boot and main
 ```
 
 **`crates/wren` is a standalone package**, and the workspace root carries no
@@ -299,22 +278,22 @@ one has to provide.
 | | |
 |---|---|
 | upstream submodule | pinned at 0.4.0 |
-| **step 1 — C reference on the C6** | **done, measured** |
-| **step 2 — MicroPython baseline** | **done, measured** |
-| **step 3 — the Rust VM** | **the language is complete** |
+| **the C reference on the C6** | **measured** |
+| **the MicroPython baseline** | **measured** |
+| **the Rust VM** | **the language is complete** |
 | — upstream's test suite | **829 of 829** |
 | — conformance probes | **96 of 96** |
 | — this crate's own tests | 193 |
-| **step 4 — bytecode** | **done, measured** |
+| **shipping bytecode** | **measured** |
 | — the suite, run from `.wrenc` | **829 of 829** |
 | — the suite in an `f32` build | 798 of 829 — *not Wren, and off by default* |
 
-### Step 3: the language is complete
+### The language is complete
 
 `crates/wren` passes **all 829** of upstream Wren's own tests — every group,
 including `core`, `language`, `limit`, `meta`, `random` and `regression` — run
 unmodified and scored against the `// expect:` comments they already carry.
-That is the same contract the C port was held to in step 1, where upstream
+That is the same contract the C port was held to, where upstream
 itself scored 821 of 846 on an ESP32-C6.
 
 Everything the language has: classes with constructors, fields, inheritance,
@@ -396,7 +375,7 @@ chip's performance counter, whose event numbers are in no header here and were
 found by experiment — which then said the interpreter spends two cycles in
 three retiring nothing.
 
-### Step 4 measured: shipping bytecode
+### Shipping bytecode, measured
 
 `.wren` is compiled on a workstation to `.wrenc` and the device is handed that,
 so the lexer and the parser are never linked. The format carries a SHA-256 of
@@ -438,7 +417,7 @@ built twice** so the only difference between the two images is that feature.
 Details and the programs themselves:
 **[`ports/esp32c6-wren-boot/README.md`](ports/esp32c6-wren-boot/README.md)**.
 
-### Steps 1 and 2: the numbers to beat
+### The numbers to beat
 
 Upstream Wren 0.4.0 runs on an ESP32-C6 and passes **821 of 846** of its own
 language tests there (97.0%). It was then measured against MicroPython 1.29.0
@@ -461,7 +440,7 @@ and paying for it in heap. The image comparison is against a stock
 `ESP32_GENERIC_C6` carrying networking and TLS, so it flatters Wren; the heap
 and speed figures are like for like.
 
-### What step 1 established about the small parts
+### What the C reference established about the small parts
 
 Four findings the Rust implementation inherits as requirements — see
 [`ports/esp32c6-wren`](ports/esp32c6-wren) for the detail.
@@ -475,7 +454,7 @@ Four findings the Rust implementation inherits as requirements — see
 
 **Two of them bear on whether the small parts are reachable at all.** The
 compiler needs 33 KB of stack, which is four times a CH32V006's entire RAM — the
-strongest argument yet for step 4, where bytecode is built on a host so the part
+strongest argument yet for building bytecode on a host, so the part
 never carries a compiler. And upstream's default garbage-collector thresholds
 (10 MB before the first collection) mean that **out of the box it crashes on
 this class of part**, with a null store rather than a diagnostic.
