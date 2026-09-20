@@ -3489,9 +3489,9 @@ impl Vm {
             Some(class) => class.num_fields.max(0) as usize,
             _ => return Err(RuntimeError::new("Not a class.")),
         };
-        let id = self
-            .heap
-            .new_instance(class_id, &alloc::vec![Value::NULL; fields]);
+        // No vector of nulls built and freed per object; see
+        // `Heap::new_blank_instance`.
+        let id = self.heap.new_blank_instance(class_id, fields);
         Ok(Value::object(id))
     }
 }

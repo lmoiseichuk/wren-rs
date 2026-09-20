@@ -1073,8 +1073,31 @@ impl Heap {
         self.allocate(Object::Instance(ObjInstance::new(class, at, fields.len())))
     }
 
+    /// An instance whose fields all start null.
+    ///
+    /// **Which is every instance a `construct` makes.** Going through
+    /// [`Heap::new_instance`] meant building a vector of nulls, handing it
+    /// over to be copied into a chunk, and freeing it again -- a heap
+    /// allocation and a free per object, on the one path whose whole job is
+    /// making objects. A chunk's spare room is filled in place instead.
+    ///
+    /// A reused chunk can hold anything the last owner left, so the range is
+    /// written rather than assumed; a fresh one is already null and writing it
+    /// twice is cheaper than remembering which it was.
+    pub fn new_blank_instance(&mut self, class: ObjectId, fields: usize) -> ObjectId {
+        let (chunk, offset) = self.reserve_fields(fields);
+        self.chunks[chunk][offset..offset + fields].fill(Value::NULL);
+        let at = (chunk << FIELD_OFFSET_BITS) | offset;
+        self.allocate(Object::Instance(ObjInstance::new(class, at, fields)))
+    }
+
     /// Put a run of fields in a chunk and say where it went.
-    fn place_fields(&mut self, fields: &[Value]) -> usize {
+    /// Find room for `count` fields and say where it is, without writing them.
+    ///
+    /// Split out of `place_fields` so that a fresh instance -- whose fields
+    /// are all null -- can have them written in place rather than copied in
+    /// from a vector built to hold nulls. See [`Heap::new_blank_instance`].
+    fn reserve_fields(&mut self, count: usize) -> (usize, usize) {
         let room = match self.chunks.last() {
             Some(chunk) => chunk.len().saturating_sub(self.chunk_used),
             None => 0,
@@ -1082,8 +1105,8 @@ impl Heap {
         // **`is_empty` as well as `room`**, because an instance with no fields
         // asks for nothing and would otherwise index a chunk that is not there.
         // A class with no fields is ordinary Wren.
-        if self.chunks.is_empty() || room < fields.len() {
-            let wanted = field_chunk_size(self.chunks.len()).max(fields.len());
+        if self.chunks.is_empty() || room < count {
+            let wanted = field_chunk_size(self.chunks.len()).max(count);
             let chunk = match self.spare_chunks.pop() {
                 Some(chunk) if chunk.len() >= wanted => chunk,
                 other => {
@@ -1098,8 +1121,13 @@ impl Heap {
         }
         let chunk = self.chunks.len() - 1;
         let offset = self.chunk_used;
+        self.chunk_used += count;
+        (chunk, offset)
+    }
+
+    fn place_fields(&mut self, fields: &[Value]) -> usize {
+        let (chunk, offset) = self.reserve_fields(fields.len());
         self.chunks[chunk][offset..offset + fields.len()].copy_from_slice(fields);
-        self.chunk_used += fields.len();
         (chunk << FIELD_OFFSET_BITS) | offset
     }
 
