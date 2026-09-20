@@ -53,6 +53,27 @@ use crate::value::{Num, Value};
 use crate::vm::{RuntimeError, Switch, Vm};
 
 /// Bind a primitive to a signature on a class.
+/// Give a class its metaclass, and hand the metaclass back.
+///
+/// **The same ten lines stood in eleven places.** A metaclass is a class whose
+/// superclass is `Class` and whose name is the class's own with " metaclass"
+/// after it; making one is two allocations and a field write, and only the
+/// name differed between the copies.
+///
+/// `System` is the one that does not use this: it builds its metaclass first
+/// and its class afterwards, so there is no class to attach to yet.
+fn new_metaclass(vm: &mut Vm, class: ObjectId, name: &str) -> ObjectId {
+    let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text(name)));
+    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+        metaclass_name,
+        Some(vm.class_class),
+    ))));
+    if let Some(class) = vm.heap.class_mut(class) {
+        class.metaclass = Some(metaclass);
+    }
+    metaclass
+}
+
 fn define(vm: &mut Vm, class: ObjectId, signature: &str, function: Primitive) {
     let symbol = vm.method_names.ensure(signature);
     vm.bind_primitive(class, symbol, function);
@@ -220,16 +241,7 @@ fn install_object(vm: &mut Vm) {
 
     // `Object.same(a, b)` is identity, ignoring any `==` a class defines --
     // which is the point of having it.
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("Object metaclass")));
-    let object_metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(object) = vm.heap.class_mut(class) {
-        object.metaclass = Some(object_metaclass);
-    }
+    let object_metaclass = new_metaclass(vm, class, "Object metaclass");
     define(vm, object_metaclass, "same(_,_)", |vm, at| {
         // **Value types compare by value**, so `Object.same(1..2, 1..2)` is
         // true even though they are two objects. What `same` ignores is any
@@ -306,16 +318,7 @@ fn install_class(vm: &mut Vm) {
 fn install_fn(vm: &mut Vm) {
     let class = vm.fn_class;
 
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("Fn metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(function) = vm.heap.class_mut(class) {
-        function.metaclass = Some(metaclass);
-    }
+    let metaclass = new_metaclass(vm, class, "Fn metaclass");
 
     // `Fn.new { ... }` -- the block is already a function, so this hands it
     // back. It exists because that is how a function literal is written in
@@ -374,16 +377,7 @@ fn signature_for(name: &str, arity: usize) -> alloc::string::String {
 fn install_fiber(vm: &mut Vm) {
     let class = vm.fiber_class;
 
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("Fiber metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(fiber) = vm.heap.class_mut(class) {
-        fiber.metaclass = Some(metaclass);
-    }
+    let metaclass = new_metaclass(vm, class, "Fiber metaclass");
 
     define(vm, metaclass, "new(_)", |vm, at| {
         let function = argument(vm, at, 1);
@@ -894,16 +888,7 @@ fn install_num_extras(vm: &mut Vm) {
         });
     }
 
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("Num metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(num) = vm.heap.class_mut(class) {
-        num.metaclass = Some(metaclass);
-    }
+    let metaclass = new_metaclass(vm, class, "Num metaclass");
     define(vm, metaclass, "fromString(_)", |vm, at| {
         let text = string_argument(vm, at, 1)?;
         let trimmed = text.trim();
@@ -1183,16 +1168,7 @@ fn install_string_extras(vm: &mut Vm) {
         compare_strings(vm, at, |o| o >= 0)
     });
 
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("String metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(string) = vm.heap.class_mut(class) {
-        string.metaclass = Some(metaclass);
-    }
+    let metaclass = new_metaclass(vm, class, "String metaclass");
     define(vm, metaclass, "fromCodePoint(_)", |vm, at| {
         let point = integer_argument(vm, at, 1, "Code point")?;
         if point < 0.0 {
@@ -1783,16 +1759,7 @@ fn install_list(vm: &mut Vm) {
     // `List` has to be reachable by name, because a list literal compiles to
     // `List.new` followed by an `addCore(_)` per element rather than to an
     // opcode of its own.
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("List metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(list) = vm.heap.class_mut(class) {
-        list.metaclass = Some(metaclass);
-    }
+    let metaclass = new_metaclass(vm, class, "List metaclass");
     define(vm, metaclass, "new()", |vm, _| Ok(new_list(vm, Vec::new())));
     vm.modules[0].define("List", Value::object(class));
 
@@ -2188,16 +2155,7 @@ fn resolve_index(index: Num, length: usize) -> Result<usize, RuntimeError> {
 fn install_map(vm: &mut Vm) {
     let class = vm.map_class;
 
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("Map metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(map) = vm.heap.class_mut(class) {
-        map.metaclass = Some(metaclass);
-    }
+    let metaclass = new_metaclass(vm, class, "Map metaclass");
     define(vm, metaclass, "new()", |vm, _| {
         let id = vm.heap.allocate(Object::Map(ObjMap::new()));
         Ok(Value::object(id))
@@ -2386,16 +2344,7 @@ fn install_map(vm: &mut Vm) {
 
     // `MapEntry` itself: two fields, reachable by name.
     let entry_class = vm.map_entry_class;
-    let entry_metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("MapEntry metaclass")));
-    let entry_metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        entry_metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(entry) = vm.heap.class_mut(entry_class) {
-        entry.metaclass = Some(entry_metaclass);
-    }
+    let entry_metaclass = new_metaclass(vm, entry_class, "MapEntry metaclass");
     define(vm, entry_metaclass, "new(_,_)", |vm, at| {
         let key = argument(vm, at, 1);
         let value = argument(vm, at, 2);
@@ -3000,16 +2949,7 @@ pub fn install_meta(vm: &mut Vm) -> usize {
         Some(vm.object_class),
     ))));
 
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("Meta metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
-    if let Some(meta) = vm.heap.class_mut(class) {
-        meta.metaclass = Some(metaclass);
-    }
+    let metaclass = new_metaclass(vm, class, "Meta metaclass");
 
     define(vm, metaclass, "getModuleVariables(_)", |vm, at| {
         let value = argument(vm, at, 1);
@@ -3106,15 +3046,8 @@ pub fn install_random(vm: &mut Vm) -> usize {
         Some(vm.object_class),
     ))));
 
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("Random metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
+    let metaclass = new_metaclass(vm, class, "Random metaclass");
     if let Some(random) = vm.heap.class_mut(class) {
-        random.metaclass = Some(metaclass);
         // **Eight fields, not four.** The generator's state is four `u32`
         // words, and a `Num` only holds one exactly when it is a double: an
         // `f32` has a 24-bit mantissa, so storing a word per field would
