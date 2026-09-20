@@ -118,6 +118,22 @@ const BENCHMARKS: &[(&str, &str, u32)] = &[
     ("method_call", include_str!("../../../benchmarks/wren/method_call.wren"), 10),
 ];
 
+/// Run only the benchmarks named here, comma separated.
+///
+/// **For the optimisation loop, not for a published figure.** Trying six
+/// variants of one interpreter arm against `method_call` is a twenty-second
+/// round trip; the whole set is a minute and a half of it is `fib`. Unset
+/// runs everything, which is what a number that goes in a table needs.
+const ONLY: Option<&str> = option_env!("WREN_ONLY");
+
+/// Whether this benchmark is one of the ones asked for.
+fn selected(name: &str) -> bool {
+    match ONLY {
+        None => true,
+        Some(list) => list.split(',').any(|wanted| wanted.trim() == name),
+    }
+}
+
 /// Override every repeat count, for a quick iteration.
 ///
 /// The full set at the counts above is minutes per flash, which is right for
@@ -153,6 +169,9 @@ fn main() -> ! {
     println!();
 
     for (name, source, repeats) in BENCHMARKS {
+        if !selected(name) {
+            continue;
+        }
         run_one(name, source, REPEAT_OVERRIDE.unwrap_or(*repeats).max(1));
     }
 

@@ -8,6 +8,7 @@
 #   tools/measure-rs.sh speed --bin counters   # a different binary in the port
 #   tools/measure-rs.sh speed --slot-block 256 # blocked slot tables, this size
 #   tools/measure-rs.sh speed --features f32   # any cargo feature of the port
+#   tools/measure-rs.sh --only method_call     # one benchmark, for a fast loop
 #
 # **Why this exists rather than `cargo run`.** The port's cargo runner is
 # `espflash flash --monitor`, which never exits: it flashes, prints, and then
@@ -43,6 +44,7 @@ while (( $# )); do
         --bin) BIN="${2:-}"; shift ;;
         --features) FEATURES="${2:-}"; shift ;;
         --slot-block) SLOT_BLOCK="${2:-}"; shift ;;
+        --only) export WREN_ONLY="${2:-}"; shift ;;
         --log) LOG="${2:-}"; shift ;;
         --board) BOARD="${2:-}"; shift ;;
         -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
