@@ -1905,7 +1905,7 @@ impl Vm {
                 let here = Rc::as_ptr(&chunk) as usize;
                 let depth = self.frames.len();
                 if self.previous_op != u16::MAX
-                    && self.previous_end == at
+                    && self.previous_end == offset_of!(at)
                     && self.previous_chunk == here
                     && self.previous_depth == depth
                 {
@@ -2149,7 +2149,7 @@ impl Vm {
                             .or_insert(0) += 1;
                         let site = self
                             .call_sites
-                            .entry((Rc::as_ptr(&chunk) as usize, at))
+                            .entry((Rc::as_ptr(&chunk) as usize, offset_of!(at)))
                             .or_insert_with(|| (alloc::vec::Vec::new(), 0));
                         site.1 += 1;
                         if !site.0.contains(&start_from.raw()) {
