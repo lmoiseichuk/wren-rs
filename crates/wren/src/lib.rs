@@ -100,6 +100,7 @@ pub mod compiler;
 #[cfg(feature = "alloc")]
 pub mod core;
 #[cfg(feature = "alloc")]
+pub mod frozen;
 pub mod heap;
 #[cfg(feature = "alloc")]
 pub mod object;

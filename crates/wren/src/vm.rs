@@ -630,19 +630,76 @@ impl Vm {
         Vm::build(heap, None, None)
     }
 
+    /// A VM whose core library is already in the image.
+    ///
+    /// **The manifest is still required, and must be the one the core was
+    /// generated from.** `core::install` still runs -- it interns the
+    /// signatures and pushes the primitives the frozen method tables index
+    /// into -- and it has to make the same `define` calls in the same order,
+    /// which is what the manifest decides. A mismatch is not a crash but a
+    /// silently wrong dispatch, so check
+    /// [`FrozenCore::disagreement`](crate::frozen::FrozenCore::disagreement)
+    /// against `vm.method_names` where the cost is affordable.
+    ///
+    /// See [`crate::frozen`] for what this saves and what it does not.
+    pub fn with_frozen_core(
+        core: &'static crate::frozen::FrozenCore,
+        manifest: &crate::wrenc::Manifest,
+    ) -> Vm {
+        Vm::build_frozen(
+            Heap::new(),
+            Some(manifest.signatures.clone()),
+            Some(manifest.variables.clone()),
+            Some(core),
+        )
+    }
+
     /// `variables` is the manifest's variable table, or `None` when the caller
     /// could not say -- in which case every core class is built, as it always
     /// was. Nothing below changes for a `None` in both arguments, which is
     /// every build that is not tailoring itself to one program.
     fn build(
-        mut heap: Heap,
+        heap: Heap,
         core_filter: Option<alloc::vec::Vec<alloc::string::String>>,
         variables: Option<alloc::vec::Vec<alloc::string::String>>,
     ) -> Vm {
+        Vm::build_frozen(heap, core_filter, variables, None)
+    }
+
+    fn build_frozen(
+        mut heap: Heap,
+        core_filter: Option<alloc::vec::Vec<alloc::string::String>>,
+        variables: Option<alloc::vec::Vec<alloc::string::String>>,
+        frozen: Option<&'static crate::frozen::FrozenCore>,
+    ) -> Vm {
+        // **Seeded before anything else asks the heap for a handle.** The
+        // generated tables name classes and strings by index, so those indices
+        // have to be the first the heap gives out -- `class_names[i]` becomes
+        // string `i` and `classes[i]` becomes class `i`, exactly as the
+        // generator saw them.
+        if let Some(core) = frozen {
+            for name in core.class_names {
+                heap.allocate(Object::String(crate::object::ObjString::from_text(name)));
+            }
+            for class in core.classes {
+                heap.adopt_class(class);
+            }
+        }
+        // Handed out in creation order by the two helpers below, which is the
+        // order the generator recorded because it ran this same function.
+        let taken = ::core::cell::Cell::new(0u32);
+
 
         // The classes have to exist before anything can be dispatched on, and
         // they refer to their own names, so the names are allocated first.
         let class_named = |heap: &mut Heap, name: &str, superclass: Option<ObjectId>| {
+            // Already in the image, and already seeded above: take the next
+            // one rather than building a second copy of it.
+            if frozen.is_some() {
+                let index = taken.get();
+                taken.set(index + 1);
+                return ObjectId::tagged(crate::object::ObjectType::Class.tag(), index);
+            }
             let name = heap.allocate(Object::String(ObjString::from_text(name)));
             heap.allocate(Object::Class(alloc::boxed::Box::new(
                 crate::object::ObjClass::new(name, superclass),

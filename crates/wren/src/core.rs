@@ -130,6 +130,14 @@ fn trim_set(vm: &mut Vm, at: usize, start: bool, end: bool) -> Result<Value, Run
 }
 
 fn new_metaclass(vm: &mut Vm, class: ObjectId, name: &str) -> ObjectId {
+    // **A class in the image already has one.** Building another would
+    // allocate a class nothing can reach and, worse, shift every class and
+    // string handle the frozen tables were generated against.
+    if vm.heap.class_is_static(class) {
+        if let Some(metaclass) = vm.heap.class(class).and_then(|class| class.metaclass) {
+            return metaclass;
+        }
+    }
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text(name)));
     let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
         metaclass_name,

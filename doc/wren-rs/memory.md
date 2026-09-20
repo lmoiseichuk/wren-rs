@@ -728,6 +728,81 @@ the step is a host-side pass that takes a `.wrenc`, builds the tailored VM it
 implies, and emits the resulting symbol table and class table as a Rust module
 the firmware includes instead of running `install`.
 
+#### The generator, and a core that is actually in flash
+
+`cargo run --example freeze -- <program>.wrenc` builds the VM that program's
+manifest implies and writes the finished state out as Rust: every class, its
+method table already flattened, and every method symbol. The firmware compiles
+that in and adopts it. `crates/wren/tests/generated/fib_core.rs` is the result
+for `fib`, and `ports/esp32c6-wrenc-rs/src/bin/fib_core.rs` is the same thing
+for the firmware's feature set.
+
+Why a generator rather than a `const fn`: a method table is indexed by symbol,
+and symbols are numbered by the order `core::install` interns them. That is a
+property of running the installer, so the honest way to get it is to run it and
+write down what happened.
+
+On `fib`, on the part:
+
+| | manifest-tailored | frozen core |
+|---|---|---|
+| classes in flash | 0 of 21 | **21 of 23** |
+| the VM's own asks | 3,120 B | **2,114 B** |
+| class contents | 1,472 B | 160 B |
+| at VM init | 6,660 B | **5,016 B** |
+| peak | 10,772 B | **9,160 B** |
+| blocks | 124 | 86 |
+
+`install` still runs, and has to: it interns the signatures, pushes the
+primitives the frozen entries index into, and defines the module variables.
+What it no longer does is build classes -- every `define` into a frozen one is
+a no-op because `Heap::class_mut` refuses it. That is not a special mode.
+`bind_primitive` pushes the primitive *before* it looks the class up, so the
+numbering is identical either way, which is exactly what makes a generated
+table valid against a primitive table built at run time.
+
+##### The failure this has, and the check that catches it
+
+A frozen method entry holds a primitive *index*, and those are positions in the
+sequence of `define` calls -- which the cargo features decide. A core generated
+with `core_full` on and compiled into a build with it off indexes the wrong
+primitive for every method, and nothing about that looks like an error.
+
+It happened here on the first device run: the generated core came from a
+default-features host build with 49 primitives, the firmware registers 31, and
+`fib` died with "Range does not implement 'iterate(_)'". **The symbol table did
+not move** -- the manifest decides which signatures are interned either way --
+so comparing symbols reported agreement. `FrozenCore::primitives` is what
+catches it, and `disagreement` checks that first. The generated file records
+the feature set it was made with, in its header.
+
+So there are two generated cores, deliberately: the test's is default-features,
+the firmware's is `uwren`. They are different files because they are different
+builds, and each is checked against the one it is compiled with.
+
+##### Testing it without a board
+
+`cargo test --test frozen` runs five checks on the host in about a tenth of a
+second: the core agrees with the build, a frozen VM runs `fib`, it agrees with
+a RAM-built VM line for line, every frozen class is addressable and refuses
+mutation, and the heap is not charged for any of it. A flash-and-watch cycle on
+the part is the better part of a minute, and the interesting failures here are
+ones a device reports only as a wrong answer.
+
+##### What is left of the core
+
+Two classes are still built in RAM: `System` and its metaclass, because
+`install_system` allocates them directly rather than through the class helper
+the cursor counts. That is 104 B of struct and 56 B of method table.
+
+The class names are still heap strings -- 231 B -- because `ObjString` owns its
+bytes. Giving it a borrowed form is the same change `Methods` and `ClassRef`
+already made twice, and the `String` slot table would shrink with it.
+
+And the arena's overhead is now the largest single item at 1,804 B of the
+5,016: with the classes gone it is no longer competing with anything. Splitting
+a reused hole rather than handing it over whole is the next real lever.
+
 ### What is left worth building
 
 Nothing from the list that used to stand here: chunked slot tables are built

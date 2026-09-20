@@ -24,6 +24,17 @@ use wren::Vm;
 #[path = "../appdesc.rs"]
 mod appdesc;
 
+// **The core library, compiled into the image rather than built in RAM.**
+// Generated from the same `.wrenc` this program runs:
+//
+//     cargo run --example freeze -- benchmarks/wrenc/fib.wrenc \
+//         > ports/esp32c6-wrenc-rs/src/bin/fib_core.rs
+//
+// Together with the bytecode below, that puts the whole program -- classes,
+// method tables, names and code -- in flash, leaving RAM for what it computes.
+#[path = "fib_core.rs"]
+mod fib_core;
+
 /// The whole heap this program gets -- there is no other allocator, so this is
 /// the RAM figure a board has to meet. `fib` peaks at 11,464 bytes of it (run
 /// the program and read the `peak` column), so 16 KiB is the smallest round
@@ -114,7 +125,7 @@ fn breakdown(vm: &Vm, baseline: usize) {
         if bytes == 0 {
             continue;
         }
-        println!("    {kind:<10} {count:>3} objects owning        {bytes:>6}");
+        println!("    {kind:<18} {count:>3} x            {bytes:>6}");
     }
     asked += contents;
 
@@ -238,7 +249,14 @@ fn main() -> ! {
     let baseline = ALLOCATOR.stats().0;
     report("before the VM");
 
-    let mut vm = Vm::with_manifest(&manifest);
+    let mut vm = Vm::with_frozen_core(&fib_core::CORE, &manifest);
+    // **A stale generated core dispatches to the wrong method and says
+    // nothing**, so the one check worth its bytes is that its symbols are the
+    // ones this build interns. See `FrozenCore::disagreement`.
+    if let Some(why) = fib_core::CORE.disagreement(&vm.method_names, vm.primitives.len()) {
+        println!("frozen core : STALE -- {why}");
+        loop {}
+    }
     report("after the VM");
     #[cfg(feature = "census")]
     breakdown(&vm, baseline);

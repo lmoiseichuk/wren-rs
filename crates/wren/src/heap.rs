@@ -897,6 +897,21 @@ impl Heap {
         ObjectId::tagged(ObjectType::Class.tag(), index)
     }
 
+    /// Whether this class lives in the image rather than the heap.
+    ///
+    /// Distinct from `class_mut(id).is_none()`, which is also true of a stale
+    /// or wrong-typed handle -- callers that must tell "frozen" from "gone"
+    /// need this one.
+    pub fn class_is_static(&self, id: ObjectId) -> bool {
+        match id.tag() == ObjectType::Class.tag() {
+            true => self
+                .classes
+                .get(id.index())
+                .is_some_and(crate::object::ClassRef::is_static),
+            false => false,
+        }
+    }
+
     /// Look up an object of a known type.
     ///
     /// **This is the API the VM uses.** Almost every access already knows what
@@ -1725,13 +1740,21 @@ impl Heap {
             let mut methods = 0;
             let mut statics = 0;
             let mut structs = 0;
+            let mut frozen = 0;
             for index in 0..self.classes.slots() {
                 if let Some(Some(class)) = self.classes.slot(index) {
+                    // A class in the image costs none of this; counting it
+                    // would report memory the heap does not hold.
+                    if class.is_static() {
+                        frozen += 1;
+                        continue;
+                    }
                     structs += core::mem::size_of::<ObjClass>();
                     methods += class.methods.footprint();
                     statics += class.static_fields.capacity() * core::mem::size_of::<Value>();
                 }
             }
+            out.push((" of which in flash", 0, frozen));
             out.push((" of which struct", core::mem::size_of::<ObjClass>(), structs));
             out.push((" of which methods", 0, methods));
             out.push((" of which statics", 0, statics));
