@@ -1808,7 +1808,7 @@ impl Vm {
     // in `code_units`. The audit is `grep -rn unsafe crates/wren/src`.
     #[allow(unsafe_code)]
     fn run_frames(&mut self, mut chunk: Rc<Chunk>, floor: usize) -> Result<Value, RuntimeError> {
-        let mut ip = self.frames.last().map_or(0, |frame| frame.ip);
+        let resume_at = self.frames.last().map_or(0, |frame| frame.ip);
         let mut base = self.frames.last().map_or(0, |frame| frame.base);
         // Cached with `ip` and `base` for the same reason: module variable
         // access would otherwise reach through the frame to the closure to the
@@ -1823,6 +1823,19 @@ impl Vm {
         // `code_units`. Named `units` because `code` is already the module of
         // opcode constants this loop matches on.
         let mut units: &[u16] = code_units(&chunk);
+        // **The instruction pointer is a pointer.** As a unit index it cost a
+        // shift and an add to turn into an address on every fetch, plus its
+        // own increment -- `sll a2, s7, 1`, `add a2, a2, s3`, `add s8, s7, 1`
+        // in the shipping build. As a pointer the fetch is one `lhu` and the
+        // advance is one `addi`.
+        //
+        // Everything that wants an *offset* -- parking a frame, reporting a
+        // line, delivering an error -- is cold and recovers it with
+        // `offset_of!`. Every jump is relative, so none of them need the base.
+        let mut start: *const u16 = units.as_ptr();
+        // SAFETY: `resume_at` is an offset into this chunk, taken from the
+        // frame that parked it.
+        let mut ip: *const u16 = unsafe { start.add(resume_at) };
         // Declared after `units`: a `macro_rules!` body resolves a name it does
         // not bind at its *definition* site, so a macro above the `let` would
         // bind the opcode module instead.
@@ -1830,7 +1843,18 @@ impl Vm {
             ($next:expr) => {{
                 let next = $next;
                 units = code_units(&next);
+                start = units.as_ptr();
                 chunk = next;
+            }};
+        }
+
+        // The unit offset of a cursor, for the cold paths that speak in
+        // offsets: `Frame::ip`, `line_at`, `deliver_error`, `collect_point`.
+        macro_rules! offset_of {
+            ($cursor:expr) => {{
+                // SAFETY: every cursor here points into `units`, and `start`
+                // is its base -- `follow_chunk!` moves the two together.
+                (unsafe { $cursor.offset_from(start) }) as usize
             }};
         }
 
@@ -1857,7 +1881,7 @@ impl Vm {
             // unknown opcode and a stream that does not decode.
             //
             // SAFETY: `at` is therefore always inside `units`.
-            let unit = unsafe { *units.get_unchecked(at) };
+            let unit = unsafe { *at };
             let byte = Chunk::opcode_of(unit);
             // **No opcode is above `HIGHEST`, and saying so removes a branch
             // from every instruction.** `opcode_of` masks to six bits, so the
@@ -1873,11 +1897,11 @@ impl Vm {
             if byte > code::HIGHEST {
                 unsafe { ::core::hint::unreachable_unchecked() };
             }
-            ip += 1;
+            ip = unsafe { ip.add(1) };
             #[cfg(feature = "profile")]
             {
                 self.op_counts[byte as usize] += 1;
-                *self.line_ops.entry((chunk.line_at(at), byte)).or_insert(0) += 1;
+                *self.line_ops.entry((chunk.line_at(offset_of!(at)), byte)).or_insert(0) += 1;
                 let here = Rc::as_ptr(&chunk) as usize;
                 let depth = self.frames.len();
                 if self.previous_op != u16::MAX
@@ -1894,8 +1918,8 @@ impl Vm {
 
             match byte {
                 code::CONSTANT => {
-                    let index = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let index = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     self.stack.push(chunk.constants[index]);
                 }
                 code::NULL => self.stack.push(Value::NULL),
@@ -1915,8 +1939,8 @@ impl Vm {
                     // spans a one-unit `LoadLocal` and a two-unit `Constant`,
                     // and nothing moved when they fused -- so the constant is
                     // where the `Constant` put it, past its own dead opcode.
-                    let index = unsafe { *units.get_unchecked(ip + 1) } as usize;
-                    ip += 2;
+                    let index = unsafe { *ip.add(1) } as usize;
+                    ip = unsafe { ip.add(2) };
                     self.stack.push(self.stack[base + slot]);
                     self.stack.push(chunk.constants[index]);
                 }
@@ -1924,14 +1948,14 @@ impl Vm {
                     let first = Chunk::inline_operand(unit) as usize;
                     // The second slot rides inline in what was the second
                     // `LoadLocal`'s own unit.
-                    let second = Chunk::inline_operand(unsafe { *units.get_unchecked(ip) }) as usize;
-                    ip += 1;
+                    let second = Chunk::inline_operand(unsafe { *ip }) as usize;
+                    ip = unsafe { ip.add(1) };
                     self.stack.push(self.stack[base + first]);
                     self.stack.push(self.stack[base + second]);
                 }
                 code::STORE_FIELD_THIS_POP => {
                     let index = Chunk::inline_operand(unit) as usize;
-                    ip += 1;
+                    ip = unsafe { ip.add(1) };
                     // Popping first rather than storing and then popping: the
                     // value is an argument to `set_field`, not something it
                     // reads off the stack.
@@ -1944,13 +1968,13 @@ impl Vm {
                     self.stack[base + slot] = *self.stack.last().unwrap();
                 }
                 code::LOAD_MODULE_VAR => {
-                    let index = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let index = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     self.stack.push(self.modules[module].values[index]);
                 }
                 code::STORE_MODULE_VAR => {
-                    let index = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let index = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     self.modules[module].values[index] = *self.stack.last().unwrap();
                 }
                 code::POP => {
@@ -1974,8 +1998,8 @@ impl Vm {
                     // The upvalue count rides inline; the function's constant
                     // index is the unit after, and the descriptors follow it.
                     let count = Chunk::inline_operand(unit) as usize;
-                    let index = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let index = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     let function = chunk.constants[index]
                         .as_object()
                         .ok_or_else(|| RuntimeError::new("Closure constant is not a function."))?;
@@ -1984,10 +2008,10 @@ impl Vm {
                     for _ in 0..count {
                         // One unit per upvalue: whether it is a local in the
                         // low byte, which one in the high byte.
-                        let descriptor = unsafe { *units.get_unchecked(ip) };
+                        let descriptor = unsafe { *ip };
                         let is_local = descriptor & 0xff != 0;
                         let index = Chunk::inline_operand(descriptor) as usize;
-                        ip += 1;
+                        ip = unsafe { ip.add(1) };
                         let captured = if is_local {
                             self.capture_upvalue(base + index)
                         } else {
@@ -2009,8 +2033,8 @@ impl Vm {
                     self.stack.push(class);
                 }
                 code::METHOD_INSTANCE | code::METHOD_STATIC => {
-                    let symbol = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let symbol = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     let class = self.stack.pop().unwrap_or(Value::NULL);
                     let body = self.stack.pop().unwrap_or(Value::NULL);
                     self.bind_method(class, body, symbol, byte == code::METHOD_STATIC)?;
@@ -2052,8 +2076,8 @@ impl Vm {
                 code::CALL | code::SUPER => 'call: {
                     // The arity rides inline; the symbol is the unit after.
                     let arity = Chunk::inline_operand(unit) as usize;
-                    let symbol = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let symbol = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
 
                     // **The arithmetic fast path.**
                     //
@@ -2134,11 +2158,12 @@ impl Vm {
                     }
                     let found = self.find_method(start_from, symbol);
                     let Some(method) = found else {
-                        let error = self.no_such_method(receiver_at, symbol, chunk.line_at(at));
-                        match self.deliver_error(error, ip, chunk.clone())? {
+                        let error = self.no_such_method(receiver_at, symbol, chunk.line_at(offset_of!(at)));
+                        match self.deliver_error(error, offset_of!(ip), chunk.clone())? {
                             Some((next_chunk, next_ip, next_base)) => {
                                 follow_chunk!(next_chunk);
-                                ip = next_ip;
+                                // SAFETY: an offset into the chunk just switched to.
+                                ip = unsafe { start.add(next_ip) };
                                 base = next_base;
                                 module = self.current_module();
                                 continue 'interpret;
@@ -2151,17 +2176,18 @@ impl Vm {
                         Method::Primitive(function) => {
                             let outcome = function(self, receiver_at).map_err(|mut error| {
                                 if error.line == 0 {
-                                    error.line = chunk.line_at(at);
+                                    error.line = chunk.line_at(offset_of!(at));
                                 }
                                 error
                             });
 
                             let value = match outcome {
                                 Ok(value) => value,
-                                Err(error) => match self.deliver_error(error, ip, chunk.clone())? {
+                                Err(error) => match self.deliver_error(error, offset_of!(ip), chunk.clone())? {
                                     Some((next_chunk, next_ip, next_base)) => {
                                         follow_chunk!(next_chunk);
-                                        ip = next_ip;
+                                        // SAFETY: an offset into the chunk just switched to.
+                                ip = unsafe { start.add(next_ip) };
                                         base = next_base;
                                         module = self.current_module();
                                         continue 'interpret;
@@ -2181,7 +2207,7 @@ impl Vm {
                             }
                             if let Some(switch) = self.pending_switch.take() {
                                 let failing = switch.as_error.then_some(switch.value);
-                                self.perform_switch(switch, ip, chunk.clone())?;
+                                self.perform_switch(switch, offset_of!(ip), chunk.clone())?;
                                 if let Some(value) = failing {
                                     // The target fails the moment it resumes,
                                     // which is what makes `transferError`
@@ -2189,12 +2215,13 @@ impl Vm {
                                     let message = self.to_string(value);
                                     let error = RuntimeError {
                                         message,
-                                        line: chunk.line_at(at),
+                                        line: chunk.line_at(offset_of!(at)),
                                     };
                                     match self.deliver_error(error, 0, chunk.clone())? {
                                         Some((next_chunk, next_ip, next_base)) => {
                                             follow_chunk!(next_chunk);
-                                            ip = next_ip;
+                                            // SAFETY: an offset into the chunk just switched to.
+                                ip = unsafe { start.add(next_ip) };
                                             base = next_base;
                                             module = self.current_module();
                                             continue 'interpret;
@@ -2207,7 +2234,8 @@ impl Vm {
                                 // as running again.
                                 follow_chunk!(self.resume_chunk()?);
                                 let frame = self.frames.last().expect("a frame to resume");
-                                ip = frame.ip;
+                                // SAFETY: a parked frame's offset, into the chunk now current.
+                                ip = unsafe { start.add(frame.ip) };
                                 base = frame.base;
                                 module = frame.module;
                                 continue 'interpret;
@@ -2224,27 +2252,34 @@ impl Vm {
                                 return Err(Self::wrong_arity(
                                     target.arity,
                                     arity,
-                                    chunk.line_at(at),
+                                    chunk.line_at(offset_of!(at)),
                                 ));
                             }
                             if self.frames.len() >= MAX_FRAMES {
-                                return Err(Self::stack_overflow(chunk.line_at(at)));
+                                return Err(Self::stack_overflow(chunk.line_at(offset_of!(at))));
                             }
                             // **The caller's chunk moves into its frame and
                             // the callee's into the local.** One `Rc` changes
                             // hands and none is cloned or dropped: the caller
                             // stops running exactly here, which is already
                             // where its `ip` is written back.
+                            // **Taken before the switch.** `offset_of!` is
+                            // relative to `start`, and `start` is about to
+                            // become the callee's chunk -- so the caller's
+                            // offset has to be read while it still means what
+                            // it says.
+                            let caller_ip = offset_of!(ip);
                             let caller_chunk = {
                                 // Same order as `follow_chunk!`. `replace`
                                 // hands the old chunk back rather than
                                 // dropping it, so nothing is released here.
                                 let next = target.chunk;
                                 units = code_units(&next);
+                                start = units.as_ptr();
                                 ::core::mem::replace(&mut chunk, next)
                             };
                             if let Some(frame) = self.frames.last_mut() {
-                                frame.ip = ip;
+                                frame.ip = caller_ip;
                                 frame.chunk = Some(caller_chunk);
                             }
                             self.frames.push(Frame {
@@ -2255,7 +2290,7 @@ impl Vm {
                                 module: target.module,
                                 field_offset: target.field_offset,
                             });
-                            ip = 0;
+                            ip = start;
                             base = receiver_at;
                             module = target.module;
                         }
@@ -2273,8 +2308,8 @@ impl Vm {
                 }
                 code::SET_ATTRIBUTES => self.set_attributes(),
                 code::IMPORT_MODULE => {
-                    let index = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let index = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     let name = self.to_string(chunk.constants[index]);
                     // Resolved against the module doing the importing.
                     let name = resolve_module(&self.modules[module].name, &name);
@@ -2290,7 +2325,7 @@ impl Vm {
                             // result would have, so nothing special is needed
                             // on the way back.
                             if let Some(frame) = self.frames.last_mut() {
-                                frame.ip = ip;
+                                frame.ip = offset_of!(ip);
                             }
                             // **Assigned, not `let`.** A fresh binding here
                             // would shadow the loop's `base` for this arm only,
@@ -2304,18 +2339,19 @@ impl Vm {
                             // The module body becomes the running frame, so
                             // this one stops running and takes its chunk back.
                             if let Some(frame) = self.frames.last_mut() {
-                                frame.ip = ip;
+                                frame.ip = offset_of!(ip);
                                 frame.chunk = Some(chunk);
                             }
                             follow_chunk!(self.push_frame(closure, base)?);
-                            ip = 0;
+                            ip = start;
                             module = self.module_of(closure);
                             continue;
                         }
-                        Err(error) => match self.deliver_error(error, ip, chunk.clone())? {
+                        Err(error) => match self.deliver_error(error, offset_of!(ip), chunk.clone())? {
                             Some((next_chunk, next_ip, next_base)) => {
                                 follow_chunk!(next_chunk);
-                                ip = next_ip;
+                                // SAFETY: an offset into the chunk just switched to.
+                                ip = unsafe { start.add(next_ip) };
                                 base = next_base;
                                 module = self.current_module();
                                 continue;
@@ -2325,9 +2361,9 @@ impl Vm {
                     }
                 }
                 code::IMPORT_VARIABLE => {
-                    let module_name = unsafe { *units.get_unchecked(ip) } as usize;
-                    let variable_name = unsafe { *units.get_unchecked(ip + 1) } as usize;
-                    ip += 2;
+                    let module_name = unsafe { *ip } as usize;
+                    let variable_name = unsafe { *ip.add(1) } as usize;
+                    ip = unsafe { ip.add(2) };
 
                     let module_name = self.to_string(chunk.constants[module_name]);
                     // The same resolution, or the `for` clause would look the
@@ -2336,7 +2372,7 @@ impl Vm {
                     let module_name = resolve_module(&self.modules[module].name, &module_name);
                     let variable = self.to_string(chunk.constants[variable_name]);
 
-                    let value = self.imported_variable(&module_name, &variable, chunk.line_at(at))?;
+                    let value = self.imported_variable(&module_name, &variable, chunk.line_at(offset_of!(at)))?;
                     self.stack.push(value);
                 }
                 code::RETURN | code::END | code::LOAD_LOCAL_RETURN | code::LOAD_FIELD_THIS_RETURN => {
@@ -2348,12 +2384,12 @@ impl Vm {
                         code::END => Value::NULL,
                         code::LOAD_LOCAL_RETURN => {
                             let slot = Chunk::inline_operand(unit) as usize;
-                            ip += 1;
+                            ip = unsafe { ip.add(1) };
                             self.stack[base + slot]
                         }
                         code::LOAD_FIELD_THIS_RETURN => {
                             let index = Chunk::inline_operand(unit) as usize;
-                            ip += 1;
+                            ip = unsafe { ip.add(1) };
                             self.field_of(self.stack[base], base, index)?
                         }
                         _ => self.stack.pop().unwrap_or(Value::NULL),
@@ -2391,7 +2427,7 @@ impl Vm {
                                     finishing: true,
                                     as_error: false,
                                 },
-                                ip,
+                                offset_of!(ip),
                                 chunk.clone(),
                             )?;
                             // Taking the chunk back is the move that pairs with the one
@@ -2399,7 +2435,8 @@ impl Vm {
                             // as running again.
                             follow_chunk!(self.resume_chunk()?);
                             let frame = self.frames.last().expect("a frame to resume");
-                            ip = frame.ip;
+                            // SAFETY: a parked frame's offset, into the chunk now current.
+                            ip = unsafe { start.add(frame.ip) };
                             base = frame.base;
                             module = frame.module;
                             continue;
@@ -2423,46 +2460,47 @@ impl Vm {
                     // as running again.
                     follow_chunk!(self.resume_chunk()?);
                     let frame = self.frames.last().expect("a frame to return to");
-                    ip = frame.ip;
+                    // SAFETY: a parked frame's offset, into the chunk now current.
+                    ip = unsafe { start.add(frame.ip) };
                     base = frame.base;
                     module = frame.module;
                 }
                 code::JUMP => {
-                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
+                    let offset = unsafe { *ip } as usize;
                     // One unit for the operand, then the distance -- which is
                     // in units too, and so reaches four times as far as the
                     // byte offset it replaces.
-                    ip += 1 + offset;
+                    ip = unsafe { ip.add(1 + offset) };
                 }
                 code::LOOP => {
-                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
-                    ip -= offset;
+                    let offset = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
+                    ip = unsafe { ip.sub(offset) };
                 }
                 code::JUMP_IF => {
-                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let offset = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     let condition = self.stack.pop().unwrap_or(Value::NULL);
                     if condition.is_falsy() {
-                        ip += offset;
+                        ip = unsafe { ip.add(offset) };
                     }
                 }
                 code::AND => {
-                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let offset = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
-                        ip += offset;
+                        ip = unsafe { ip.add(offset) };
                     } else {
                         self.stack.pop();
                     }
                 }
                 code::OR => {
-                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
-                    ip += 1;
+                    let offset = unsafe { *ip } as usize;
+                    ip = unsafe { ip.add(1) };
                     if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
                         self.stack.pop();
                     } else {
-                        ip += offset;
+                        ip = unsafe { ip.add(offset) };
                     }
                 }
 
@@ -2472,7 +2510,7 @@ impl Vm {
                 // than failing to compile. `bytecode::code` carries the
                 // note about adding one, and the exhaustive `byte_of` in
                 // its test module is what makes the omission visible.
-                _ => return Err(Self::bad_opcode(byte, chunk.line_at(at))),
+                _ => return Err(Self::bad_opcode(byte, chunk.line_at(offset_of!(at)))),
             }
 
 
@@ -2487,11 +2525,11 @@ impl Vm {
             // Known only now: the arm is what consumed the operands.
             #[cfg(feature = "profile")]
             {
-                self.previous_end = ip;
+                self.previous_end = offset_of!(ip);
             }
 
             if (NURSERY && self.heap.young() >= NURSERY_OBJECTS) || self.heap.collection_due() {
-                self.collect_point(ip);
+                self.collect_point(offset_of!(ip));
             }
         }
     }
