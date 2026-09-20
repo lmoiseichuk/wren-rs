@@ -39,7 +39,8 @@ its code can call and every variable it can reach, so a VM can be built with
 only those -- and a build step can freeze the resulting classes, method tables
 and names into the image rather than constructing them in RAM at start-up. On
 `fib` that leaves nothing of the core in the heap at all, and a run peaking at
-8,184 B against a CH32V006's 8,192. See
+8,528 B against a CH32V006's 8,192 -- and 54,696 B of `wren` in flash against
+its 63,488. See
 **[`doc/wren_native.md`](doc/wren_native.md)** and
 **[`doc/wren-rs/memory.md`](doc/wren-rs/memory.md)**.
 
@@ -149,14 +150,16 @@ identical constants on every implementation. Method and caveats:
 
 | benchmark | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| `binary_trees` depth 9 | 5.717 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 9.727 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.430 s | **0.130 s** | 0.154 s |
-| `method_call` | 1.598 s | **0.350 s** | 1.748 s |
+| `binary_trees` depth 9 | 5.678 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 9.605 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.420 s | **0.130 s** | 0.154 s |
+| `method_call` | 1.601 s | **0.350 s** | 1.748 s |
 | **VM resident** | **23,176 B** | 83,036 B | — |
 
 **Between two and a half and four and a half times slower than C, and 72%
-smaller resident.** The speed is
+smaller resident.** Against MicroPython it is *slower* on three of the four and
+faster on `method_call`; `--features nofp` closes most of that gap and still
+does not overtake it on `list_build`. The speed is
 the honest cost of reaching objects by a bounds-checked index rather than a
 pointer, which is what keeps `unsafe` out of the object model; the memory is
 what
@@ -191,14 +194,14 @@ run each:
 
 | | `f64` | `f32` | `nofp` |
 |---|---|---|---|
-| `binary_trees` | 5.717 s | 5.308 s | **5.247 s** |
-| `fib` ×5 | 9.727 s | 8.805 s | **7.930 s** |
-| `list_build` | 0.430 s | 0.389 s | **0.267 s** |
-| `method_call` | 1.598 s | 1.533 s | **1.492 s** |
-| `binary_trees` peak | 115,024 B | 92,164 B | **92,000 B** |
-| `list_build` peak | 132,288 B | 66,652 B | **66,632 B** |
+| `binary_trees` | 5.678 s | 5.295 s | **5.034 s** |
+| `fib` ×5 | 9.605 s | 8.721 s | **7.480 s** |
+| `list_build` | 0.420 s | 0.384 s | **0.248 s** |
+| `method_call` | 1.601 s | 1.538 s | **1.440 s** |
+| `binary_trees` peak | 115,168 B | 88,144 B | 92,080 B |
+| `list_build` peak | 132,292 B | **66,656 B** | 66,636 B |
 | VM resident | 23,176 B | 22,888 B | **21,316 B** |
-| image | 471,552 B | 455,664 B | **399,872 B** |
+| image | 472,928 B | 457,264 B | **400,512 B** |
 
 Both narrower modes are faster *and* smaller, because `riscv32imac` has neither
 the `F` nor the `D` extension — every width is software and the narrow ones are
@@ -244,23 +247,71 @@ the core those need, and enough for a build step to compute the resulting
 classes, method tables and names *at image build time* and compile them in as
 `static` data. `tools/make_native_executable.sh --uwren` does both.
 
-On `fib`, on the same board, with a fixed heap and no allocator underneath it:
+`fib` on the same board, `-Os`, a fixed 16 KiB heap and no allocator under it:
 
-| | bytes |
-|---|---|
-| the core's classes, tables and names in RAM | **0** |
-| heap in use once the VM is built | 4,008 B |
-| heap at the run's peak | 8,184 B |
-| image | 170,832 B |
+| | tailored | full Wren, same board |
+|---|---|---|
+| the core's classes, tables and names in RAM | **0 B** | — |
+| heap once the VM is built | **4,008 B** | 23,176 B resident |
+| heap at the run's peak | **8,528 B** | — |
+| `wren` in flash | **54,696 B** | 85,972 B |
+| whole image | **171,728 B** | 472,928 B |
+| `fib(24)` ×5 | 11.78 s | 9.605 s |
 
 **Nothing of the core is in the heap.** Twenty-one classes, their flattened
 method tables and their names all live in `.rodata`; what the heap holds is the
 slots that address them, the VM's own vectors, and whatever the program
-computes. A CH32V006 has 8,192 B of RAM and 63,488 B of flash — the heap peak
-now fits it, though the `Vm` struct and the call stack sit outside that figure.
+computes — 930 B of objects at peak.
+
+**54,696 B fits a CH32V006's 63,488 B of flash**, which no build of this VM
+managed before, and the 8,528 B heap peak is just over its 8,192 B of RAM —
+with the `Vm` struct and the call stack still outside that figure.
+
+The one row that goes the wrong way is the clock, and it is not the VM's doing:
+this image is built `-Os` where the benchmark port is `-O3`. Integer
+arithmetic is *faster* at equal optimisation — see the `nofp` column above.
 
 How it is built, how to test it on the host without a board, and the one way to
 get it wrong: **[`doc/wren_native.md`](doc/wren_native.md)**.
+
+### Cooking a native executable
+
+The same tailoring works for a host binary: the program is compiled to
+bytecode, the core it needs is generated as Rust, both are compiled in, and the
+result reads nothing from disk.
+
+```sh
+tools/make_native_executable.sh benchmarks/wren/fib.wren            # full Wren
+tools/make_native_executable.sh benchmarks/wren/fib.wren --uwren    # tailored
+tools/make_native_executable.sh doc/examples --uwren --run          # a folder
+```
+
+| on `fib` | full Wren | `--uwren` |
+|---|---|---|
+| executable | 760,512 B | **501,264 B** |
+| bytecode compiled in | 589 B | 589 B |
+| generated core | — | 5,732 B of Rust |
+
+A third smaller, and most of what is left in either is the Rust standard
+library that a firmware does not carry. It runs in 33 ms.
+
+**Why it is worth having.** The failures that matter in a tailored build do not
+look like failures: a method symbol numbered differently, or a frozen method
+table indexed against the wrong install order, reaches a device as a wrong
+answer and nothing else — and a flash-and-watch cycle is the better part of a
+minute. The same program built for the host runs in milliseconds and fails in
+exactly the same ways, because it is the same VM with the same features.
+`cargo test --test frozen` is the narrow version: six checks on `fib` in about
+a tenth of a second.
+
+**The one way to get it wrong** is to generate a core with one feature set and
+compile it with another. A frozen method entry holds a *primitive index*, and
+those are positions in the sequence of `define` calls that the cargo features
+decide — so mixing the two puts every method on a plausible, wrong primitive,
+and the symbol table does not move when it happens. It has already happened
+once here. The script generates the core with the features it is about to
+compile, which is how using it avoids the problem; `FrozenCore::disagreement`
+catches it at start-up if something else causes it.
 
 ### The ceiling on garbage, and why a small part pays nothing for it
 
