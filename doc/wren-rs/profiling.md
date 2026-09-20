@@ -711,6 +711,90 @@ effect can be larger than the first and point the other way. It is not visible
 in the source and not predictable from the mechanism. Only the four numbers
 say which way it went.
 
+### The backlog: every experiment in this pass, with its verdict
+
+Worked least-frequent first through the top ten opcodes and then the next ten.
+Percentages are instructions retired against the state before that experiment;
+`sum` is over all four benchmarks, which is what the accept/reject decision was
+made on.
+
+| # | experiment | b_trees | fib | list | method | sum | kept |
+|---|---|---|---|---|---|---|---|
+| 1 | field offset into a local | −0.32% | +1.24% | −0.07% | −0.96% | +0.44% | only with 2 |
+| 2 | constant pool into a local | +0.13% | +0.50% | −0.29% | +0.14% | +0.31% | only with 1 |
+| 3 | **1 and 2 together** | −0.81% | +0.31% | −0.85% | −1.50% | **−0.30%** | **yes** |
+| 4 | `LoadLocalConstant` fused push | −1.14% | −0.56% | −0.85% | −1.50% | −0.87% | **yes** |
+| 5 | `LoadLocalPair` fused, aliasing-aware | −1.28% | −0.93% | −1.44% | −1.65% | **−1.14%** | **yes** |
+| 6 | field accessors `Option`/`bool` | −2.85% | +3.70% | +0.11% | −8.18% | +0.13% | only with 7 |
+| 7 | **6 plus `#[cold]` constructor** | −3.84% | +0.31% | +0.07% | −8.70% | **−2.04%** | **yes** |
+| 8 | blank instance, no temporary vector | −12.99% | +0.56% | +0.60% | +0.72% | **−4.29%** | **yes** |
+| 9 | fast path without two `Option`s | −0.06% | −0.50% | −0.52% | −0.27% | −0.34% | **yes** |
+| 10 | primitive result written in place | +0.49% | −0.38% | +0.64% | +0.91% | +0.08% | no |
+| 11 | `receiver_at` computed once | (see 10; measured together) | | | | +0.08% | no |
+| 12 | cheaper field-offset fetch | +0.00% | −0.00% | +0.00% | −0.00% | 0.00% | no |
+| 13 | `Call` arm errors `#[cold]` | +0.31% | +0.69% | +0.60% | +0.72% | +0.55% | no |
+| 14 | `call_target` errors `#[cold]` | +0.34% | +1.37% | +0.56% | +0.25% | +0.89% | no |
+| 15 | `call_target` returns `Option` | +0.34% | +1.37% | +0.56% | +0.25% | +0.89% | no |
+| 16 | 15 plus `#[inline(always)]` | +0.34% | +1.37% | +0.56% | +0.25% | +0.89% | no |
+| 17 | `resume_chunk` error `#[cold]` | +0.81% | +2.00% | +0.93% | +1.09% | +1.47% | no |
+| 18 | `symbol < len` merged into `get` | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | no |
+| 19 | drop the redundant `arity == 1` | +0.93% | +1.43% | +0.22% | +0.99% | +1.20% | no |
+| 20 | hoist module values (not built) | — | — | — | — | — | unsound |
+
+Nine experiments kept in five commits; eleven refused. Experiments 14, 15 and
+16 produced **bit-identical machine code**, which is how three different ideas
+came to have one number.
+
+### What the failures have in common
+
+**Four of them removed a cost that was not there.** 12 and 18 measured exactly
+zero: the compiler had already merged the branch and the bounds test. 15 and 16
+compiled to the same instructions as 14. Reading the generated code, or simply
+measuring before theorising, would have saved all four.
+
+**Two of them removed work that was paying for itself.** 19 is the sharpest:
+`arity == 1` is genuinely redundant, because every signature
+`learn_numeric_operators` registers is `X(_)`. It is also a cheap early reject,
+and without it every call of another arity reaches the `num_ops` load before
+falling through -- 1.43% on `fib`. A test can be redundant as a *predicate* and
+load-bearing as a *filter*.
+
+**And 10 and 11 were refused once before**, on numbers this pass reproduced to
+within a tenth of a per cent. They are in the list below with their original
+verdicts. Reading that list first would have saved two experiments.
+
+### The one that pays for all the arithmetic
+
+Experiment 8 is worth its own note, because the reasoning that nearly stopped
+it from being tried was written down two commits earlier and was wrong.
+
+The ceiling argument said: the next ten opcodes are 9% of executions, so even
+ten machine instructions saved on each of them is under one per cent, so do not
+bother. `Construct` is 1.0% of executions -- and gave **13% of one benchmark**,
+because what it was doing per instruction was `vec![Value::NULL; fields]`: a
+heap allocation and a free, some five hundred instructions, to hand the heap a
+run of nulls it then copied and dropped. `place_fields` is split so the
+room-finding is reusable and the range is filled in place.
+
+The ceiling is sound arithmetic about *small* savings, and says nothing about
+an arm doing something structurally expensive. **Frequency says where to look;
+it does not say what is there.** An opcode that allocates is worth two orders
+of magnitude more than one that indexes, and nothing in a frequency table
+distinguishes them.
+
+### What is left, and what it would cost
+
+Every closure call clones an `Rc<Chunk>` in `call_target`, and the matching
+drop happens on return -- roughly seven million calls across the benchmarks.
+Removing it means the interpreter holding the code as raw slices with validity
+resting on the frame rooting its closure, rather than on an owned handle. An
+attempt to size it first, by adding a second round trip and measuring the
+difference, was inconclusive: the added clone and drop cancel, and the
+optimiser removed them to different degrees in different benchmarks, giving
+per-call costs between 0.4 and 5.0 instructions. **A probe that the optimiser
+can see through measures the optimiser, not the code.** The real figure needs
+the change built.
+
 ### Where the `#[cold]` trick stops working
 
 Taking a constant error out of line won `field_of` two points. The same edit
