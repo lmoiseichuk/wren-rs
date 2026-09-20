@@ -2371,7 +2371,9 @@ impl Vm {
                     // reads off the stack.
                     let value = self.stack.pop().unwrap_or(Value::NULL);
                     let receiver = self.stack[base];
-                    self.set_field(receiver, field_offset, index, value)?;
+                    if !self.set_field(receiver, field_offset, index, value) {
+                        return Err(Vm::not_a_field());
+                    }
                 }
                 code::STORE_LOCAL => {
                     let slot = Chunk::inline_operand(unit) as usize;
@@ -2451,19 +2453,25 @@ impl Vm {
                 }
                 code::LOAD_FIELD_THIS => {
                     let index = Chunk::inline_operand(unit) as usize;
-                    let value = self.field_of(self.stack[base], field_offset, index)?;
+                    let Some(value) = self.field_of(self.stack[base], field_offset, index) else {
+                        return Err(Vm::not_a_field());
+                    };
                     self.stack.push(value);
                 }
                 code::STORE_FIELD_THIS => {
                     let index = Chunk::inline_operand(unit) as usize;
                     let value = *self.stack.last().unwrap();
                     let receiver = self.stack[base];
-                    self.set_field(receiver, field_offset, index, value)?;
+                    if !self.set_field(receiver, field_offset, index, value) {
+                        return Err(Vm::not_a_field());
+                    }
                 }
                 code::LOAD_FIELD => {
                     let index = Chunk::inline_operand(unit) as usize;
                     let receiver = self.stack.pop().unwrap_or(Value::NULL);
-                    let value = self.field_of(receiver, field_offset, index)?;
+                    let Some(value) = self.field_of(receiver, field_offset, index) else {
+                        return Err(Vm::not_a_field());
+                    };
                     self.stack.push(value);
                 }
                 code::STORE_FIELD => {
@@ -2475,7 +2483,9 @@ impl Vm {
                     // an expression, so the value is what stays.
                     let value = self.stack.pop().unwrap_or(Value::NULL);
                     let receiver = self.stack.pop().unwrap_or(Value::NULL);
-                    self.set_field(receiver, field_offset, index, value)?;
+                    if !self.set_field(receiver, field_offset, index, value) {
+                        return Err(Vm::not_a_field());
+                    }
                     self.stack.push(value);
                 }
                 code::CONSTRUCT => {
@@ -2833,7 +2843,10 @@ impl Vm {
                         code::LOAD_FIELD_THIS_RETURN => {
                             let index = Chunk::inline_operand(unit) as usize;
                             ip = unsafe { ip.add(1) };
-                            self.field_of(self.stack[base], field_offset, index)?
+                            match self.field_of(self.stack[base], field_offset, index) {
+                                Some(value) => value,
+                                None => return Err(Vm::not_a_field()),
+                            }
                         }
                         _ => self.stack.pop().unwrap_or(Value::NULL),
                     };
@@ -3172,42 +3185,42 @@ impl Vm {
     /// `base` and `module` -- reaching back through `self.frames.last()` for
     /// it cost a length, a branch and two loads on every field access, of
     /// which the benchmarks here do about three quarters of a million.
-    fn field_of(&self, receiver: Value, offset: usize, index: usize) -> Result<Value, RuntimeError> {
-        let Some(id) = receiver.as_object() else {
-            return Err(RuntimeError::new(
-                "Cannot access a field outside of a class.",
-            ));
-        };
-        match self.heap.field_read(id, offset + index) {
-            Some(value) => Ok(value),
-            None => Err(RuntimeError::new(
-                "Cannot access a field outside of a class.",
-            )),
-        }
+    /// **`Option`, not `Result`, because every failure is the same sentence.**
+    /// A `RuntimeError` is a `String` and a line, so returning one made this a
+    /// twenty-four byte return value where sixteen would do -- on a path the
+    /// benchmarks take three quarters of a million times, and which cannot
+    /// fail in any of them. The caller builds the error, and only when there
+    /// is one to build.
+    fn field_of(&self, receiver: Value, offset: usize, index: usize) -> Option<Value> {
+        let id = receiver.as_object()?;
+        self.heap.field_read(id, offset + index)
+    }
+
+    /// The one error either field accessor can report; see [`Vm::field_of`].
+    ///
+    /// **`cold` and `inline(never)` because the point was to get it out of the
+    /// loop.** Returning a `RuntimeError` by value put its construction inline
+    /// in every field arm; moving that into a function the optimiser knows is
+    /// not taken is what keeps the arms small, and `run_frames` is large
+    /// enough that a few bytes per arm decide what stays in registers.
+    #[cold]
+    #[inline(never)]
+    fn not_a_field() -> RuntimeError {
+        RuntimeError::new("Cannot access a field outside of a class.")
     }
 
     /// Store into a field of `receiver`; see [`Vm::field_of`] on `offset`.
-    fn set_field(
-        &mut self,
-        receiver: Value,
-        offset: usize,
-        index: usize,
-        value: Value,
-    ) -> Result<(), RuntimeError> {
+    /// Store into a field of `receiver`, reporting whether it happened.
+    ///
+    /// A `bool` rather than a `Result`, for the reason on [`Vm::field_of`].
+    fn set_field(&mut self, receiver: Value, offset: usize, index: usize, value: Value) -> bool {
         let Some(id) = receiver.as_object() else {
-            return Err(RuntimeError::new(
-                "Cannot access a field outside of a class.",
-            ));
+            return false;
         };
         // The store and the barrier both live in the heap now, because the
         // fields do -- and it reports whether the handle was an instance, so
         // this no longer looks the instance up once to ask and once to store.
-        match self.heap.set_instance_field(id, offset + index, value) {
-            true => Ok(()),
-            false => Err(RuntimeError::new(
-                "Cannot access a field outside of a class.",
-            )),
-        }
+        self.heap.set_instance_field(id, offset + index, value)
     }
 
     /// The class whose static fields the running method should see.

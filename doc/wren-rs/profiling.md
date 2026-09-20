@@ -681,6 +681,36 @@ locals to say it. `a_fused_local_pair_sees_the_value_it_just_pushed` says it in
 five, and fails on the buggy version -- which was checked, this time, before
 the test was believed.
 
+### A constant error is not worth a `Result`
+
+`field_of` and `set_field` returned `Result<_, RuntimeError>`, and a
+`RuntimeError` is a `String` and a line -- twenty-four bytes of return value
+where sixteen would do, on a path the benchmarks take three quarters of a
+million times and which fails in none of them. Every failure is the same
+sentence, so the accessors now report with `Option` and `bool` and the caller
+builds the error.
+
+On its own that was nearly a wash, and instructively so:
+
+| | `binary_trees` | `fib` | `list_build` | `method_call` | sum |
+|---|---|---|---|---|---|
+| `Option` and `bool` | −2.85% | **+3.70%** | +0.11% | **−8.18%** | +0.13% |
+| ...and the error constructor `#[cold]` | **−3.84%** | +0.31% | +0.07% | **−8.70%** | **−2.04%** |
+
+**`fib` touches no field at all**, so a 3.7% swing on it was never about field
+access: removing the `Result` moved the error *construction* inline into every
+field arm, and `run_frames` is large enough that a few bytes per arm decide
+what stays in registers. Marking the constructor `#[cold]` and `#[inline(never)]`
+puts it back out of line, and the benchmark that cannot use the change stops
+paying for it.
+
+The pattern is worth naming, because it is the third time this page has hit it
+from a different direction: **a change to a hot arm is also a change to the
+size of the function containing it**, and in a function this size that second
+effect can be larger than the first and point the other way. It is not visible
+in the source and not predictable from the mechanism. Only the four numbers
+say which way it went.
+
 ### What was refused, again
 
 Two changes were written, measured, and found to be already in the list below:
