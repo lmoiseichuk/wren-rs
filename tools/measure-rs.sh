@@ -8,7 +8,13 @@
 #   tools/measure-rs.sh speed --bin counters   # a different binary in the port
 #   tools/measure-rs.sh speed --slot-block 256 # blocked slot tables, this size
 #   tools/measure-rs.sh speed --features f32   # any cargo feature of the port
-#   tools/measure-rs.sh --only method_call     # one benchmark, for a fast loop
+#   tools/measure-rs.sh --only method_call     # report one benchmark of the four
+#
+# **`--only` filters the report, not the build.** It used to select benchmarks
+# at compile time, which changed the image -- `binary_trees` measured 3.67%
+# apart between a two-benchmark build and a three-benchmark one, on the same
+# commit. Two optimisations were refused on that difference. Every build now
+# runs all four and this only decides what is printed.
 #
 # **Why this exists rather than `cargo run`.** The port's cargo runner is
 # `espflash flash --monitor`, which never exits: it flashes, prints, and then
@@ -36,6 +42,7 @@ PAD=""
 LOG=""
 FEATURES=""
 SLOT_BLOCK=""
+ONLY=""
 
 while (( $# )); do
     case "$1" in
@@ -44,7 +51,7 @@ while (( $# )); do
         --bin) BIN="${2:-}"; shift ;;
         --features) FEATURES="${2:-}"; shift ;;
         --slot-block) SLOT_BLOCK="${2:-}"; shift ;;
-        --only) export WREN_ONLY="${2:-}"; shift ;;
+        --only) ONLY="${2:-}"; shift ;;
         --log) LOG="${2:-}"; shift ;;
         --board) BOARD="${2:-}"; shift ;;
         -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -122,6 +129,7 @@ wait $FLASH 2>/dev/null
 echo
 # The flashing tool and the ROM both talk on this port; what is wanted is
 # what the firmware said.
-grep -vE "^I \(|^ets |boot|esp_image|clk|mode:|load:|entry|^Flash |^Chip |Crystal|^MAC |App/|Segment|Erasing|Writing|Uploading|Connecting|INFO|^\[20|^ESP-ROM|^Build:|^Saved PC|^SPIWP|^Features|^Partition|^Serial |^Product|^Cores|^Stub|^Changing|^Detected|^Using|^$" "$LOG"
+[[ -n "$ONLY" ]] && FILTER="$(echo "$ONLY" | tr ',' '|')" || FILTER=".*"
+grep -E "^($FILTER| +\[|^$)" "$LOG" | grep -vE "^I \(|^ets |boot|esp_image|clk|mode:|load:|entry|^Flash |^Chip |Crystal|^MAC |App/|Segment|Erasing|Writing|Uploading|Connecting|INFO|^\[20|^ESP-ROM|^Build:|^Saved PC|^SPIWP|^Features|^Partition|^Serial |^Product|^Cores|^Stub|^Changing|^Detected|^Using|^$" "$LOG"
 echo
 echo "full output: $LOG"

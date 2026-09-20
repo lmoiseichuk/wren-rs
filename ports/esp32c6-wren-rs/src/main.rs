@@ -118,22 +118,6 @@ const BENCHMARKS: &[(&str, &str, u32)] = &[
     ("method_call", include_str!("../../../benchmarks/wren/method_call.wren"), 10),
 ];
 
-/// Run only the benchmarks named here, comma separated.
-///
-/// **For the optimisation loop, not for a published figure.** Trying six
-/// variants of one interpreter arm against `method_call` is a twenty-second
-/// round trip; the whole set is a minute and a half of it is `fib`. Unset
-/// runs everything, which is what a number that goes in a table needs.
-const ONLY: Option<&str> = option_env!("WREN_ONLY");
-
-/// Whether this benchmark is one of the ones asked for.
-fn selected(name: &str) -> bool {
-    match ONLY {
-        None => true,
-        Some(list) => list.split(',').any(|wanted| wanted.trim() == name),
-    }
-}
-
 /// Override every repeat count, for a quick iteration.
 ///
 /// The full set at the counts above is minutes per flash, which is right for
@@ -168,10 +152,15 @@ fn main() -> ! {
     println!("[vm] resident {resident} B");
     println!();
 
+    // **Every build runs every benchmark.** Selecting them at build time was
+    // worth twenty seconds a round and cost a correct comparison: the
+    // selection is an `option_env!`, so it changes the binary, and
+    // `binary_trees` measured 411,792,094 instructions in a build that ran two
+    // benchmarks against 426,918,702 in one that ran three -- same commit,
+    // same source, 3.67% apart. Two changes were refused on that difference
+    // before it was noticed. Filtering now happens in `measure-rs.sh`, on the
+    // output, where it cannot reach the image.
     for (name, source, repeats) in BENCHMARKS {
-        if !selected(name) {
-            continue;
-        }
         run_one(name, source, REPEAT_OVERRIDE.unwrap_or(*repeats).max(1));
     }
 

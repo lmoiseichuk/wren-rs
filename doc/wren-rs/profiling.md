@@ -710,47 +710,44 @@ size and every percentage above it was inflated by the same factor. The
 refusal stands on the corrected figures; it stood on the wrong ones by
 accident.*
 
-### The loop's live set is the thing that costs, not the arm
+### A benchmark filter that changed the benchmark
 
-Four changes that each remove work were measured and refused, and they refuse
-for the same reason -- so it is worth stating once rather than four times.
+`tools/measure-rs.sh --only <names>` was added to cut a measurement round from
+ninety seconds to twenty. It selected benchmarks with `option_env!`, which
+means it **changed the image** -- and the image is what is being measured.
 
-| change | `fib` | `method_call` | `binary_trees` |
-|---|---|---|---|
-| arms for the unused opcode space | — | +1.82% | — |
-| the code slice cached, bounds check kept | +0.31% | +0.31% | — |
-| the bounds check dropped, slice not cached | — | +1.04% | — |
-| `Pop` and `JumpIf` popping unchecked | −0.44% | −0.26% | **+3.48%** |
-| the dead length dropped from the slice | ±0.000% | ±0.000% | **+3.67%** |
+Same commit, same source, `binary_trees`:
 
-**The last two are the instructive pair.** Both strictly remove work from an
-arm. Both leave `fib` and `method_call` unchanged or slightly better -- and
-both cost `binary_trees` three and a half per cent.
+| the binary was built to run | instructions retired |
+|---|---|
+| `binary_trees,fib` | 411,792,094 |
+| `method_call,fib,binary_trees` | **426,918,702** |
 
-And `binary_trees` is not being noisy. Padding every branch target to 16 bytes
-instead of 4 -- which moves every address in the image and changes nothing
-else -- moves its count by **700 instructions in 411.8 million**, 0.00017%.
-The same sweep moves `fib` by five. Instructions retired is address-invariant
-to five decimal places, so a three per cent difference is a real three per
-cent of work.
+3.67% apart, reproducibly, from a difference that does nothing at run time.
 
-What separates `binary_trees` from the other two is what it does *between*
-instructions: it is the one that allocates, collects, and switches chunks
-through the constructor path rather than the ordinary call path. A change to
-the set of values the loop keeps live is free on a benchmark that stays in
-the loop and expensive on one that keeps leaving it.
+**Two optimisations were refused on that difference** -- popping without a
+bounds check, and dropping the dead length from the code slice -- because
+their measurements were taken with one filter and compared against a baseline
+taken with another. Re-measured against a baseline built the same way, the
+first is worth −0.19% to −0.44% across all three benchmarks and the second is
+exactly neutral. Both were fine.
 
-**So the pair to measure against is `fib` and `method_call`, and the one that
-decides is `binary_trees`.** The first two reproduce to within twenty
-instructions across every build in this session and say whether an arm got
-cheaper; the third says whether the loop as a whole got worse, and it is the
-one that has refused every change that looked free.
+Two things follow, and the first is the general one:
 
-*An earlier reading of this data blamed a register-allocation cliff in the
-dispatch -- five instructions appearing before the fetch. That was wrong: the
-loop branches back past them, to the fetch itself, and only the two
-chunk-switch paths pay them. The disassembly has to be read for where the
-loop re-enters, not from the top of the block.*
+**A measurement harness that is compiled into the thing it measures is part of
+the measurement.** `--pad` gets this right -- it is a linker flag, applied to
+every build under comparison, and its effect was itself measured (700
+instructions in 411.8 million). `--only` got it wrong by being invisible: it
+looked like a reporting convenience and was a code change.
+
+So every build now runs all four benchmarks and `--only` filters the *output*.
+The loop is slower and the comparison is sound.
+
+**And `binary_trees` is not the erratic benchmark it appeared to be.** Every
+unexplained swing attributed to it in this session was this. With the filter
+out of the image it reproduces like the others, and the earlier note here
+claiming it varies between builds -- and the rule built on that note, to treat
+it as a veto rather than a signal -- was wrong and is withdrawn.
 
 ---
 

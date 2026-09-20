@@ -8,5 +8,4 @@
 fn main() {
     println!("cargo::rerun-if-env-changed=WREN_SLOT_BLOCK");
     println!("cargo::rerun-if-env-changed=WREN_REPEATS");
-    println!("cargo::rerun-if-env-changed=WREN_ONLY");
 }
