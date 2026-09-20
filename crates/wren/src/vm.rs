@@ -2135,22 +2135,38 @@ impl Vm {
                             let left = self.stack[top - 2].as_num();
                             let right = self.stack[top - 1].as_num();
                             if let (Some(a), Some(b)) = (left, right) {
+                                #[allow(clippy::float_cmp)]
                                 let value = match operation {
-                                    NUM_ADD => Value::num(a + b),
-                                    NUM_SUB => Value::num(a - b),
-                                    NUM_MUL => Value::num(a * b),
-                                    NUM_DIV => Value::num(a / b),
-                                    NUM_MOD => Value::num(a % b),
-                                    NUM_LT => Value::bool(a < b),
-                                    NUM_GT => Value::bool(a > b),
-                                    NUM_LE => Value::bool(a <= b),
+                                    // **Dividing by zero declines rather than
+                                    // answering.** A float build has an
+                                    // infinity to give and gives it; an
+                                    // integer build does not, and `a / 0`
+                                    // would panic. Declining hands the case to
+                                    // the primitive, which raises "Cannot
+                                    // divide by zero." as an error a program
+                                    // can catch.
+                                    NUM_DIV | NUM_MOD
+                                        if cfg!(feature = "no-fp") && b == (0 as crate::value::Num) =>
+                                    {
+                                        None
+                                    }
+                                    NUM_ADD => Some(Value::num(a + b)),
+                                    NUM_SUB => Some(Value::num(a - b)),
+                                    NUM_MUL => Some(Value::num(a * b)),
+                                    NUM_DIV => Some(Value::num(a / b)),
+                                    NUM_MOD => Some(Value::num(a % b)),
+                                    NUM_LT => Some(Value::bool(a < b)),
+                                    NUM_GT => Some(Value::bool(a > b)),
+                                    NUM_LE => Some(Value::bool(a <= b)),
                                     // `learn_numeric_operators` writes nothing
                                     // else, so this is `>=`.
-                                    _ => Value::bool(a >= b),
+                                    _ => Some(Value::bool(a >= b)),
                                 };
-                                self.stack.truncate(top - 2);
-                                self.stack.push(value);
-                                break 'call;
+                                if let Some(value) = value {
+                                    self.stack.truncate(top - 2);
+                                    self.stack.push(value);
+                                    break 'call;
+                                }
                             }
                         }
                     }
@@ -3141,6 +3157,41 @@ pub fn resolve_module(importer: &str, name: &str) -> String {
 /// exponential when the exponent is below -4 or at least the precision, and
 /// decimal otherwise, then strip trailing zeros either way. That is why `1e300`
 /// prints as `1e+300` while `1000` prints as `1000`.
+/// An integer build prints an integer, and that is the whole of it.
+///
+/// **This is where the largest saving in the crate is.** `%g` needs Rust's
+/// `{:e}`, which pulls in Dragon and Grisu -- shortest-representation
+/// formatting, its cached powers of ten and its exact fallback -- for about
+/// 22 KB. `i32`'s `Display` is a division loop. There is no `nan`, no
+/// `infinity` and no negative zero to spell, because an integer has none of
+/// them.
+#[cfg(feature = "no-fp")]
+fn format_number(value: crate::value::Num) -> String {
+    let mut text = String::new();
+    let mut digits = value.unsigned_abs();
+    if value < 0 {
+        text.push('-');
+    }
+    // A division loop, written out because `i32`'s own `Display` would do the
+    // same and this keeps the whole formatter in one place.
+    let mut stack = [0u8; 10];
+    let mut count = 0;
+    loop {
+        stack[count] = b'0' + (digits % 10) as u8;
+        digits /= 10;
+        count += 1;
+        if digits == 0 {
+            break;
+        }
+    }
+    while count > 0 {
+        count -= 1;
+        text.push(stack[count] as char);
+    }
+    text
+}
+
+#[cfg(not(feature = "no-fp"))]
 fn format_number(value: crate::value::Num) -> String {
     // Wren spells these out rather than using C's "inf"/"-inf"/"nan", so a
     // program's output is the same on every platform -- C leaves the spelling
@@ -3198,11 +3249,13 @@ fn format_number(value: crate::value::Num) -> String {
 /// while an `f32` still holds integers exactly to 16,777,216; nine would stop
 /// `0.1` printing as `0.1`. Eight is the value that keeps both.
 #[cfg(not(feature = "f32"))]
+#[cfg(not(feature = "no-fp"))]
 const SIGNIFICANT: usize = 14;
 #[cfg(feature = "f32")]
 const SIGNIFICANT: usize = 8;
 
 /// Strip the trailing zeros `%g` removes, and the point if nothing follows it.
+#[cfg(not(feature = "no-fp"))]
 fn trim_trailing_zeros(text: &str) -> String {
     if !text.contains('.') {
         return text.to_string();

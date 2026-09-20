@@ -118,6 +118,8 @@ fn line_comments_end_at_the_newline_and_not_before() {
 }
 
 #[test]
+// The name says it: this is about doubles.
+#[cfg(not(feature = "no-fp"))]
 fn numbers_are_doubles_including_the_hexadecimal_ones() {
     // Wren has one numeric type. `0xff` is 255.0, not an integer.
     let source = "0 1 42 2.75 1e3 1e-3 0xff 0X10";
@@ -131,6 +133,10 @@ fn numbers_are_doubles_including_the_hexadecimal_ones() {
             other => panic!("expected a number, got {other:?}"),
         }
     }
+    // The fractions are not representable without floating point, and the
+    // lexer refuses them there rather than rounding -- so the expectation is
+    // the float one and the test is a float test.
+    #[cfg(not(feature = "no-fp"))]
     assert_eq!(values, [0.0, 1.0, 42.0, 2.75, 1000.0, 0.001, 255.0, 16.0]);
 }
 

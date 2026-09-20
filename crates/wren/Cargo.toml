@@ -81,6 +81,21 @@ libm = ["dep:libm"]
 # 2^24, so a program that counts past 16,777,216 will print something else.
 # `doc/wren-rs/design.md` sets out the trade in full.
 f32 = []
+# **Integers only, no floating point anywhere. This is µwren, not Wren.**
+#
+# Wren has one numeric type and it is a double. Removing floating point is
+# therefore a change to the language, not a narrowing of it -- `1/2` is `0`,
+# there are no fractional literals, and `Num` is a 31-bit signed integer
+# because one bit pays for the tag that NaN boxing used to get free.
+#
+# What it buys is the largest saving anywhere in the crate. An `f32` still
+# formats and still parses, so it carries Rust's Dragon and Grisu shortest-
+# formatting, its `dec2flt` tables and `strtod` with it; integers carry none
+# of them, and neither do libm's transcendentals, which cannot be defined.
+#
+# It is for a part like a CH32V006 -- 62 KB of flash, 8 KB of RAM -- where a
+# sensor counts millivolts and percentages and never needed a double.
+no-fp = []
 # **Counters in the collector, for deciding what to replace it with.** Off by
 # default and never shipped: it adds a tally to every allocation and, at every
 # collection, a refcount simulation over the garbage to work out how much of it

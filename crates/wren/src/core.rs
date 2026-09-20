@@ -49,7 +49,7 @@ use crate::object::{
     MapEntry, ObjClass, ObjFiber, ObjList, ObjMap, ObjRange, ObjString, Object, ObjectType,
     Primitive,
 };
-use crate::value::{Num, Value};
+use crate::value::{Num, Value, NOT_A_NUMBER};
 use crate::vm::{RuntimeError, Switch, Vm};
 
 /// Bind a primitive to a signature on a class.
@@ -69,6 +69,15 @@ use crate::vm::{RuntimeError, Switch, Vm};
 /// does this for `<`, `>`, `<=` and `>=`; this is the same move for the
 /// search methods. `indexOf` answers a number and the other three a bool, so
 /// the match returns a `Value` rather than a `bool`.
+/// `0` and `1` in whichever numeric type this build has.
+///
+/// **Shared arithmetic needs literals that are not spelled as floats.**
+/// Iteration, indexing and range walking are the same code in a `f64` build
+/// and an integer one, and `ONE` only compiles in the first. These say the
+/// same thing in both.
+const ZERO: Num = 0 as Num;
+const ONE: Num = 1 as Num;
+
 fn search_text(vm: &mut Vm, at: usize, mode: u8) -> Result<Value, RuntimeError> {
     let text = string_text(vm, receiver(vm, at));
     let needle = string_argument(vm, at, 1)?;
@@ -78,7 +87,7 @@ fn search_text(vm: &mut Vm, at: usize, mode: u8) -> Result<Value, RuntimeError> 
         SEARCH_ENDS => Value::bool(text.ends_with(&needle)),
         // `indexOf` reports -1 rather than null when the needle is absent,
         // which is upstream's answer and not a sentinel this code chose.
-        _ => Value::num(text.find(&needle).map_or(-1.0, |index| index as Num)),
+        _ => Value::num(text.find(&needle).map_or(-ONE, |index| index as Num)),
     })
 }
 
@@ -222,7 +231,7 @@ fn number_argument(vm: &Vm, at: usize, index: usize) -> Result<Num, RuntimeError
 macro_rules! arithmetic {
     ($vm:expr, $class:expr, $signature:literal, $left:ident, $right:ident, $body:expr) => {
         define($vm, $class, $signature, |vm, at| {
-            let $left = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+            let $left = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
             let $right = number_argument(vm, at, 1)?;
             Ok($body)
         });
@@ -605,10 +614,38 @@ fn install_num(vm: &mut Vm) {
     arithmetic!(vm, class, "+(_)", a, b, Value::num(a + b));
     arithmetic!(vm, class, "-(_)", a, b, Value::num(a - b));
     arithmetic!(vm, class, "*(_)", a, b, Value::num(a * b));
+    #[cfg(not(feature = "no-fp"))]
     arithmetic!(vm, class, "/(_)", a, b, Value::num(a / b));
+    // **Integer division by zero is an error, not an infinity.** A float
+    // build answers `infinity` because IEEE says so and Wren exposes it; an
+    // integer build has no such value, and Rust's `/` would panic -- which is
+    // the one answer a scripting language must never give.
+    #[cfg(feature = "no-fp")]
+    define(vm, class, "/(_)", |vm, at| {
+        let left = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
+        let right = number_argument(vm, at, 1)?;
+        match right {
+            0 => Err(RuntimeError::new("Cannot divide by zero.")),
+            // `wrapping_div` for the one pair that overflows, the most
+            // negative value over -1.
+            right => Ok(Value::num(left.wrapping_div(right))),
+        }
+    });
     // Wren's `%` follows C's fmod: the result takes the sign of the dividend,
     // which is *not* what Rust's `rem_euclid` does.
+    #[cfg(not(feature = "no-fp"))]
     arithmetic!(vm, class, "%(_)", a, b, Value::num(a % b));
+    #[cfg(feature = "no-fp")]
+    define(vm, class, "%(_)", |vm, at| {
+        let left = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
+        let right = number_argument(vm, at, 1)?;
+        match right {
+            0 => Err(RuntimeError::new("Cannot divide by zero.")),
+            // Takes the sign of the dividend, as C's fmod does and as the
+            // float build's `%` does.
+            right => Ok(Value::num(left.wrapping_rem(right))),
+        }
+    });
     arithmetic!(vm, class, "<(_)", a, b, Value::bool(a < b));
     arithmetic!(vm, class, ">(_)", a, b, Value::bool(a > b));
     arithmetic!(vm, class, "<=(_)", a, b, Value::bool(a <= b));
@@ -622,7 +659,7 @@ fn install_num(vm: &mut Vm) {
     // closure's parameter. Macro hygiene is right to bind it that way, and the
     // result is a closure that captures, which is not a `fn` pointer.
     define(vm, class, "..(_)", |vm, at| {
-        let from = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+        let from = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
         let to = number_argument(vm, at, 1)?;
         let id = vm.heap.allocate(Object::Range(ObjRange {
             from,
@@ -632,7 +669,7 @@ fn install_num(vm: &mut Vm) {
         Ok(Value::object(id))
     });
     define(vm, class, "...(_)", |vm, at| {
-        let from = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+        let from = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
         let to = number_argument(vm, at, 1)?;
         let id = vm.heap.allocate(Object::Range(ObjRange {
             from,
@@ -662,26 +699,26 @@ fn install_num(vm: &mut Vm) {
     });
 
     define(vm, class, "-", |vm, at| {
-        Ok(Value::num(-receiver(vm, at).as_num().unwrap_or(Num::NAN)))
+        Ok(Value::num(-receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER)))
     });
     define(vm, class, "abs", |vm, at| {
         Ok(Value::num(math::abs(
-            receiver(vm, at).as_num().unwrap_or(Num::NAN),
+            receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
         )))
     });
     define(vm, class, "floor", |vm, at| {
         Ok(Value::num(math::floor(
-            receiver(vm, at).as_num().unwrap_or(Num::NAN),
+            receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
         )))
     });
     define(vm, class, "ceil", |vm, at| {
         Ok(Value::num(math::ceil(
-            receiver(vm, at).as_num().unwrap_or(Num::NAN),
+            receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
         )))
     });
     define(vm, class, "sqrt", |vm, at| {
         Ok(Value::num(math::sqrt(
-            receiver(vm, at).as_num().unwrap_or(Num::NAN),
+            receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
         )))
     });
     define(vm, class, "toString", |vm, at| {
@@ -785,17 +822,17 @@ fn install_num_extras(vm: &mut Vm) {
     let class = vm.num_class;
 
     define(vm, class, "min(_)", |vm, at| {
-        let a = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+        let a = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
         let b = number_argument(vm, at, 1)?;
         Ok(Value::num(if a < b { a } else { b }))
     });
     define(vm, class, "max(_)", |vm, at| {
-        let a = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+        let a = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
         let b = number_argument(vm, at, 1)?;
         Ok(Value::num(if a > b { a } else { b }))
     });
     define(vm, class, "clamp(_,_)", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+        let value = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
         let low = number_argument(vm, at, 1)?;
         let high = number_argument(vm, at, 2)?;
         let clamped = if value < low {
@@ -808,50 +845,78 @@ fn install_num_extras(vm: &mut Vm) {
         Ok(Value::num(clamped))
     });
 
-    define(vm, class, "truncate", |vm, at| {
-        Ok(Value::num(math::trunc(
-            receiver(vm, at).as_num().unwrap_or(Num::NAN),
-        )))
-    });
-    define(vm, class, "fraction", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
-        let fraction = value - math::trunc(value);
-        // `(-2).fraction` is `-0`, not `0`. The subtraction gives a positive
-        // zero, and Wren prints the sign, so it has to be put back.
-        if fraction == 0.0 && value.is_sign_negative() {
-            return Ok(Value::num(-0.0));
-        }
-        Ok(Value::num(fraction))
-    });
-    define(vm, class, "sign", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
-        let sign = if value > 0.0 {
-            1.0
-        } else if value < 0.0 {
-            -1.0
-        } else {
-            // Zero's sign is zero, not one. Wren follows the sign function
-            // rather than `copysign`.
-            0.0
-        };
-        Ok(Value::num(sign))
-    });
-    define(vm, class, "isInteger", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
-        Ok(Value::bool(
-            value.is_finite() && value == math::trunc(value),
-        ))
-    });
-    define(vm, class, "isNan", |vm, at| {
-        Ok(Value::bool(
-            receiver(vm, at).as_num().unwrap_or(0.0).is_nan(),
-        ))
-    });
-    define(vm, class, "isInfinity", |vm, at| {
-        Ok(Value::bool(
-            receiver(vm, at).as_num().unwrap_or(0.0).is_infinite(),
-        ))
-    });
+    #[cfg(not(feature = "no-fp"))]
+    {
+        define(vm, class, "truncate", |vm, at| {
+            Ok(Value::num(math::trunc(
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
+            )))
+        });
+        define(vm, class, "fraction", |vm, at| {
+            let value = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
+            let fraction = value - math::trunc(value);
+            // `(-2).fraction` is `-0`, not `0`. The subtraction gives a positive
+            // zero, and Wren prints the sign, so it has to be put back.
+            if fraction == ZERO && value.is_sign_negative() {
+                return Ok(Value::num(-ZERO));
+            }
+            Ok(Value::num(fraction))
+        });
+        define(vm, class, "sign", |vm, at| {
+            let value = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
+            let sign = if value > ZERO {
+                ONE
+            } else if value < ZERO {
+                -ONE
+            } else {
+                // Zero's sign is zero, not one. Wren follows the sign function
+                // rather than `copysign`.
+                ZERO
+            };
+            Ok(Value::num(sign))
+        });
+        define(vm, class, "isInteger", |vm, at| {
+            let value = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
+            Ok(Value::bool(
+                value.is_finite() && value == math::trunc(value),
+            ))
+        });
+        define(vm, class, "isNan", |vm, at| {
+            Ok(Value::bool(
+                receiver(vm, at).as_num().unwrap_or(ZERO).is_nan(),
+            ))
+        });
+        define(vm, class, "isInfinity", |vm, at| {
+            Ok(Value::bool(
+                receiver(vm, at).as_num().unwrap_or(ZERO).is_infinite(),
+            ))
+        });
+
+    }
+
+    // **The same six questions, answered for integers.** Every one of them
+    // asks about a fractional part or a non-finite value, and an integer has
+    // neither -- so the answers are constants rather than computations, and
+    // the methods stay defined so a program that asks gets Wren's answer
+    // rather than a missing method.
+    #[cfg(feature = "no-fp")]
+    {
+        define(vm, class, "truncate", |vm, at| Ok(receiver(vm, at)));
+        define(vm, class, "fraction", |_, _| Ok(Value::num(0)));
+        define(vm, class, "sign", |vm, at| {
+            let value = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
+            // Zero's sign is zero, not one -- the sign function, not
+            // `copysign`, which is what upstream follows.
+            Ok(Value::num(match value {
+                0 => 0,
+                value if value > 0 => 1,
+                _ => -1,
+            }))
+        });
+        define(vm, class, "isInteger", |_, _| Ok(Value::TRUE));
+        define(vm, class, "isNan", |_, _| Ok(Value::FALSE));
+        define(vm, class, "isInfinity", |_, _| Ok(Value::FALSE));
+    }
 
     // **Wren's bitwise operators work on 32-bit unsigned values**, so a double
     // is truncated and wrapped first and the result comes back as a double.
@@ -866,7 +931,7 @@ fn install_num_extras(vm: &mut Vm) {
         bitwise(vm, at, |a, b| a.wrapping_shr(b & 31))
     });
     define(vm, class, "~", |vm, at| {
-        let value = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+        let value = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
         Ok(Value::num(!(value as i64 as u32) as Num))
     });
 
@@ -875,72 +940,72 @@ fn install_num_extras(vm: &mut Vm) {
     // neither they are undefined, and `1.sin` reports "Num does not implement
     // 'sin'" -- an answer the caller can see, rather than one from a series
     // that is quietly wrong in the digits Wren prints.
-    #[cfg(any(feature = "std", feature = "libm"))]
+    #[cfg(all(any(feature = "std", feature = "libm"), not(feature = "no-fp")))]
     {
         use crate::math::real;
 
         define(vm, class, "round", |vm, at| {
             Ok(Value::num(real::round(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "pow(_)", |vm, at| {
-            let base = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+            let base = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
             let exponent = number_argument(vm, at, 1)?;
             Ok(Value::num(real::pow(base, exponent)))
         });
         define(vm, class, "log", |vm, at| {
             Ok(Value::num(real::ln(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "log2", |vm, at| {
             Ok(Value::num(real::log2(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "exp", |vm, at| {
             Ok(Value::num(real::exp(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "cbrt", |vm, at| {
             Ok(Value::num(real::cbrt(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "sin", |vm, at| {
             Ok(Value::num(real::sin(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "cos", |vm, at| {
             Ok(Value::num(real::cos(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "tan", |vm, at| {
             Ok(Value::num(real::tan(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "asin", |vm, at| {
             Ok(Value::num(real::asin(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "acos", |vm, at| {
             Ok(Value::num(real::acos(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "atan", |vm, at| {
             Ok(Value::num(real::atan(
-                receiver(vm, at).as_num().unwrap_or(Num::NAN),
+                receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER),
             )))
         });
         define(vm, class, "atan(_)", |vm, at| {
-            let y = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+            let y = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
             let x = number_argument(vm, at, 1)?;
             Ok(Value::num(real::atan2(y, x)))
         });
@@ -967,6 +1032,7 @@ fn install_num_extras(vm: &mut Vm) {
         // text is a number, and "no" is an answer. A number too large to
         // represent is different -- the text *is* a number, and quietly
         // answering `infinity` would be a wrong one.
+        #[cfg(not(feature = "no-fp"))]
         match parsed {
             Some(value) if value.is_infinite() => {
                 Err(RuntimeError::new("Number literal is too large."))
@@ -974,32 +1040,69 @@ fn install_num_extras(vm: &mut Vm) {
             Some(value) => Ok(Value::num(value)),
             None => Ok(Value::NULL),
         }
+        // An integer parse has no infinity to refuse; what it has instead is
+        // a range, and `parse` already said no to anything outside it. The
+        // difference between "not a number" and "too large" is kept by
+        // asking whether the text looked numeric at all.
+        #[cfg(feature = "no-fp")]
+        match parsed {
+            Some(value) if value > crate::value::NUM_MAX => {
+                Err(RuntimeError::new("Number literal is too large."))
+            }
+            Some(value) => Ok(Value::num(value)),
+            None => Ok(Value::NULL),
+        }
     });
 
-    define(vm, metaclass, "pi", |_, _| {
-        Ok(Value::num(core::f64::consts::PI as Num))
-    });
-    define(vm, metaclass, "e", |_, _| {
-        Ok(Value::num(core::f64::consts::E as Num))
-    });
-    define(vm, metaclass, "infinity", |_, _| {
-        Ok(Value::num(Num::INFINITY))
-    });
-    define(vm, metaclass, "nan", |_, _| Ok(Value::num(Num::NAN)));
-    define(vm, metaclass, "largest", |_, _| Ok(Value::num(Num::MAX)));
-    define(vm, metaclass, "smallest", |_, _| {
-        Ok(Value::num(Num::MIN_POSITIVE))
-    });
-    define(vm, metaclass, "maxSafeInteger", |_, _| {
-        Ok(Value::num(9007199254740991.0))
-    });
+    // **`pi`, `e`, `infinity` and `nan` are not integers and are not
+    // defined without floating point.** Asking for one reports "Num
+    // metaclass does not implement 'pi'", which is an answer a caller can
+    // see -- rather than rounding pi to 3 and being quietly wrong.
+    #[cfg(not(feature = "no-fp"))]
+    {
+        define(vm, metaclass, "pi", |_, _| {
+            Ok(Value::num(core::f64::consts::PI as Num))
+        });
+        define(vm, metaclass, "e", |_, _| {
+            Ok(Value::num(core::f64::consts::E as Num))
+        });
+        define(vm, metaclass, "infinity", |_, _| {
+            Ok(Value::num(Num::INFINITY))
+        });
+        define(vm, metaclass, "nan", |_, _| Ok(Value::num(NOT_A_NUMBER)));
+        define(vm, metaclass, "maxSafeInteger", |_, _| {
+            Ok(Value::num(9007199254740991.0))
+        });
+    }
+    // `largest` and `smallest` mean what they say in either build: the
+    // biggest and the smallest positive number this `Num` can hold. For
+    // integers that is the 31-bit range the tag leaves.
+    #[cfg(not(feature = "no-fp"))]
+    {
+        define(vm, metaclass, "largest", |_, _| Ok(Value::num(Num::MAX)));
+        define(vm, metaclass, "smallest", |_, _| {
+            Ok(Value::num(Num::MIN_POSITIVE))
+        });
+    }
+    #[cfg(feature = "no-fp")]
+    {
+        define(vm, metaclass, "largest", |_, _| {
+            Ok(Value::num(crate::value::NUM_MAX))
+        });
+        define(vm, metaclass, "smallest", |_, _| Ok(Value::num(1)));
+    }
+    #[cfg(not(feature = "no-fp"))]
     define(vm, metaclass, "minSafeInteger", |_, _| {
         Ok(Value::num(-9007199254740991.0))
+    });
+    #[cfg(feature = "no-fp")]
+    define(vm, metaclass, "minSafeInteger", |_, _| {
+        Ok(Value::num(-crate::value::NUM_MAX - 1))
     });
 }
 
 fn bitwise(vm: &Vm, at: usize, operation: fn(u32, u32) -> u32) -> Result<Value, RuntimeError> {
-    let left = receiver(vm, at).as_num().unwrap_or(Num::NAN);
+    let left = receiver(vm, at).as_num().unwrap_or(NOT_A_NUMBER);
     let right = argument(vm, at, 1)
         .as_num()
         .ok_or_else(|| RuntimeError::new("Right operand must be a number."))?;
@@ -1059,19 +1162,19 @@ fn install_string_extras(vm: &mut Vm) {
         // Negative counts from the end, as every other index in the language
         // does. Equal to the length is allowed -- searching an empty tail is a
         // sensible question with the answer -1.
-        let resolved = if start < 0.0 {
+        let resolved = if start < ZERO {
             start + text.len() as Num
         } else {
             start
         };
         // The start must be a position *in* the string, so equal to the
         // length is already past the end.
-        if resolved < 0.0 || resolved >= text.len() as Num {
+        if resolved < ZERO || resolved >= text.len() as Num {
             return Err(RuntimeError::new("Start out of bounds."));
         }
         let start = resolved as usize;
         Ok(Value::num(
-            find_bytes(&text[start..], &needle).map_or(-1.0, |index| (index + start) as Num),
+            find_bytes(&text[start..], &needle).map_or(-ONE, |index| (index + start) as Num),
         ))
     });
 
@@ -1111,7 +1214,7 @@ fn install_string_extras(vm: &mut Vm) {
     define(vm, class, "*(_)", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
         let count = number_argument(vm, at, 1)?;
-        if count < 0.0 || count != math::trunc(count) {
+        if count < ZERO || count != math::trunc(count) {
             return Err(RuntimeError::new("Count must be a non-negative integer."));
         }
         let repeated = text.repeat(count as usize);
@@ -1140,7 +1243,7 @@ fn install_string_extras(vm: &mut Vm) {
             0
         } else {
             let index = integer_argument(vm, at, 1, "Iterator")?;
-            if index < 0.0 || index as usize >= bytes.len() {
+            if index < ZERO || index as usize >= bytes.len() {
                 return Ok(Value::FALSE);
             }
             // One byte on, then past any continuation bytes. This always
@@ -1159,7 +1262,7 @@ fn install_string_extras(vm: &mut Vm) {
     define(vm, class, "iteratorValue(_)", |vm, at| {
         let bytes = string_bytes(vm, receiver(vm, at));
         let index = integer_argument(vm, at, 1, "Iterator")?;
-        if index < 0.0 || index as usize >= bytes.len() {
+        if index < ZERO || index as usize >= bytes.len() {
             return Err(RuntimeError::new("Iterator out of bounds."));
         }
         Ok(vm.new_string_bytes(character_bytes(&bytes, index as usize)))
@@ -1181,7 +1284,7 @@ fn install_string_extras(vm: &mut Vm) {
     let metaclass = new_metaclass(vm, class, "String metaclass");
     define(vm, metaclass, "fromCodePoint(_)", |vm, at| {
         let point = integer_argument(vm, at, 1, "Code point")?;
-        if point < 0.0 {
+        if point < ZERO {
             return Err(RuntimeError::new("Code point cannot be negative."));
         }
         if point > 0x10ffff as Num {
@@ -1199,7 +1302,7 @@ fn install_string_extras(vm: &mut Vm) {
     });
     define(vm, metaclass, "fromByte(_)", |vm, at| {
         let byte = number_argument(vm, at, 1)?;
-        if !(0.0..=255.0).contains(&byte) || byte != math::trunc(byte) {
+        if !(ZERO..=(255 as Num)).contains(&byte) || byte != math::trunc(byte) {
             return Err(RuntimeError::new(
                 "Byte must be an integer between 0 and 255.",
             ));
@@ -1319,16 +1422,16 @@ fn install_string_views(vm: &mut Vm) {
         let length = string_bytes(vm, string).len();
         let current = argument(vm, at, 1);
         let next = if current.is_null() {
-            0.0
+            ZERO
         } else {
             // A negative iterator simply has no next element; it is not an
             // error, because iteration is meant to be driven blindly.
-            integer_argument(vm, at, 1, "Iterator")? + 1.0
+            integer_argument(vm, at, 1, "Iterator")? + ONE
         };
-        if next < 1.0 && !current.is_null() {
+        if next < ONE && !current.is_null() {
             return Ok(Value::FALSE);
         }
-        if next < 0.0 || next >= length as Num {
+        if next < ZERO || next >= length as Num {
             return Ok(Value::FALSE);
         }
         Ok(Value::num(next))
@@ -1357,7 +1460,7 @@ fn install_string_views(vm: &mut Vm) {
         let index = number_argument(vm, at, 1)?;
         let index = resolve_index(index, bytes.len())?;
         Ok(Value::num(
-            code_point_at(&bytes, index).map_or(-1.0, |character| character as u32 as Num),
+            code_point_at(&bytes, index).map_or(-ONE, |character| character as u32 as Num),
         ))
     });
     define(vm, class, "iterate(_)", |vm, at| {
@@ -1370,7 +1473,7 @@ fn install_string_views(vm: &mut Vm) {
             0
         } else {
             let index = integer_argument(vm, at, 1, "Iterator")?;
-            if index < 0.0 || index as usize >= bytes.len() {
+            if index < ZERO || index as usize >= bytes.len() {
                 return Ok(Value::FALSE);
             }
             index as usize + 1
@@ -1390,7 +1493,7 @@ fn install_string_views(vm: &mut Vm) {
         let index = resolve_index(index, bytes.len())
             .map_err(|_| RuntimeError::new("Iterator out of bounds."))?;
         Ok(Value::num(
-            code_point_at(&bytes, index).map_or(-1.0, |character| character as u32 as Num),
+            code_point_at(&bytes, index).map_or(-ONE, |character| character as u32 as Num),
         ))
     });
 }
@@ -1450,14 +1553,14 @@ fn install_sequence(vm: &mut Vm) {
 
     ("count", |vm, at| {
         let sequence = receiver(vm, at);
-        let mut count = 0.0;
+        let mut count = ZERO;
         let mut iterator = Value::NULL;
         loop {
             iterator = vm.invoke_with(sequence, "iterate(_)", &[iterator])?;
             if iterator.is_falsy() {
                 return Ok(Value::num(count));
             }
-            count += 1.0;
+            count += ONE;
         }
     }),
 
@@ -1553,10 +1656,10 @@ fn install_sequence(vm: &mut Vm) {
     ("count(_)", |vm, at| {
         let sequence = receiver(vm, at);
         let function = function_argument(vm, at, 1)?;
-        let mut count = 0.0;
+        let mut count = ZERO;
         for element in collect(vm, sequence)? {
             if !vm.call_function(function, &[element])?.is_falsy() {
-                count += 1.0;
+                count += ONE;
             }
         }
         Ok(Value::num(count))
@@ -1597,7 +1700,7 @@ fn install_sequence(vm: &mut Vm) {
         Ok(new_view(
             vm,
             class,
-            &[receiver(vm, at), Value::num(count), Value::num(0.0)],
+            &[receiver(vm, at), Value::num(count), Value::num(ZERO)],
         ))
     }),
     ("skip(_)", |vm, at| {
@@ -1658,13 +1761,13 @@ fn install_lazy_sequences(vm: &mut Vm) {
     define(vm, class, "iterate(_)", |vm, at| {
         let this = receiver(vm, at);
         let source = instance_field(vm, this, 0);
-        let limit = instance_field(vm, this, 1).as_num().unwrap_or(0.0);
+        let limit = instance_field(vm, this, 1).as_num().unwrap_or(ZERO);
         let iterator = argument(vm, at, 1);
 
         let taken = if iterator.is_null() {
-            1.0
+            ONE
         } else {
-            instance_field(vm, this, 2).as_num().unwrap_or(0.0) + 1.0
+            instance_field(vm, this, 2).as_num().unwrap_or(ZERO) + ONE
         };
         set_instance_field(vm, this, 2, Value::num(taken));
         if taken > limit {
@@ -1688,11 +1791,11 @@ fn install_lazy_sequences(vm: &mut Vm) {
         if !iterator.is_null() {
             return vm.invoke_with(source, "iterate(_)", &[iterator]);
         }
-        let mut remaining = instance_field(vm, this, 1).as_num().unwrap_or(0.0);
+        let mut remaining = instance_field(vm, this, 1).as_num().unwrap_or(ZERO);
         iterator = vm.invoke_with(source, "iterate(_)", &[iterator])?;
-        while remaining > 0.0 && !iterator.is_falsy() {
+        while remaining > ZERO && !iterator.is_falsy() {
             iterator = vm.invoke_with(source, "iterate(_)", &[iterator])?;
-            remaining -= 1.0;
+            remaining -= ONE;
         }
         Ok(iterator)
     });
@@ -1757,7 +1860,7 @@ fn function_argument(vm: &Vm, at: usize, index: usize) -> Result<Value, RuntimeE
 /// A count for `take` or `skip`: a non-negative whole number.
 fn counting_argument(vm: &Vm, at: usize, index: usize) -> Result<Num, RuntimeError> {
     let count = integer_argument(vm, at, index, "Count")?;
-    if count < 0.0 {
+    if count < ZERO {
         return Err(RuntimeError::new("Count must be a non-negative integer."));
     }
     Ok(count)
@@ -1851,13 +1954,13 @@ fn install_list(vm: &mut Vm) {
         }
         let current = argument(vm, at, 1);
         if current.is_null() {
-            return Ok(Value::num(0.0));
+            return Ok(Value::num(ZERO));
         }
         let index = integer_argument(vm, at, 1, "Iterator")?;
-        if index < 0.0 || index >= (length - 1) as Num {
+        if index < ZERO || index >= (length - 1) as Num {
             return Ok(Value::FALSE);
         }
-        Ok(Value::num(index + 1.0))
+        Ok(Value::num(index + ONE))
     });
 
     define(vm, class, "iteratorValue(_)", |vm, at| {
@@ -1906,12 +2009,12 @@ fn install_list_extras(vm: &mut Vm) {
         let length = list_length(vm, list);
         // `insert` accepts one past the end, where the other index-taking
         // methods do not: appending is a legitimate insertion point.
-        let at_index = if index < 0.0 {
-            index + length as Num + 1.0
+        let at_index = if index < ZERO {
+            index + length as Num + ONE
         } else {
             index
         };
-        if at_index < 0.0 || at_index > length as Num {
+        if at_index < ZERO || at_index > length as Num {
             return Err(RuntimeError::new("Index out of bounds."));
         }
         let handle = list.as_object().unwrap();
@@ -1973,7 +2076,7 @@ fn install_list_extras(vm: &mut Vm) {
 
     define(vm, class, "*(_)", |vm, at| {
         let count = integer_argument(vm, at, 1, "Count")?;
-        if count < 0.0 {
+        if count < ZERO {
             return Err(RuntimeError::new("Count must be a non-negative integer."));
         }
         let elements = list_elements(vm, receiver(vm, at));
@@ -2018,7 +2121,7 @@ fn install_list_extras(vm: &mut Vm) {
         let found = list_elements(vm, receiver(vm, at))
             .iter()
             .position(|element| values_equal(vm, *element, wanted));
-        Ok(Value::num(found.map_or(-1.0, |index| index as Num)))
+        Ok(Value::num(found.map_or(-ONE, |index| index as Num)))
     });
 
     define(vm, class, "isEmpty", |vm, at| {
@@ -2104,7 +2207,7 @@ fn install_list_extras(vm: &mut Vm) {
     if let Some(metaclass) = metaclass {
         define(vm, metaclass, "filled(_,_)", |vm, at| {
             let count = number_argument(vm, at, 1)?;
-            if count < 0.0 || count != math::trunc(count) {
+            if count < ZERO || count != math::trunc(count) {
                 return Err(RuntimeError::new("Size must be a non-negative integer."));
             }
             let value = argument(vm, at, 2);
@@ -2150,12 +2253,12 @@ fn resolve_index(index: Num, length: usize) -> Result<usize, RuntimeError> {
     if index != math::trunc(index) {
         return Err(RuntimeError::new("Index must be an integer."));
     }
-    let resolved = if index < 0.0 {
+    let resolved = if index < ZERO {
         index + length as Num
     } else {
         index
     };
-    if resolved < 0.0 || resolved >= length as Num {
+    if resolved < ZERO || resolved >= length as Num {
         return Err(RuntimeError::new("Index out of bounds."));
     }
     Ok(resolved as usize)
@@ -2283,7 +2386,7 @@ fn install_map(vm: &mut Vm) {
             0
         } else {
             let index = integer_argument(vm, at, 1, "Iterator")?;
-            if index < 0.0 {
+            if index < ZERO {
                 return Ok(Value::FALSE);
             }
             index as usize + 1
@@ -2305,7 +2408,7 @@ fn install_map(vm: &mut Vm) {
         // **Out of the table's range and pointing at an empty slot are
         // different faults.** The first is a bad index, the second an iterator
         // that has gone stale, and upstream reports them differently.
-        if slot < 0.0 || slot as usize >= capacity {
+        if slot < ZERO || slot as usize >= capacity {
             return Err(RuntimeError::new("Iterator out of bounds."));
         }
         let slot = slot as usize;
@@ -2408,17 +2511,38 @@ fn map_count(vm: &Vm, map: Value) -> usize {
 fn hash_value(vm: &Vm, value: Value) -> u32 {
     if let Some(number) = value.as_num() {
         // Hash the bits, folded, so that nearby numbers do not all land in
-        // nearby slots. `0.0` and `-0.0` are equal under `==` and must hash
+        // nearby slots. `ZERO` and `-ZERO` are equal under `==` and must hash
         // alike, so the sign of zero is normalised away first.
         // Widened to 64 bits before folding: the shift below is an overflow
         // when a `Num` is 32 bits wide, and the fold is then a no-op rather
         // than a panic.
-        let normalised = if number == 0.0 { 0.0 } else { number };
+        let normalised = if number == ZERO { ZERO } else { number };
         // Redundant in a 64-bit build and required in a 32-bit one, which is
         // why the lint is silenced rather than the cast removed.
-        #[allow(clippy::unnecessary_cast)]
-        let bits = normalised.to_bits() as u64;
-        return (bits as u32) ^ ((bits >> 32) as u32);
+        #[cfg(not(feature = "no-fp"))]
+        {
+            #[allow(clippy::unnecessary_cast)]
+            let bits = normalised.to_bits() as u64;
+            return (bits as u32) ^ ((bits >> 32) as u32);
+        }
+        // **An integer key still has to be mixed.** Using it as its own hash
+        // looks free and is not: consecutive keys then land in consecutive
+        // slots, and `core/map/churn` -- upstream's own regression test for
+        // exactly this -- fills the table with tombstones and the probe never
+        // reaches a never-used slot to stop at. The float path gets its
+        // scatter for nothing by folding a double's bits; this has to ask.
+        //
+        // MurmurHash3's finalizer: two multiplies and three shifts.
+        #[cfg(feature = "no-fp")]
+        {
+            let mut bits = normalised as u32;
+            bits ^= bits >> 16;
+            bits = bits.wrapping_mul(0x85eb_ca6b);
+            bits ^= bits >> 13;
+            bits = bits.wrapping_mul(0xc2b2_ae35);
+            bits ^= bits >> 16;
+            return bits;
+        }
     }
     if value.is_null() {
         return 1;
@@ -2440,9 +2564,15 @@ fn hash_value(vm: &Vm, value: Value) -> u32 {
             // Widened before folding: the shift below is an overflow when a
             // `Num` is 32 bits, where the fold should simply do nothing.
             #[allow(clippy::unnecessary_cast)]
+            #[cfg(not(feature = "no-fp"))]
             let from = range.from.to_bits() as u64;
+            #[cfg(feature = "no-fp")]
+            let from = range.from as u64;
             #[allow(clippy::unnecessary_cast)]
+            #[cfg(not(feature = "no-fp"))]
             let to = range.to.to_bits() as u64;
+            #[cfg(feature = "no-fp")]
+            let to = range.to as u64;
             (from as u32)
                 ^ ((from >> 32) as u32)
                 ^ (to as u32).rotate_left(7)
@@ -2468,10 +2598,17 @@ fn probe(vm: &Vm, entries: &[MapEntry], key: Value) -> (usize, bool) {
 
     // **Bounded by the table, because a full one has no never-used slot to
     // stop at.** The load factor keeps *live* entries under three quarters
-    // and says nothing about tombstones, so a table that has been churned --
-    // inserted into and removed from repeatedly without ever growing -- can
-    // reach a state where every slot is live or a tombstone. An unbounded
-    // walk then never terminates, and the VM hangs rather than failing.
+    // but says nothing about tombstones, so a table that has been churned --
+    // inserted and removed from repeatedly without growing -- can reach a
+    // state where every slot is live or a tombstone. An unbounded walk then
+    // never terminates.
+    //
+    // This was reachable before and not reached: a double's bits fold so
+    // badly for small integers that 1, 2 and 3 all hash to the same slot, so
+    // every probe started in the same place and met a tombstone before it
+    // ever reached the untouched tail. An integer build hashes properly,
+    // scatters, and finds the hole in the afternoon. `core/map/churn` is
+    // upstream's own regression test for the same family of bug.
     for _ in 0..capacity {
         let entry = entries[slot];
         if entry.key.is_undefined() {
@@ -2490,7 +2627,7 @@ fn probe(vm: &Vm, entries: &[MapEntry], key: Value) -> (usize, bool) {
     }
     // Every slot walked: the key is not here, and the only place to put one
     // is a tombstone. There is always at least one, because the load factor
-    // guarantees the table is never full of *live* entries.
+    // guarantees the table is never full of live entries.
     (tombstone.unwrap_or(slot), false)
 }
 
@@ -2608,21 +2745,21 @@ fn install_range(vm: &mut Vm) {
 
     define(vm, class, "from", |vm, at| {
         Ok(Value::num(
-            range_of(vm, receiver(vm, at)).map_or(Num::NAN, |r| r.from),
+            range_of(vm, receiver(vm, at)).map_or(NOT_A_NUMBER, |r| r.from),
         ))
     });
     define(vm, class, "to", |vm, at| {
         Ok(Value::num(
-            range_of(vm, receiver(vm, at)).map_or(Num::NAN, |r| r.to),
+            range_of(vm, receiver(vm, at)).map_or(NOT_A_NUMBER, |r| r.to),
         ))
     });
     define(vm, class, "min", |vm, at| {
         let range = range_of(vm, receiver(vm, at));
-        Ok(Value::num(range.map_or(Num::NAN, |r| r.from.min(r.to))))
+        Ok(Value::num(range.map_or(NOT_A_NUMBER, |r| r.from.min(r.to))))
     });
     define(vm, class, "max", |vm, at| {
         let range = range_of(vm, receiver(vm, at));
-        Ok(Value::num(range.map_or(Num::NAN, |r| r.from.max(r.to))))
+        Ok(Value::num(range.map_or(NOT_A_NUMBER, |r| r.from.max(r.to))))
     });
 
     // Upstream's `Range.iterate` verbatim in behaviour, including the two edge
@@ -2650,12 +2787,12 @@ fn install_range(vm: &mut Vm) {
             .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?;
 
         if range.from < range.to {
-            iterator += 1.0;
+            iterator += ONE;
             if iterator > range.to {
                 return Ok(Value::FALSE);
             }
         } else {
-            iterator -= 1.0;
+            iterator -= ONE;
             if iterator < range.to {
                 return Ok(Value::FALSE);
             }
@@ -2721,7 +2858,7 @@ fn slice_indices(range: &ObjRange, length: usize) -> Result<Vec<usize>, RuntimeE
     // without it, a start equal to the length is out of bounds and the idiom
     // fails on exactly the case it exists for.
     let end = if range.is_inclusive {
-        -1.0
+        -ONE
     } else {
         length as Num
     };
@@ -2733,7 +2870,7 @@ fn slice_indices(range: &ObjRange, length: usize) -> Result<Vec<usize>, RuntimeE
         if value != math::trunc(value) {
             return Err(RuntimeError::new("Range start must be an integer."));
         }
-        let resolved = if value < 0.0 {
+        let resolved = if value < ZERO {
             value + length as Num
         } else {
             value
@@ -3160,7 +3297,7 @@ pub fn install_random(vm: &mut Vm) -> usize {
         let list = argument(vm, at, 1);
         let count = number_argument(vm, at, 2)?;
         let mut elements = list_elements(vm, list);
-        if count < 0.0 || count as usize > elements.len() {
+        if count < ZERO || count as usize > elements.len() {
             return Err(RuntimeError::new("Not enough elements to sample."));
         }
         // **Without replacement**, which is what Wren's `sample` promises: a

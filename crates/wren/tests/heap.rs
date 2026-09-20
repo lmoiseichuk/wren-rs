@@ -155,7 +155,7 @@ fn an_instance_keeps_its_class_and_fields() {
     let field = string(&mut heap, "origin");
     // An instance's fields live in the heap's arena, so the heap is the only
     // thing that can make one.
-    let instance = Value::object(heap.new_instance(class, &[field, Value::num(1.0)]));
+    let instance = Value::object(heap.new_instance(class, &[field, Value::num(1 as wren::value::Num)]));
 
     heap.collect([instance]);
 
@@ -202,8 +202,8 @@ fn freed_slots_are_reused() {
 fn a_range_holds_no_references() {
     let mut heap = Heap::new();
     let range = Value::object(heap.allocate(Object::Range(ObjRange {
-        from: 1.0,
-        to: 5.0,
+        from: 1 as wren::value::Num,
+        to: 5 as wren::value::Num,
         is_inclusive: true,
     })));
 
