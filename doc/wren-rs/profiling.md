@@ -745,6 +745,53 @@ Nine experiments kept in five commits; eleven refused. Experiments 14, 15 and
 16 produced **bit-identical machine code**, which is how three different ideas
 came to have one number.
 
+### A second pass, after the first one changed the tree
+
+| # | experiment | b_trees | fib | list | method | sum | kept |
+|---|---|---|---|---|---|---|---|
+| 21 | field accessors `Option`/`bool`, `#[cold]` | −3.84% | +0.31% | +0.07% | −8.70% | **−2.04%** | **yes** |
+| 22 | blank instance, no temporary vector | −12.99% | +0.56% | +0.60% | +0.72% | **−4.29%** | **yes** |
+| 23 | fast path without two `Option`s | −0.06% | −0.50% | −0.52% | −0.27% | −0.34% | **yes** |
+| 24 | reserve a frame's slots, push unchecked | −0.87% | **−1.50%** | **−1.91%** | −0.53% | **−1.22%** | **yes** |
+| 25 | ...and pop unchecked as well | **+1.51%** | **+1.84%** | **+1.33%** | **+1.98%** | **+1.73%** | no |
+
+**25 is the instructive one.** The bound that justifies an unchecked *push*
+justifies an unchecked *pop* just as well -- `max_stack` refuses a function
+whose depth would go negative, and `verify-slots` confirms no function falls
+below where it started over all 829 programs. The guarantee was real and the
+change still lost, on all four benchmarks at once.
+
+The reason is in the shape of the code rather than in the count. `Vec::pop`
+reads the value and then lowers the length; the replacement lowered the length
+and then read, which is a store the following load cannot be reordered around.
+The test that was supposedly being removed was cheaper than the barrier that
+replaced it -- and the same guarantee, applied to pushes, is worth 1.22%.
+**A safety argument tells you a change is permitted, not that it is an
+improvement.**
+
+### The opcode mix does not move
+
+Re-profiled after all of the above, expecting the ranking to have shifted:
+every count is **identical**, benchmark by benchmark and opcode by opcode. That
+is the right answer and worth confirming rather than assuming -- none of these
+changes altered which instructions run, only what each costs. What did move is
+the price: 23.7 machine instructions per bytecode instruction, against 24.0
+before this pass and the 108 an earlier note miscalculated by dividing by
+single-run counts when the board repeats `fib` five times and `method_call`
+ten.
+
+So the ranking that decides where to look next is unchanged, and `Call` is
+still the only arm frequent enough that one machine instruction is worth a per
+cent:
+
+| opcode | device ops | share | one instruction saved |
+|---|---|---|---|
+| `Call` | 16,539,893 | 36.81% | **1.55%** |
+| `JumpIf` | 4,472,026 | 9.95% | 0.42% |
+| `LoadLocalPair` | 4,391,387 | 9.77% | 0.41% |
+| `Constant` | 4,151,398 | 9.24% | 0.39% |
+| `LoadLocalConstant` | 3,949,939 | 8.79% | 0.37% |
+
 ### What the failures have in common
 
 **Four of them removed a cost that was not there.** 12 and 18 measured exactly

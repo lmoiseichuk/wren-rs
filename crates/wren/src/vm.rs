@@ -2413,6 +2413,17 @@ impl Vm {
                                 self.stack.len() - entry_len,
                             );
                         }
+                        // **The other half of the bound.** `max_stack`
+                        // refuses a function whose depth would go negative,
+                        // which is what says a pop always has something to
+                        // take -- the guarantee `pop_reserved` rests on.
+                        if self.stack.len() < entry_len {
+                            std::eprintln!(
+                                "SLOTS-UNDER fn '{}' fell {} below where it started",
+                                function.name,
+                                entry_len - self.stack.len(),
+                            );
+                        }
                     }
                 }
             }
