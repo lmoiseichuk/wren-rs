@@ -14,7 +14,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -280,8 +279,6 @@ pub struct Vm {
     /// of the chapter. One flat namespace would pass most of the suite and get
     /// the interesting half wrong.
     pub modules: Vec<Module>,
-    /// Module name to index, so an import can find one already loaded.
-    pub module_index: BTreeMap<String, usize>,
     /// How to find a module's source, if the host can.
     ///
     /// `None` means imports fail, which is right for a firmware with no
@@ -615,7 +612,6 @@ impl Vm {
             num_ops: [NUM_OP_NONE; 256],
             primitives: Vec::new(),
             modules: alloc::vec![Module::new()],
-            module_index: BTreeMap::new(),
             module_loader: None,
             clock: None,
             core_variables: 0,
@@ -727,7 +723,27 @@ impl Vm {
     /// it after the file; one evaluating a string may leave it unnamed.
     pub fn set_main_module_name(&mut self, name: &str) {
         self.modules[0].name = name.to_string();
-        self.module_index.insert(name.to_string(), 0);
+    }
+
+    /// The index of a loaded module, by name.
+    ///
+    /// **A scan, not a map.** A program holds a handful of modules and every
+    /// caller is an import or a `Meta` query, so this runs a few times in a
+    /// program's life. The `BTreeMap<String, usize>` it replaces was 1,934 B
+    /// of monomorphised B-tree.
+    ///
+    /// An unnamed module cannot be found: the main module has no name until a
+    /// host gives it one, and asking for `""` used to find nothing.
+    pub fn module_index(&self, name: &str) -> Option<usize> {
+        if name.is_empty() {
+            return None;
+        }
+        for (index, module) in self.modules.iter().enumerate() {
+            if module.name == name {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// Tell the VM how to read a clock, for `System.clock`.
@@ -749,8 +765,8 @@ impl Vm {
     /// second because running it means continuing in a new frame rather than
     /// falling through.
     fn load_module(&mut self, name: &str) -> Result<(usize, Option<ObjectId>), RuntimeError> {
-        if let Some(index) = self.module_index.get(name) {
-            return Ok((*index, None));
+        if let Some(index) = self.module_index(name) {
+            return Ok((index, None));
         }
 
         // Built-in modules are constructed rather than loaded: there is no
@@ -794,9 +810,8 @@ impl Vm {
         }
         self.modules.push(module);
         let index = self.modules.len() - 1;
-        // Registered *before* compiling, so a module that imports itself finds
-        // the partially built one rather than looping forever.
-        self.module_index.insert(name.to_string(), index);
+        // The name was set above, *before* compiling, so a module that imports
+        // itself finds the partially built one rather than looping forever.
 
         // **A module can only be loaded where there is a compiler.** A build
         // without one runs bytecode it was handed, and `import` of a source
@@ -990,7 +1005,22 @@ impl Vm {
             }
             classes.push((depth, id));
         }
-        classes.sort_by_key(|(depth, _)| *depth);
+        // **A counting pass, not a sort.** The walk above stops at 64, so a
+        // depth is one of 0..=64 and the general sort's whole machinery --
+        // driftsort, its quicksort fallback and its small-sort kernels, all
+        // monomorphised for this one tuple -- buys nothing over one pass per
+        // depth. Equal depths keep their table order, which is what
+        // `sort_by_key`'s stability gave, so the order handed on is identical.
+        let deepest = classes.iter().map(|entry| entry.0).max().unwrap_or(0);
+        let mut ordered: Vec<(usize, ObjectId)> = Vec::with_capacity(classes.len());
+        for want in 0..=deepest {
+            for entry in &classes {
+                if entry.0 == want {
+                    ordered.push(*entry);
+                }
+            }
+        }
+        let classes = ordered;
 
         for (_, id) in &classes {
             let parent = match self.heap.class(*id) {
@@ -1342,7 +1372,7 @@ impl Vm {
         variable: &str,
         line: u16,
     ) -> Result<Value, RuntimeError> {
-        let Some(from) = self.module_index.get(module_name).copied() else {
+        let Some(from) = self.module_index(module_name) else {
             return Err(RuntimeError {
                 message: format!("Could not load module '{module_name}'."),
                 line,

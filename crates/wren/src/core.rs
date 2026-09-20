@@ -3006,7 +3006,7 @@ pub fn install_meta(vm: &mut Vm) -> usize {
             return Err(RuntimeError::new("Module name must be a string."));
         }
         let name = vm.to_string(value);
-        let Some(index) = vm.module_index.get(&name).copied() else {
+        let Some(index) = vm.module_index(&name) else {
             return Err(RuntimeError::new(alloc::format!(
                 "Could not find a module named '{name}'."
             )));
@@ -3071,10 +3071,7 @@ pub fn install_meta(vm: &mut Vm) -> usize {
     module.name = alloc::string::String::from("meta");
     module.define("Meta", Value::object(class));
     vm.modules.push(module);
-    let index = vm.modules.len() - 1;
-    vm.module_index
-        .insert(alloc::string::String::from("meta"), index);
-    index
+    vm.modules.len() - 1
 }
 
 /// Build the built-in `random` module and return its index.
@@ -3242,12 +3239,13 @@ pub fn install_random(vm: &mut Vm) -> usize {
     vm.random_class = class;
 
     let mut module = crate::vm::Module::new();
+    // **Named, like every other module.** It was not before, because the name
+    // lived in a separate index; `Meta.getModuleVariables("random")` found it
+    // through that map and would find nothing without this line.
+    module.name = alloc::string::String::from("random");
     module.define("Random", Value::object(class));
     vm.modules.push(module);
-    let index = vm.modules.len() - 1;
-    vm.module_index
-        .insert(alloc::string::String::from("random"), index);
-    index
+    vm.modules.len() - 1
 }
 
 fn new_random(vm: &mut Vm, class: crate::handle::ObjectId, seed: u32) -> Value {
