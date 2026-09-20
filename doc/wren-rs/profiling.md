@@ -711,6 +711,50 @@ effect can be larger than the first and point the other way. It is not visible
 in the source and not predictable from the mechanism. Only the four numbers
 say which way it went.
 
+### Where the `#[cold]` trick stops working
+
+Taking a constant error out of line won `field_of` two points. The same edit
+was then tried on every other eager `RuntimeError::new` the call and return
+paths construct, and every one of them lost:
+
+| error moved out of line | `binary_trees` | `fib` | sum |
+|---|---|---|---|
+| `not_a_field`, from six arms of `run_frames` | −3.84% | +0.31% | **−2.04%** |
+| the `Call` arm's two, already behind `ok_or_else` | +0.31% | +0.69% | +0.55% |
+| `call_target`'s two | +0.34% | **+1.37%** | +0.89% |
+| `resume_chunk`'s one | +0.81% | **+2.00%** | +1.47% |
+
+**The boundary is which function the error was in, not how hot it was.**
+`field_of` is called from six arms of a function large enough that a few bytes
+per arm decide what stays in registers. `call_target` and `resume_chunk` are
+small, are inlined into the call and return paths, and having the construction
+inline is apparently what the optimiser wants there -- rewriting it as an
+`Option` return, marking it `#[cold]`, and forcing `#[inline(always)]` all
+produced *bit-identical* machine code, and all three cost `fib` the same 1.37%.
+Three formulations, one answer: leave it where it is.
+
+### The ceiling on what is left
+
+At 108 machine instructions per bytecode instruction, what a change can be
+worth is mostly decided before it is written:
+
+| | share of executions | 10 machine instructions saved on each |
+|---|---|---|
+| the top ten opcodes | 91.0% | 8.4% |
+| the next ten | 9.0% | **0.83%** |
+| `Call` alone | 35.4% | 3.3% |
+
+The model is worth trusting: it predicted 2.05% for the field change, against
+2.0% measured. What it says is that **the next ten opcodes cannot reach one per
+cent** -- 9% of executions, and a simple arm has nowhere near ten instructions
+to give. The field path only managed thirty because it was constructing a
+`String`-bearing error that no benchmark ever raises.
+
+It also says where anything further has to come from: `Call` is the only opcode
+frequent enough that three instructions saved is a whole per cent. The known
+lever there is quickening, and that needs mutable chunks -- which is what
+`code_units` and `chunk_constants` trade on.
+
 ### What was refused, again
 
 Two changes were written, measured, and found to be already in the list below:
