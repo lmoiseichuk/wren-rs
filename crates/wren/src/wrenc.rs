@@ -500,6 +500,74 @@ pub struct Loaded {
 }
 
 /// Read a `.wrenc` into `vm`, returning a closure ready to run.
+/// What a compiled program asks of the core library.
+///
+/// **The file already said this; nothing new is written.** Every `.wrenc`
+/// carries the method signatures its code calls and the module variables it
+/// names, because the loader has to remap them into the VM it is landing in.
+/// Read back, that list *is* a manifest: the exact set of core methods and
+/// classes the program can possibly reach.
+///
+/// What it is for is deciding what to link. `core::install` is one binding
+/// call per method and the class installers are the rest of the core's
+/// flash; a firmware that knows the program never sorts a list, never
+/// interpolates a string and never opens a fiber does not have to carry the
+/// code for any of them. Today that choice is a cargo feature chosen by
+/// hand. This is the same choice, made by the program.
+///
+/// It needs no `Vm` and does not run anything, so a build script can read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    /// Every method signature the code calls, as written -- `count`,
+    /// `add(_)`, `iterate(_)`.
+    pub signatures: alloc::vec::Vec<alloc::string::String>,
+    /// Every module-level variable the code names, which for the core is the
+    /// set of classes it touches -- `List`, `System`, `Fiber`.
+    pub variables: alloc::vec::Vec<alloc::string::String>,
+    /// SHA-256 of the source this was compiled from, so a manifest can be
+    /// matched to the program it describes.
+    pub source_digest: [u8; 32],
+}
+
+/// Read a `.wrenc`'s manifest without loading it.
+pub fn manifest(bytes: &[u8]) -> Result<Manifest, LoadError> {
+    let mut reader = Reader { bytes, at: 0 };
+
+    if reader.take(MAGIC.len())? != MAGIC {
+        return Err(LoadError::NotBytecode);
+    }
+    let version = reader.u16()?;
+    if version != VERSION {
+        return Err(LoadError::WrongVersion {
+            found: version,
+            expected: VERSION,
+        });
+    }
+
+    let mut source_digest = [0u8; 32];
+    source_digest.copy_from_slice(reader.take(32)?);
+
+    let mut signatures = alloc::vec::Vec::new();
+    for _ in 0..reader.u32()? {
+        let name = core::str::from_utf8(reader.blob()?)
+            .map_err(|_| LoadError::Malformed("a method name is not utf-8"))?;
+        signatures.push(alloc::string::String::from(name));
+    }
+
+    let mut variables = alloc::vec::Vec::new();
+    for _ in 0..reader.u32()? {
+        let name = core::str::from_utf8(reader.blob()?)
+            .map_err(|_| LoadError::Malformed("a variable name is not utf-8"))?;
+        variables.push(alloc::string::String::from(name));
+    }
+
+    Ok(Manifest {
+        signatures,
+        variables,
+        source_digest,
+    })
+}
+
 pub fn load(vm: &mut Vm, bytes: &[u8]) -> Result<Loaded, LoadError> {
     let mut reader = Reader { bytes, at: 0 };
 
