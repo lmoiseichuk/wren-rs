@@ -23,9 +23,8 @@
 //! 65,535 units — 256 KB on a 32-bit part, which is far past anything this is
 //! for. Alignment is free for the same reason: every block starts on a unit.
 //!
-//! **This is not wired to the VM.** It is the allocator a `no_std` firmware
-//! without one would hand to `alloc`, and it is here as a tested piece rather
-//! than a promise. See the note at the bottom on what connecting it involves.
+//! [`Arena`] wraps it as a `#[global_allocator]`, which is how a firmware
+//! without one gets `alloc` — and therefore the VM.
 
 /// A block's size, with the high bit meaning the block is free.
 ///
@@ -42,6 +41,17 @@ pub type Unit = usize;
 pub struct UHeap<'a> {
     /// The buffer, in units. Records live at the front, blocks at the back.
     memory: &'a mut [Unit],
+    /// The most units ever spoken for, table included.
+    ///
+    /// **Peak is the number a fixed buffer lives by.** What is in use when a
+    /// run finishes says nothing about whether it fitted.
+    peak: u16,
+    /// How many allocations were refused.
+    ///
+    /// A firmware that refuses one is a firmware that is about to panic, so
+    /// the count is worth having even though it is usually zero -- it turns
+    /// "it crashed" into "it wanted more than this buffer at its worst".
+    refused: u16,
     /// How many records the table holds.
     ///
     /// **This is the third number and it carries the rest.** Blocks are cut
@@ -69,7 +79,12 @@ impl<'a> UHeap<'a> {
     /// asked for it. Clearing 8 KB at boot would be the single most expensive
     /// thing this module did.
     pub fn new(memory: &'a mut [Unit]) -> UHeap<'a> {
-        UHeap { memory, count: 0 }
+        UHeap {
+            memory,
+            count: 0,
+            peak: 0,
+            refused: 0,
+        }
     }
 
     /// How many units the heap spans in total.
@@ -120,7 +135,22 @@ impl<'a> UHeap<'a> {
     /// breaks the descending order the table depends on — and buying that
     /// back would cost more than the waste on a heap this size.
     pub fn alloc(&mut self, units: u16) -> Option<u16> {
-        if units == 0 || units > SIZE {
+        self.alloc_aligned(units, 1)
+    }
+
+    /// Take `units`, starting on a multiple of `align` units.
+    ///
+    /// **Alignment is why this exists.** A unit is a `usize`, so a block is
+    /// naturally aligned for anything `usize`-sized -- and `alloc` is asked
+    /// for eight-byte alignment on a thirty-two-bit part whenever something
+    /// holds a `u64`. Refusing those is refusing to be an allocator; rounding
+    /// the block's start down to the alignment costs at most one unit and
+    /// keeps the block index derivable from the pointer, which is what makes
+    /// `free` a subtraction rather than a header.
+    pub fn alloc_aligned(&mut self, units: u16, align: u16) -> Option<u16> {
+        let align = align.max(1);
+        if units == 0 || units > SIZE || !align.is_power_of_two() {
+            self.refused = self.refused.saturating_add(1);
             return None;
         }
 
@@ -129,7 +159,7 @@ impl<'a> UHeap<'a> {
         let mut best: Option<(u16, u16)> = None;
         for at in 0..self.count {
             let record = self.record(at);
-            if record.free && record.size >= units {
+            if record.free && record.size >= units && record.index.is_multiple_of(align) {
                 match best {
                     Some((_, size)) if size <= record.size => {}
                     _ => best = Some((at, record.size)),
@@ -143,14 +173,21 @@ impl<'a> UHeap<'a> {
             return Some(record.index);
         }
 
+
         // Nothing reusable: cut a new block off the bottom. The table needs
         // one more unit too, and they grow towards each other.
         let floor = self.floor();
         if floor < units {
+            self.refused = self.refused.saturating_add(1);
             return None;
         }
-        let index = floor - units;
+        // Rounded down, so the block starts on the alignment. The gap that
+        // leaves belongs to this block rather than becoming an untracked
+        // hole -- a hole nothing records is a hole nothing can reuse.
+        let index = (floor - units) / align * align;
+        let units = floor - index;
         if (index as usize) < self.count as usize + 1 {
+            self.refused = self.refused.saturating_add(1);
             return None;
         }
         let at = self.count;
@@ -163,6 +200,7 @@ impl<'a> UHeap<'a> {
                 free: false,
             },
         );
+        self.peak = self.peak.max(self.used() as u16);
         Some(index)
     }
 
@@ -234,6 +272,34 @@ impl<'a> UHeap<'a> {
         &mut self.memory[start..start + units as usize]
     }
 
+    /// The most units ever spoken for.
+    pub fn peak(&self) -> usize {
+        self.peak as usize
+    }
+
+    /// How many allocations this heap has refused.
+    pub fn refused(&self) -> usize {
+        self.refused as usize
+    }
+
+    /// The largest run of free units an allocation could still take.
+    ///
+    /// Two numbers make a heap, not one: what is left, and the largest piece
+    /// of it. A heap with plenty free and no piece big enough is full in the
+    /// only sense that matters.
+    pub fn largest_free(&self) -> usize {
+        let mut largest = 0;
+        for at in 0..self.count {
+            let record = self.record(at);
+            if record.free {
+                largest = largest.max(record.size as usize);
+            }
+        }
+        // The unallocated middle, less the unit a new record would need.
+        let middle = (self.floor() as usize).saturating_sub(self.count as usize + 1);
+        largest.max(middle)
+    }
+
     /// How many units are spoken for, holes included.
     ///
     /// The figure a firmware wants is this one rather than the sum of live
@@ -241,5 +307,142 @@ impl<'a> UHeap<'a> {
     pub fn used(&self) -> usize {
         let floor = self.floor() as usize;
         (self.memory.len() - floor) + self.count as usize
+    }
+}
+
+
+/// A [`UHeap`] over a buffer of its own, usable as a `#[global_allocator]`.
+///
+/// ```ignore
+/// #[global_allocator]
+/// static ALLOCATOR: wren::uheap::Arena<2048> = wren::uheap::Arena::new();
+/// ```
+///
+/// `UNITS` is the size in units, so `2048` is 8 KB on a 32-bit part — a
+/// CH32V006's entire RAM.
+///
+/// **Single-threaded by construction, and that is the whole safety
+/// argument.** A global allocator has to be reachable without one, so this
+/// holds its state in `UnsafeCell` and claims `Sync`. That claim is only
+/// true on a target with one core where nothing that allocates can preempt
+/// something else that allocates — which is the firmware this exists for,
+/// and is not something the crate can check. A build with threads or with
+/// allocating interrupt handlers must not use it.
+pub struct Arena<const UNITS: usize> {
+    memory: core::cell::UnsafeCell<[Unit; UNITS]>,
+    heap: core::cell::UnsafeCell<Option<UHeap<'static>>>,
+}
+
+// SAFETY: as documented on the type -- one thread, no allocating preemption.
+#[allow(unsafe_code)]
+unsafe impl<const UNITS: usize> Sync for Arena<UNITS> {}
+
+impl<const UNITS: usize> Default for Arena<UNITS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const UNITS: usize> Arena<UNITS> {
+    /// An empty arena. The buffer is not cleared and is never read unwritten.
+    pub const fn new() -> Arena<UNITS> {
+        Arena {
+            memory: core::cell::UnsafeCell::new([0; UNITS]),
+            heap: core::cell::UnsafeCell::new(None),
+        }
+    }
+
+    /// How many bytes are spoken for, holes included.
+    pub fn used(&self) -> usize {
+        // SAFETY: single-threaded, as documented on the type.
+        #[allow(unsafe_code)]
+        unsafe {
+            self.heap_mut().used() * core::mem::size_of::<Unit>()
+        }
+    }
+
+    /// How many blocks exist, free ones included.
+    pub fn blocks(&self) -> usize {
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            self.heap_mut().blocks()
+        }
+    }
+
+    /// Everything a firmware wants to know, in one go.
+    ///
+    /// `(used, peak, largest free run, blocks, refusals)`, all in bytes
+    /// except the last two. **Peak and the largest free run are the two that
+    /// decide whether a buffer is big enough**: what is in use at the end
+    /// says nothing, and free space that is not in one piece cannot be
+    /// handed out.
+    pub fn stats(&self) -> (usize, usize, usize, usize, usize) {
+        let unit = core::mem::size_of::<Unit>();
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        let heap = unsafe { self.heap_mut() };
+        (
+            heap.used() * unit,
+            heap.peak() * unit,
+            heap.largest_free() * unit,
+            heap.blocks(),
+            heap.refused(),
+        )
+    }
+
+    /// The whole arena, in bytes.
+    pub const fn capacity(&self) -> usize {
+        UNITS * core::mem::size_of::<Unit>()
+    }
+
+    /// The heap, built on first use.
+    ///
+    /// Lazily, because the runtime may allocate before `main` runs and there
+    /// is nowhere earlier to build it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not be reentering this from another thread; see the
+    /// type's documentation.
+    #[allow(unsafe_code, clippy::mut_from_ref)]
+    unsafe fn heap_mut(&self) -> &mut UHeap<'static> {
+        let slot = &mut *self.heap.get();
+        if slot.is_none() {
+            let memory: &'static mut [Unit] = &mut *self.memory.get();
+            *slot = Some(UHeap::new(memory));
+        }
+        slot.as_mut().expect("just built")
+    }
+
+    fn base(&self) -> *mut Unit {
+        self.memory.get().cast()
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe impl<const UNITS: usize> core::alloc::GlobalAlloc for Arena<UNITS> {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        // Every block starts on a unit, so alignment up to one is free and
+        // anything larger is refused rather than quietly misaligned.
+        let unit = core::mem::size_of::<Unit>();
+        let units = layout.size().div_ceil(unit);
+        let align = layout.align().div_ceil(unit).max(1);
+        let (Ok(units), Ok(align)) = (u16::try_from(units), u16::try_from(align)) else {
+            return core::ptr::null_mut();
+        };
+        // SAFETY: single-threaded, as documented on the type.
+        match self.heap_mut().alloc_aligned(units, align) {
+            Some(index) => self.base().add(index as usize).cast(),
+            None => core::ptr::null_mut(),
+        }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, _layout: core::alloc::Layout) {
+        // The handle is the block's unit index and the pointer *is* the
+        // block, so the index is a subtraction rather than a header.
+        let offset = pointer.cast::<Unit>().offset_from(self.base());
+        // SAFETY: as above.
+        self.heap_mut().free(offset as u16);
     }
 }

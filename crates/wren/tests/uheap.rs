@@ -226,3 +226,53 @@ fn churn_never_loses_the_heap() {
     assert_eq!(heap.blocks(), 0, "everything given back leaves nothing behind");
     assert_eq!(heap.used(), 0);
 }
+
+#[test]
+fn a_block_can_be_asked_to_start_on_an_alignment() {
+    let mut memory = buffer(64);
+    let mut heap = UHeap::new(&mut memory);
+    // Odd sizes, so an unaligned start is what would happen by default.
+    for _ in 0..6 {
+        let index = heap.alloc_aligned(3, 2).expect("fits");
+        assert_eq!(index % 2, 0, "block {index} should start on an even unit");
+    }
+}
+
+#[test]
+fn an_aligned_hole_is_reused_and_a_misaligned_one_is_not() {
+    let mut memory = buffer(64);
+    let mut heap = UHeap::new(&mut memory);
+    let _anchor = heap.alloc(1).expect("fits");
+    let odd = heap.alloc(2).expect("fits");
+    assert_eq!(odd % 2, 1, "this hole starts on an odd unit");
+    assert!(heap.free(odd));
+
+    // The misaligned hole cannot serve an aligned ask, so a fresh block is
+    // cut rather than the pointer being quietly wrong.
+    let aligned = heap.alloc_aligned(2, 2).expect("fits");
+    assert_eq!(aligned % 2, 0);
+    assert_ne!(aligned, odd);
+}
+
+#[test]
+fn the_heap_says_what_it_did() {
+    let mut memory = buffer(32);
+    let mut heap = UHeap::new(&mut memory);
+    let _a = heap.alloc(4).expect("fits");
+    let b = heap.alloc(4).expect("fits");
+    assert_eq!(heap.peak(), 10, "two blocks of four and two records");
+
+    // `b` is the lowest block, so freeing it unwinds rather than leaving a
+    // hole -- and `used` counts holes, which is why it is the *last* block
+    // that makes it fall.
+    assert!(heap.free(b));
+    assert_eq!(heap.used(), 5, "one block of four and its record");
+    assert!(heap.used() < heap.peak(), "peak remembers the high-water mark");
+
+    assert_eq!(heap.refused(), 0);
+    assert!(heap.alloc(1000).is_none());
+    assert_eq!(heap.refused(), 1, "a refusal is counted");
+
+    // Free space in one piece is what an allocation can actually take.
+    assert!(heap.largest_free() >= 4);
+}
