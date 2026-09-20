@@ -930,6 +930,65 @@ impl Vm {
         }
     }
 
+    /// What the VM itself holds, beside the heap.
+    ///
+    /// **Most of a freshly built VM is not objects.** The heap's own
+    /// accounting covers classes, strings and closures; this covers the
+    /// vectors the interpreter keeps outside it -- the value stack, the
+    /// interned signatures, the primitive table, each module's variables --
+    /// and on a part where the whole heap is fixed those are the larger half.
+    ///
+    /// Paired with [`Heap::memory_census`] and `Heap::bytes` it accounts for
+    /// everything a `Vm` has asked the allocator for, which is what a fixed
+    /// heap's own total can then be checked against.
+    #[cfg(feature = "census")]
+    pub fn memory_census(&self) -> alloc::vec::Vec<(&'static str, usize)> {
+        use ::core::mem::size_of;
+        let mut out = alloc::vec::Vec::new();
+
+        out.push(("Vm struct", size_of::<Vm>()));
+        out.push(("stack", self.stack.capacity() * size_of::<Value>()));
+        out.push(("frames", self.frames.capacity() * size_of::<Frame>()));
+        out.push((
+            "primitives",
+            self.primitives.capacity() * size_of::<crate::object::Primitive>(),
+        ));
+        out.push(("method_names", self.method_names.footprint()));
+
+        // Every module carries its own name table and variable vector, and
+        // module zero is the core -- which is where the core's classes are
+        // named and so the larger of them in a program that imports nothing.
+        let mut modules = self.modules.capacity() * size_of::<Module>();
+        for module in &self.modules {
+            modules += module.name.capacity()
+                + module.names.footprint()
+                + module.values.capacity() * size_of::<Value>();
+        }
+        out.push(("modules", modules));
+
+        out.push((
+            "open_upvalues",
+            self.open_upvalues.capacity() * size_of::<ObjectId>(),
+        ));
+        out.push((
+            "root_handles",
+            self.root_handles.capacity() * size_of::<ObjectId>(),
+        ));
+        out.push(("output", self.output.capacity()));
+
+        // Read once during `install` and then dead weight for the life of the
+        // VM, which is worth seeing rather than assuming.
+        let filter = match &self.core_filter {
+            Some(names) => {
+                names.capacity() * size_of::<alloc::string::String>()
+                    + names.iter().map(|name| name.capacity()).sum::<usize>()
+            }
+            None => 0,
+        };
+        out.push(("core_filter", filter));
+        out
+    }
+
     /// What `System.print` has written so far.
     pub fn output_str(&self) -> &str {
         ::core::str::from_utf8(&self.output).unwrap_or("<not utf-8>")

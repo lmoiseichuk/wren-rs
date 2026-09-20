@@ -554,9 +554,55 @@ grow, and a doubling allocates the new block before releasing the old -- which
 `uheap` will not split, so each one leaves a hole behind.
 
 **So flash fits a CH32V006 and RAM does not**, by 3,272 bytes against its 8,192.
-The gap is not in the core any more; it is in how the VM's two growing vectors
-are sized. Reserving them once at a depth the manifest can imply, rather than
-doubling into them, is where the next measurement should go.
+
+#### What the 7,296 bytes actually are
+
+`--features census` makes the VM answer that itself, on the part, and the
+answer is not what the shape of the problem suggested. Built with `fib`'s
+manifest, before a line of its code runs:
+
+| | bytes |
+|---|---|
+| object contents -- strings, method tables | 1,667 |
+| slot tables: `Class` 128, `String` 512 | 640 |
+| slot bookkeeping -- free lists, mark bits | 64 |
+| `primitives` | 256 |
+| `method_names`, the interned signatures | 289 |
+| `modules` -- the core namespace's names and values | 703 |
+| **everything the VM asked for** | **3,619** |
+| the runtime, before the VM existed | 544 |
+| the census's own vectors | 326 |
+| **everything every caller asked for** | **4,489** |
+| the arena's own overhead | 2,235 |
+| block records, 143 x 4 B | 572 |
+| **the arena holds** | **7,296** |
+
+and 1,480 bytes of `Vm` struct beside it, on the stack rather than in the heap.
+
+The ledger closes to the byte, which is the point of printing it that way: a
+term nobody thought of shows up as a discrepancy instead of hiding inside a
+plausible figure. Two readings come out of it.
+
+**The tailored VM is genuinely small -- 3,619 bytes -- and the allocator is
+taking another 2,807 on top of it.** Overhead plus block records is 38% of the
+total, more than every VM structure except the objects themselves.
+
+**And that overhead has one cause, not three.** The census counts the two
+mechanisms apart: alignment gaps absorbed by a fresh cut have cost 4 bytes in
+the whole run, and holes reused whole have cost 4,144. `alloc_aligned` takes a
+best-fit hole without splitting it -- the note there says splitting would put
+the allocated half above the free remainder and break the descending order the
+table depends on -- so a 64-byte hole answers a 12-byte ask and keeps the other
+52. With 72 of the VM's 139 blocks at 16 bytes or under, that rounding falls on
+nearly everything.
+
+Which makes the next measurement a different one from the one the previous
+section pointed at: splitting a reused hole, at the cost of teaching the table
+an ascending pair, is worth about 2 KB of the 3,272 the part is short by. The
+`stack` and `frames` vectors doubling during the run are the rest of it, and
+still worth reserving from the manifest -- but they are no longer the larger
+half.
+
 
 ### What is left worth building
 

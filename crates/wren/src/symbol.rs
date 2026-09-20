@@ -16,6 +16,22 @@ pub struct SymbolTable {
 }
 
 impl SymbolTable {
+    /// What this table has taken: the vector, and every name in it.
+    ///
+    /// **A signature is a `String`, so each one is its own allocation** --
+    /// `"iteratorValue(_)"` is a 16-byte buffer plus the 12 bytes of the
+    /// `String` that points at it. Interning 160 of them is the reason a VM
+    /// that has run nothing still holds kilobytes.
+    #[cfg(feature = "census")]
+    pub fn footprint(&self) -> usize {
+        self.names.capacity() * core::mem::size_of::<String>()
+            + self
+                .names
+                .iter()
+                .map(|name| name.capacity())
+                .sum::<usize>()
+    }
+
     pub fn new() -> SymbolTable {
         SymbolTable { names: Vec::new() }
     }

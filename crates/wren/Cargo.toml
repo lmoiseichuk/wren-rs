@@ -143,7 +143,12 @@ uwren = ["alloc", "nofp"]
 # default and never shipped: it adds a tally to every allocation and, at every
 # collection, a refcount simulation over the garbage to work out how much of it
 # is cyclic. `cargo run --release --features profile --example heap-profile`.
-profile = ["std"]
+profile = ["std", "census"]
+# **Asking a built VM what it is holding, without `std`.** The counters above
+# need a host; this needs only the arithmetic, so a firmware can print its own
+# breakdown on the part where the number actually matters. `profile` turns it
+# on because every one of its reports wants it too.
+census = []
 # **Reference counting in front of the tracing collector. Off, and measured.**
 #
 # Every heap-to-heap reference is counted and an object whose count reaches

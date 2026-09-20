@@ -46,6 +46,152 @@ fn report(when: &str) {
     );
 }
 
+/// What the VM is holding, line by line, and whether it adds up.
+///
+/// **Two independent accountings, printed together.** The VM says what it
+/// asked for; the arena says what it actually cut. They will not match to the
+/// byte -- an allocator rounds, and `Vec::capacity` is what a vector was given
+/// rather than what the allocator charged for it -- but a gap much wider than
+/// the block count explains means something is being paid for that no line
+/// here names.
+#[cfg(feature = "census")]
+fn breakdown(vm: &Vm, baseline: usize) {
+    // **The walk comes first, before anything below allocates.** Both census
+    // calls build vectors, and they build them in the arena being measured --
+    // so asking the arena afterwards would count the question as part of the
+    // answer.
+    let mut live = 0;
+    let mut holes = 0;
+    let mut live_blocks = 0;
+    let mut hole_blocks = 0;
+    // Buckets are powers of two: 1-16 B, 17-32, and so on to 1 KB and up.
+    let mut buckets = [0usize; 8];
+    ALLOCATOR.walk(|bytes, free| {
+        match free {
+            true => {
+                holes += bytes;
+                hole_blocks += 1;
+            }
+            false => {
+                live += bytes;
+                live_blocks += 1;
+                let bucket = match bytes {
+                    0..=16 => 0,
+                    17..=32 => 1,
+                    33..=64 => 2,
+                    65..=128 => 3,
+                    129..=256 => 4,
+                    257..=512 => 5,
+                    513..=1024 => 6,
+                    _ => 7,
+                };
+                buckets[bucket] += 1;
+            }
+        }
+    });
+
+    let mut asked = 0;
+
+    println!();
+    println!("what the VM holds, and why                      bytes");
+    println!("-----------------------------------------------------");
+
+    // **An object's cost is its slot plus its contents, and the slot is
+    // already in the table's capacity below.** Charging `Heap::bytes` whole
+    // would count every occupied slot twice, so the slots come back out here
+    // and what is left is what the objects themselves own: a string's text,
+    // a class's method table.
+    let mut occupied = 0;
+    for (_, slots, free, size) in vm.heap.slot_census() {
+        occupied += (slots - free) * size;
+    }
+    let contents = vm.heap.bytes().saturating_sub(occupied);
+    println!("  object contents (strings, method tables) {contents:>8}");
+    asked += contents;
+
+    // Slot vectors and the bookkeeping sized from them. An empty table costs
+    // nothing, so only the ones that grew are worth a line.
+    let mut slots = 0;
+    let mut books = 0;
+    for (name, table, bookkeeping) in vm.heap.memory_census() {
+        if table + bookkeeping == 0 {
+            continue;
+        }
+        println!("  {name:<20} slots {table:>8}  + {bookkeeping} bookkeeping");
+        slots += table;
+        books += bookkeeping;
+    }
+    asked += slots + books;
+
+    println!("-----------------------------------------------------");
+    let mut on_the_stack = 0;
+    for (name, bytes) in vm.memory_census() {
+        if bytes == 0 {
+            continue;
+        }
+        // **The `Vm` is a local in `main`, so it is stack and not arena.**
+        // Real RAM either way and worth seeing, but it must not be added to a
+        // total the allocator is going to be asked to confirm.
+        if name == "Vm struct" {
+            println!("  {name:<38} {bytes:>10}  (stack, not heap)");
+            on_the_stack = bytes;
+            continue;
+        }
+        println!("  {name:<38} {bytes:>10}");
+        asked += bytes;
+    }
+
+    println!("-----------------------------------------------------");
+    println!("  the VM says it asked the arena for     {asked:>10}");
+    println!("  ...and holds this much stack besides   {on_the_stack:>10}");
+
+    // **A closed ledger, not a list of numbers.** Every line below is
+    // measured, and they are printed in an order that adds up to the arena's
+    // own total -- so a term nobody thought of shows up as a discrepancy
+    // rather than hiding inside a plausible-looking figure.
+    let requested = ALLOCATOR.requested();
+    let records = (live_blocks + hole_blocks) * core::mem::size_of::<Unit>();
+    // The two census calls above built vectors, and they built them here.
+    let census_itself = requested.saturating_sub(asked + baseline);
+
+    println!();
+    println!("  reconciling, in bytes:");
+    println!("    the VM's lines above                 {asked:>10}");
+    println!("    the runtime, before the VM existed   {baseline:>10}");
+    println!("    this census's own vectors            {census_itself:>10}");
+    println!("    -------------------------------------------");
+    println!("    every caller asked for               {requested:>10}");
+    let (reuse, cut) = ALLOCATOR.wasted();
+    println!(
+        "    the arena's overhead                 {:>10}",
+        (live + holes).saturating_sub(requested)
+    );
+    // **Cumulative, so these can exceed the line above.** Both are decisions
+    // taken when a block is cut and a later free does not give them back --
+    // which is the point: they say which rule to change, not what is held now.
+    println!("      ...holes reused whole, ever        {reuse:>10}");
+    println!("      ...alignment gaps absorbed, ever   {cut:>10}");
+    println!(
+        "    block records                        {records:>10}   {} blocks x {} B",
+        live_blocks + hole_blocks,
+        core::mem::size_of::<Unit>()
+    );
+    println!("    -------------------------------------------");
+    println!(
+        "    the arena holds                      {:>10}   of which {holes} B is holes",
+        live + holes + records
+    );
+
+    println!();
+    println!("  block sizes:");
+    let labels = ["<=16 B", "<=32 B", "<=64 B", "<=128 B", "<=256 B", "<=512 B", "<=1 KB", "> 1 KB"];
+    for (label, count) in labels.iter().zip(buckets.iter()) {
+        if *count > 0 {
+            println!("    {label:<10} {count:>4}");
+        }
+    }
+}
+
 #[main]
 fn main() -> ! {
     let _peripherals = esp_hal::init(esp_hal::Config::default());
@@ -63,8 +209,15 @@ fn main() -> ! {
     };
     println!("fib asks for: {} core methods", manifest.signatures.len());
 
+    // Taken before the VM is built, because the arena is the global allocator
+    // and the runtime is already in it -- see `breakdown`.
+    let baseline = ALLOCATOR.stats().0;
+    report("before the VM");
+
     let mut vm = Vm::with_core_methods(&manifest.signatures);
     report("after the VM");
+    #[cfg(feature = "census")]
+    breakdown(&vm, baseline);
 
     let origin = Instant::now();
     vm.set_clock(move || origin.elapsed().as_micros() as f64 / 1_000_000.0);

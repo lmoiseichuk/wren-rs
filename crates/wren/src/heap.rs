@@ -455,6 +455,37 @@ impl<T> Table<T> {
         core::mem::size_of::<Option<T>>()
     }
 
+    /// What this table has actually asked the allocator for.
+    ///
+    /// **Capacity, not occupancy.** `Heap::bytes` counts the slots that hold
+    /// something, which is the right number for deciding when to collect and
+    /// the wrong one for deciding how much RAM a part needs: a `Vec` that
+    /// doubled to 64 slots and holds 33 of them has taken all 64, and the
+    /// bookkeeping vectors beside it were sized to match. On a fixed heap
+    /// that difference is most of the total -- see `doc/wren-rs/memory.md`.
+    #[cfg(feature = "census")]
+    fn footprint(&self) -> (usize, usize) {
+        #[cfg(feature = "blocked-slots")]
+        let slots = self.blocks.capacity() * core::mem::size_of::<Vec<Option<T>>>()
+            + self
+                .blocks
+                .iter()
+                .map(|block| block.capacity() * self.slot_size())
+                .sum::<usize>();
+        #[cfg(not(feature = "blocked-slots"))]
+        let slots = self.blocks.capacity() * self.slot_size();
+
+        // The free list, the mark bits and the generation bookkeeping: all
+        // sized from the table and none of it visible in an object's cost.
+        let bookkeeping = self.free.capacity() * core::mem::size_of::<u32>()
+            + self.marks.capacity() * core::mem::size_of::<u64>()
+            + self.young.capacity() * core::mem::size_of::<u32>()
+            + self.young_bits.capacity() * core::mem::size_of::<u64>()
+            + self.remembered.capacity() * core::mem::size_of::<u32>()
+            + self.remembered_bits.capacity() * core::mem::size_of::<u64>();
+        (slots, bookkeeping)
+    }
+
     fn occupied(&self, index: u32) -> bool {
         matches!(self.slot(index as usize), Some(Some(_)))
     }
@@ -1501,7 +1532,7 @@ impl Heap {
     ///
     /// `None` when the tables are not blocked, because then there is nothing
     /// to census: a flat table is one run of slots that only ever grows.
-    #[cfg(all(feature = "profile", feature = "blocked-slots"))]
+    #[cfg(all(feature = "census", feature = "blocked-slots"))]
     pub fn block_census(&self) -> Option<(usize, usize, usize)> {
         let mut held = 0;
         let mut addressed = 0;
@@ -1534,12 +1565,12 @@ impl Heap {
     }
 
     /// There are no blocks to report on when the tables are flat.
-    #[cfg(all(feature = "profile", not(feature = "blocked-slots")))]
+    #[cfg(all(feature = "census", not(feature = "blocked-slots")))]
     pub fn block_census(&self) -> Option<(usize, usize, usize)> {
         None
     }
 
-    #[cfg(feature = "profile")]
+    #[cfg(feature = "census")]
     pub fn slot_census(&self) -> alloc::vec::Vec<(&'static str, usize, usize, usize)> {
         alloc::vec![
             ("Class", self.classes.slots(), self.classes.free.len(),
@@ -1566,7 +1597,7 @@ impl Heap {
     }
 
     /// How many slots are occupied, across every table.
-    #[cfg(feature = "profile")]
+    #[cfg(feature = "census")]
     fn occupancy(&self) -> usize {
         let mut total = 0;
         total += self.classes.slots() - self.classes.free.len();
@@ -1580,6 +1611,57 @@ impl Heap {
         total += self.strings.slots() - self.strings.free.len();
         total += self.upvalues.slots() - self.upvalues.free.len();
         total
+    }
+
+    /// What the heap has taken from the allocator, and for what.
+    ///
+    /// **`bytes` answers a different question.** That is the live set the
+    /// collector schedules against: slots that hold something, plus each
+    /// object's own contents. This is what a fixed heap has actually handed
+    /// out -- every slot vector at its capacity, the free lists and mark bits
+    /// beside them, and the instance-field chunks -- which is the number a
+    /// part with no allocator underneath has to meet.
+    ///
+    /// Returned per type so a report can say which table grew, and summed by
+    /// the caller. Objects' own contents stay in `bytes()`: a string's text
+    /// and a class's method table are charged there and not here, so adding
+    /// the two gives the whole without counting anything twice.
+    #[cfg(feature = "census")]
+    pub fn memory_census(&self) -> alloc::vec::Vec<(&'static str, usize, usize)> {
+        let mut out = alloc::vec::Vec::new();
+        macro_rules! row {
+            ($name:literal, $table:expr) => {{
+                let (slots, bookkeeping) = $table.footprint();
+                out.push(($name, slots, bookkeeping));
+            }};
+        }
+        row!("Class", self.classes);
+        row!("Closure", self.closures);
+        row!("Fn", self.functions);
+        row!("Fiber", self.fibers);
+        row!("Instance", self.instances);
+        row!("List", self.lists);
+        row!("Map", self.maps);
+        row!("Range", self.ranges);
+        row!("String", self.strings);
+        row!("Upvalue", self.upvalues);
+
+        // The field chunks are not a slot table, but they are the same kind of
+        // cost: asked for in bulk and held whether or not they are full.
+        let fields = self.chunks.capacity() * core::mem::size_of::<Vec<Value>>()
+            + self
+                .chunks
+                .iter()
+                .map(|chunk| chunk.capacity() * core::mem::size_of::<Value>())
+                .sum::<usize>()
+            + self.spare_chunks.capacity() * core::mem::size_of::<Vec<Value>>()
+            + self
+                .spare_chunks
+                .iter()
+                .map(|chunk| chunk.capacity() * core::mem::size_of::<Value>())
+                .sum::<usize>();
+        out.push(("fields", fields, 0));
+        out
     }
 
     /// Every live handle, table by table.

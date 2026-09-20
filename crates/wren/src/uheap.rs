@@ -59,6 +59,23 @@ pub struct UHeap<'a> {
     /// lowest block — which makes the boundary between the table and the
     /// blocks derivable rather than stored.
     count: u16,
+    /// Bytes callers have asked for, against the bytes actually cut.
+    ///
+    /// **The difference is the allocator's own overhead**, and on a fixed
+    /// heap it is worth a number rather than an estimate: a block rounds up
+    /// to a whole unit, an aligned block absorbs the gap its rounding leaves,
+    /// and a reused hole is taken whole however small the ask. Behind the
+    /// census feature, so a shipping build carries neither the field nor the
+    /// addition.
+    #[cfg(feature = "census")]
+    requested: usize,
+    /// Units lost to a reused hole being bigger than the ask, and to a fresh
+    /// cut absorbing its own alignment gap -- the two halves of the overhead,
+    /// counted apart because they have different fixes.
+    #[cfg(feature = "census")]
+    wasted_reuse: usize,
+    #[cfg(feature = "census")]
+    wasted_cut: usize,
 }
 
 /// Where a block sits and how big it is.
@@ -84,6 +101,12 @@ impl<'a> UHeap<'a> {
             count: 0,
             peak: 0,
             refused: 0,
+            #[cfg(feature = "census")]
+            requested: 0,
+            #[cfg(feature = "census")]
+            wasted_reuse: 0,
+            #[cfg(feature = "census")]
+            wasted_cut: 0,
         }
     }
 
@@ -95,6 +118,24 @@ impl<'a> UHeap<'a> {
     /// How many blocks exist, free ones included.
     pub fn blocks(&self) -> usize {
         self.count as usize
+    }
+
+    /// Every block, in the order the table holds them: size in bytes, and
+    /// whether it is a hole.
+    ///
+    /// **The other side of the accounting.** `Heap::memory_census` says what
+    /// the VM asked for; this says what the allocator actually cut, alignment
+    /// rounding and holes included. The two disagreeing by more than a few
+    /// per cent means something is being paid for that nobody asked for --
+    /// which is exactly the question a fixed heap exists to answer.
+    ///
+    /// Calls `visit` per block rather than returning a vector, because
+    /// allocating one here would change the thing being measured.
+    pub fn walk(&self, mut visit: impl FnMut(usize, bool)) {
+        for at in 0..self.count {
+            let record = self.record(at);
+            visit(record.size as usize * ::core::mem::size_of::<Unit>(), record.free);
+        }
     }
 
     /// The lowest unit any block occupies, which is where the table must stop.
@@ -169,6 +210,11 @@ impl<'a> UHeap<'a> {
         if let Some((at, _)) = best {
             let mut record = self.record(at);
             record.free = false;
+            #[cfg(feature = "census")]
+            {
+                self.wasted_reuse += (record.size - units) as usize
+                    * ::core::mem::size_of::<Unit>();
+            }
             self.write(at, record);
             return Some(record.index);
         }
@@ -185,6 +231,10 @@ impl<'a> UHeap<'a> {
         // leaves belongs to this block rather than becoming an untracked
         // hole -- a hole nothing records is a hole nothing can reuse.
         let index = (floor - units) / align * align;
+        #[cfg(feature = "census")]
+        {
+            self.wasted_cut += (floor - index - units) as usize * ::core::mem::size_of::<Unit>();
+        }
         let units = floor - index;
         if (index as usize) < self.count as usize + 1 {
             self.refused = self.refused.saturating_add(1);
@@ -202,6 +252,41 @@ impl<'a> UHeap<'a> {
         );
         self.peak = self.peak.max(self.used() as u16);
         Some(index)
+    }
+
+    /// Note a request in bytes, which only the `GlobalAlloc` shim still knows.
+    ///
+    /// `alloc_aligned` is given units, so by the time a block is cut the
+    /// caller's real ask has already been rounded up and the overhead it
+    /// implies is no longer visible.
+    #[cfg(feature = "census")]
+    fn note_request(&mut self, bytes: usize) {
+        self.requested += bytes;
+    }
+
+    #[cfg(feature = "census")]
+    fn note_release(&mut self, bytes: usize) {
+        self.requested = self.requested.saturating_sub(bytes);
+    }
+
+    /// Bytes callers currently hold, as they asked for them.
+    ///
+    /// Against [`UHeap::used`] this is the allocator's overhead: rounding to
+    /// a whole unit, the gap an aligned block absorbs, and a reused hole
+    /// taken whole.
+    #[cfg(feature = "census")]
+    pub fn requested(&self) -> usize {
+        self.requested
+    }
+
+    /// The overhead, split by cause: `(reused holes, alignment gaps)`.
+    ///
+    /// Cumulative over the heap's life rather than current, because both are
+    /// decisions made at the moment a block is cut and a later free does not
+    /// take them back.
+    #[cfg(feature = "census")]
+    pub fn wasted(&self) -> (usize, usize) {
+        (self.wasted_reuse, self.wasted_cut)
     }
 
     /// Give a block back.
@@ -391,6 +476,36 @@ impl<const UNITS: usize> Arena<UNITS> {
         )
     }
 
+    /// Every block the arena has cut: size in bytes, and whether it is a hole.
+    ///
+    /// See [`UHeap::walk`]. A firmware uses this to bucket its own blocks --
+    /// a histogram of what a VM actually asks for says more about where to
+    /// look than a single total does.
+    pub fn walk(&self, visit: impl FnMut(usize, bool)) {
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        let heap = unsafe { self.heap_mut() };
+        heap.walk(visit);
+    }
+
+    /// Bytes callers hold as they asked for them; see [`UHeap::requested`].
+    #[cfg(feature = "census")]
+    pub fn requested(&self) -> usize {
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        let heap = unsafe { self.heap_mut() };
+        heap.requested()
+    }
+
+    /// The overhead, split by cause; see [`UHeap::wasted`].
+    #[cfg(feature = "census")]
+    pub fn wasted(&self) -> (usize, usize) {
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        let heap = unsafe { self.heap_mut() };
+        heap.wasted()
+    }
+
     /// The whole arena, in bytes.
     pub const fn capacity(&self) -> usize {
         UNITS * core::mem::size_of::<Unit>()
@@ -433,7 +548,11 @@ unsafe impl<const UNITS: usize> core::alloc::GlobalAlloc for Arena<UNITS> {
         };
         // SAFETY: single-threaded, as documented on the type.
         match self.heap_mut().alloc_aligned(units, align) {
-            Some(index) => self.base().add(index as usize).cast(),
+            Some(index) => {
+                #[cfg(feature = "census")]
+                self.heap_mut().note_request(layout.size());
+                self.base().add(index as usize).cast()
+            }
             None => core::ptr::null_mut(),
         }
     }
@@ -443,6 +562,8 @@ unsafe impl<const UNITS: usize> core::alloc::GlobalAlloc for Arena<UNITS> {
         // block, so the index is a subtraction rather than a header.
         let offset = pointer.cast::<Unit>().offset_from(self.base());
         // SAFETY: as above.
+        #[cfg(feature = "census")]
+        self.heap_mut().note_release(_layout.size());
         self.heap_mut().free(offset as u16);
     }
 }

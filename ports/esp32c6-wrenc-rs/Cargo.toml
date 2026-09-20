@@ -31,6 +31,10 @@ publish = false
 # footprint numbers in `doc/wren-rs/memory.md` come from.
 default = ["core_full"]
 core_full = ["wren/core_full"]
+# **Asking the built VM what it is holding.** Adds the breakdown `uwren` prints
+# after construction; off by default because a shipping image should not carry
+# the arithmetic or the strings.
+census = ["wren/census"]
 f32 = ["wren/f32"]
 
 [dependencies]
