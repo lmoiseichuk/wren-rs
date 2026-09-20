@@ -769,6 +769,49 @@ replaced it -- and the same guarantee, applied to pushes, is worth 1.22%.
 **A safety argument tells you a change is permitted, not that it is an
 improvement.**
 
+### The top ten, worked a second time
+
+Re-walked least-frequent-first with the arms as they now stand, so that the
+history counts: an idea already refused is not retried, and one already applied
+is not applied twice.
+
+| # | opcode | what is left | outcome |
+|---|---|---|---|
+| 10 | `StoreFieldThisPop` | field offset hoisted, `set_field` returns `bool` | nothing left |
+| 9 | `Pop` | the unchecked pop, refused at 25 | nothing left |
+| 8 | `LoadFieldThis` | `Option` return and `push_reserved` both landed | nothing left |
+| 7, 6 | `Return`, `LoadLocalReturn` | the result push | **−0.40%, kept** |
+| 5, 4, 3 | the loads | index bounds checks | not attempted -- see below |
+| 2 | `JumpIf` | pop refused; `is_falsy` already a range check | nothing left |
+| 1 | `Call` | the `Option<Method>` from `find_method` | already free |
+
+**7 and 6 are 10.46% of what the board executes** and were the largest pair
+left untouched. Their result push needs none of the `max_slots` machinery:
+`truncate(base)` leaves the length at `base`, and the capacity is at least the
+length it had a moment earlier, which was more than `base` because slot `base`
+held the receiver. Frame arithmetic, not analysis.
+
+**The loads were left alone deliberately.** What remains in them is the bounds
+check on `self.stack[base + slot]` and on `constants[index]`, and `max_stack`
+bounds the stack's *depth*, not the slot indices an instruction names. Nothing
+in the tree licenses skipping those, so they stay.
+
+**`Call` turned out to be already optimal, and one line proved it.** The
+dispatch builds an `Option<Method>` -- an enum inside an option, twelve bytes
+-- and takes it apart two lines later, which is exactly the shape that paid
+1.22% when removed from the arithmetic fast path. The restructure to dispatch
+on the packed entry instead is a delicate edit across a few hundred lines of
+the most complex function in the crate. Adding `#[inline(always)]` to
+`find_method` tests the same hypothesis in one line: if the option is ever
+materialised, forcing the inline removes it. **The measurement came back
+identical to the byte.** It was already inlined and the option already gone.
+
+That is the fourth time in this pass that a proposed change turned out to be
+removing a cost the compiler had already removed, and the first time the
+question was settled for one line instead of a day. **Where a cheap experiment
+tests the same hypothesis as an expensive one, run the cheap one first** -- not
+to decide, but to find out whether deciding is necessary.
+
 ### The opcode mix does not move
 
 Re-profiled after all of the above, expecting the ranking to have shifted:
