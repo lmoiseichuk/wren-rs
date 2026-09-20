@@ -1965,3 +1965,35 @@ fn a_ruled_out_class_is_not_a_built_in() {
         Err(error) => panic!("tailored VM refused a user class: {error:?}"),
     }
 }
+
+/// A chain of `var b = a`, where the fused pair's second slot is the first's target.
+///
+/// **The case a fused `LoadLocalPair` gets wrong.** `var a3 = a2` compiles to a
+/// `LoadLocal` whose value lands in `a3`'s slot, so the next statement's
+/// `LoadLocal a3` reads the slot the previous push just wrote -- and the two
+/// fuse into one instruction. Reading both slots before pushing either, which
+/// is what lets one capacity test serve two values, then reads that slot's
+/// stale contents.
+///
+/// Found by `vendor/wren/test/language/variable/many_locals.wren`, which needs
+/// 255 locals to say it. Four say it just as well, and say it in a tenth of a
+/// second: the 146 tests in this file all passed with the bug in place, and the
+/// conformance suite reported it by aborting with no message at all.
+#[test]
+fn a_fused_local_pair_sees_the_value_it_just_pushed() {
+    let source = "\
+{
+  var a1 = \"value\"
+  var a2 = a1
+  var a3 = a2
+  var a4 = a3
+  var a5 = a4
+  System.print(a5)
+}
+";
+    let mut vm = wren::Vm::new();
+    match vm.interpret(source) {
+        Ok(()) => assert_eq!(vm.output_str().trim(), "value"),
+        Err(error) => panic!("a chain of local copies failed: {error:?}"),
+    }
+}

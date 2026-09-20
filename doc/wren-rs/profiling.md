@@ -589,6 +589,31 @@ Two runs of the *same binary* differed by 67 instructions in 426 million --
 one part in six million. That is what makes a 0.3% result meaningful here, and
 it was worth establishing before trusting any of the numbers below.
 
+### The significance rule
+
+**A delta under one per cent is reproducible but not attributable.** Two runs
+of the same binary differ by 67 instructions in 426 million, so a 0.3% result
+is real in the sense that it will repeat -- but it is register allocation and
+instruction scheduling responding to an unrelated edit, not the mechanism the
+change was about. Counting only cases at or past 1%, and judging a change on
+the **sum across all four benchmarks**, is what separates the two.
+
+Re-scoring the refused list below against that rule is uncomfortable reading:
+
+| refused change | cases past 1% | verdict under the rule |
+|---|---|---|
+| upstream's result placement | 0 of 2 | not shown harmful, worst +0.38% |
+| hoisting `receiver_at` | 0 of 2 | not shown harmful, worst +0.96% |
+| operand window, copied | 3 of 3 | genuinely refused |
+| operand window, borrowed | 3 of 3 | genuinely refused |
+| operand window, const range | 2 of 3 | genuinely refused |
+| method cache, either form | 3 of 3 | genuinely refused |
+
+The first two were decided on evidence that this rule calls churn. Both were
+re-measured in the current tree and both still lost on the sum -- result
+placement by +0.08% -- so the conclusions stand, but they stand on the sum and
+not on the individual numbers recorded beside them.
+
 ### What was kept
 
 **The field offset in a local, and the constant pool beside the code.**
@@ -612,6 +637,49 @@ register-allocation effect and not something the source makes visible.
 
 The lesson is the one this page keeps arriving at from a new direction:
 **the unit of measurement is the combination that ships, not the idea.**
+
+### One capacity test for two values
+
+`LoadLocalConstant` and `LoadLocalPair` each push twice, and between them they
+are a fifth of everything the benchmarks execute. Two `push`es test the
+capacity twice and set the length twice; `extend_from_slice` of a two-element
+array does both once.
+
+| | `binary_trees` | `fib` | `list_build` | `method_call` | sum |
+|---|---|---|---|---|---|
+| with the field offset and constants | **−1.28%** | −0.93% | **−1.44%** | **−1.65%** | **−1.14%** |
+
+Three of four past the threshold, none regressing, 13.3 million instructions.
+
+**And it was nearly shipped broken.** Fusing the two reads ahead of both pushes
+is wrong for `LoadLocalPair`: its second slot can be the slot the first push
+writes into, so reading both first reads that slot's stale contents. `var a3 =
+a2` is exactly that shape -- the initializer's value lands in `a3`'s slot, and
+the next statement loads `a3`. The fix names the one slot where the two orders
+disagree, which costs a compare against the capacity test it saves.
+`LoadLocalConstant` has no such dependency, its second value coming from the
+constant pool.
+
+What makes this worth writing down is how badly it hid:
+
+  - **146 unit tests passed.** So did the four benchmarks, and so did the
+    device measurement -- which is how a −1.40% number was produced for a
+    build that was wrong.
+  - **The conformance suite aborted with no message at all.** It installs a
+    silent panic hook, so the index panic unwound into a second panic and the
+    process died on `SIGABRT` with an empty stderr and, because stdout was
+    block-buffered into a file, no output either. It reads exactly like a
+    hang or a toolchain fault.
+  - **The first regression test written for it passed on both versions.**
+    A test that cannot fail is worse than no test, because it converts a gap
+    into a claim of coverage.
+
+The case was found by making the bug *safe but wrong* -- `get().unwrap_or` in
+place of the indexing panic -- so the suite could name the files instead of
+dying: `language/variable/many_locals.wren` and its sibling, which need 255
+locals to say it. `a_fused_local_pair_sees_the_value_it_just_pushed` says it in
+five, and fails on the buggy version -- which was checked, this time, before
+the test was believed.
 
 ### What was refused, again
 

@@ -2331,8 +2331,13 @@ impl Vm {
                     // where the `Constant` put it, past its own dead opcode.
                     let index = unsafe { *ip.add(1) } as usize;
                     ip = unsafe { ip.add(2) };
-                    self.stack.push(self.stack[base + slot]);
-                    self.stack.push(constants[index]);
+                    // **One capacity test for two values.** Two `push`es test
+                    // twice and grow twice; this pair and `LoadLocalPair` are
+                    // between them a fifth of everything the benchmarks
+                    // execute, so the second test is worth removing even
+                    // though each one is only a compare and a branch.
+                    let pair = [self.stack[base + slot], constants[index]];
+                    self.stack.extend_from_slice(&pair);
                 }
                 code::LOAD_LOCAL_PAIR => {
                     let first = Chunk::inline_operand(unit) as usize;
@@ -2340,8 +2345,23 @@ impl Vm {
                     // `LoadLocal`'s own unit.
                     let second = Chunk::inline_operand(unsafe { *ip }) as usize;
                     ip = unsafe { ip.add(1) };
-                    self.stack.push(self.stack[base + first]);
-                    self.stack.push(self.stack[base + second]);
+                    // **The second slot can be the one the first push writes
+                    // into.** Reading both before pushing either -- which is
+                    // what makes one capacity test do for two values -- then
+                    // reads that slot's old contents, or past the end of the
+                    // stack. Only the unit tests missed it; the conformance
+                    // suite aborts.
+                    //
+                    // The first value lands at `top`, so that is the one slot
+                    // where the two orders disagree, and naming it costs a
+                    // compare against the capacity test it saves.
+                    let a = self.stack[base + first];
+                    let top = self.stack.len();
+                    let b = match base + second == top {
+                        true => a,
+                        false => self.stack[base + second],
+                    };
+                    self.stack.extend_from_slice(&[a, b]);
                 }
                 code::STORE_FIELD_THIS_POP => {
                     let index = Chunk::inline_operand(unit) as usize;
