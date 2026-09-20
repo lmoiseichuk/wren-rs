@@ -2,7 +2,7 @@
 #
 # Compile every `.wren` this repository ships as bytecode, and check the result.
 #
-#   tools/build-bytecode.sh           # rebuild programs/ and benchmarks/wrenc/
+#   tools/build-bytecode.sh           # rebuild doc/examples/ and benchmarks/wrenc/
 #   tools/build-bytecode.sh --check   # verify they match their sources, build nothing
 #
 # **A `.wrenc` in the tree is a build artefact that looks like a source file.**
@@ -59,7 +59,7 @@ compile_into() {
 }
 
 failures=0
-compile_into "$ROOT/programs" "$ROOT/programs"
+compile_into "$ROOT/doc/examples" "$ROOT/doc/examples"
 compile_into "$ROOT/benchmarks/wren" "$ROOT/benchmarks/wrenc"
 
 if (( CHECK )); then

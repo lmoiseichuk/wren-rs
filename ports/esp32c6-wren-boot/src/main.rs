@@ -17,7 +17,7 @@
 //! The two programs share one VM, which is what makes this a boot sequence
 //! rather than two unrelated runs. They do not share *names* -- Wren rejects a
 //! top-level name that is never defined, so a class declared in `boot` is not
-//! visible in `main` -- and `programs/boot.wren` says more about why.
+//! visible in `main` -- and `doc/examples/boot.wren` says more about why.
 
 #![no_std]
 #![no_main]

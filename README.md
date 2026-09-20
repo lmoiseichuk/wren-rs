@@ -229,7 +229,7 @@ one first.
 crates/wren/    the Rust VM -- the crate a firmware depends on
 vendor/wren/    upstream wren-lang/wren, submodule, unmodified
 benchmarks/     the same programs in both languages, same constants
-programs/       boot.wren and main.wren, and the bytecode built from them
+doc/examples/   a worked node in Wren, and the bytecode built from it
 doc/wren/       what upstream Wren and MicroPython measured
 doc/wren-rs/    why the Rust implementation is built the way it is
 ports/          one directory per (board, implementation) pair

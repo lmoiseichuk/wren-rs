@@ -51,11 +51,11 @@ pub const SEQUENCE: &[&str] = &["boot", "main"];
 pub const STORE: &[Program] = &[
     Program {
         name: "boot.wrenc",
-        bytes: include_bytes!("../../../programs/boot.wrenc"),
+        bytes: include_bytes!("../../../doc/examples/boot.wrenc"),
     },
     Program {
         name: "main.wrenc",
-        bytes: include_bytes!("../../../programs/main.wrenc"),
+        bytes: include_bytes!("../../../doc/examples/main.wrenc"),
     },
 ];
 
@@ -64,11 +64,11 @@ pub const STORE: &[Program] = &[
 pub const STORE: &[Program] = &[
     Program {
         name: "boot.wren",
-        bytes: include_bytes!("../../../programs/boot.wren"),
+        bytes: include_bytes!("../../../doc/examples/boot.wren"),
     },
     Program {
         name: "main.wren",
-        bytes: include_bytes!("../../../programs/main.wren"),
+        bytes: include_bytes!("../../../doc/examples/main.wren"),
     },
 ];
 

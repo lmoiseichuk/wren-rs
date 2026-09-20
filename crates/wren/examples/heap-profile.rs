@@ -20,7 +20,7 @@
 //!    is the one number people usually assert rather than measure.
 //!
 //! Every Wren file in the repository is run: upstream's suite, which is the
-//! broadest population available, plus the benchmarks and `programs/`. Files
+//! broadest population available, plus the benchmarks and the examples. Files
 //! that fail to compile still count -- they exercise the compiler's own
 //! allocation, which is part of what a firmware pays for.
 
@@ -67,7 +67,7 @@ fn main() {
     let mut files = Vec::new();
     collect_wren(Path::new("vendor/wren/test"), &mut files);
     collect_wren(Path::new("benchmarks/wren"), &mut files);
-    collect_wren(Path::new("programs"), &mut files);
+    collect_wren(Path::new("doc/examples"), &mut files);
     files.sort();
     if let Some(filter) = &only {
         files.retain(|path| path.to_string_lossy().contains(filter.as_str()));

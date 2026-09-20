@@ -93,9 +93,9 @@ the trade, and the 31 KB is what it is worth.
 
 ## The programs
 
-`programs/boot.wren` sets up: identity, the calibration curve, and a power-on
+`doc/examples/boot.wren` sets up: identity, the calibration curve, and a power-on
 self-test that refuses a curve which would report nonsense.
-`programs/main.wren` is the application: sample, median-filter, decide against a
+`doc/examples/main.wren` is the application: sample, median-filter, decide against a
 deadband whether the reading is worth the radio, and account for what it sent.
 
 **They share no names.** Wren rejects a top-level name that is never defined, so
