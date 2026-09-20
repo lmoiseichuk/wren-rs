@@ -26,6 +26,12 @@ publish = false
 # builds it that way, and `WREN_SLOT_BLOCK` sizes the block.
 [features]
 blocked-slots = ["wren/blocked-slots"]
+# **The numeric modes, so one port can measure all three.** `f32` halves every
+# value and `nofp` drops floating point entirely -- neither is Wren, and both
+# are measured here rather than argued about. `tools/measure-rs.sh --features
+# f32` builds one.
+f32 = ["wren/f32"]
+nofp = ["wren/nofp"]
 
 [dependencies]
 # This port compiles on the device, so it takes the compiler.
