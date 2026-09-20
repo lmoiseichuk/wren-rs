@@ -1842,3 +1842,32 @@ fn inlined_arithmetic_matches_the_primitive() {
     assert_eq!(run(&format!("{nan}System.print(n >= 1)")), "false\n");
     assert_eq!(run(&format!("{nan}System.print(n <= n)")), "false\n");
 }
+
+/// `!` is three primitives, and the fast path answers for two of them.
+///
+/// `Bool` and `Null` both define `!` and neither can be reopened, so those
+/// two are settled. `Object.!` answers `false` for everything else -- which
+/// is how `!0` and `!""` are `false` in Wren -- and a user class may override
+/// it, so both of those must still dispatch.
+#[test]
+fn negation_answers_for_bool_and_null_and_dispatches_for_the_rest() {
+    assert_eq!(run("System.print(!true)"), "false\n");
+    assert_eq!(run("System.print(!false)"), "true\n");
+    assert_eq!(run("System.print(!null)"), "true\n", "null is falsy");
+    assert_eq!(run("System.print(!!true)"), "true\n", "and it composes");
+
+    assert_eq!(run("System.print(!0)"), "false\n", "zero is truthy in Wren");
+    assert_eq!(run(r#"System.print(!"")"#), "false\n", "so is the empty string");
+    assert_eq!(run("System.print(![])"), "false\n");
+
+    let overridden = r#"
+        class Always {
+            construct new() {}
+            ! {
+                return "mine"
+            }
+        }
+        System.print(!Always.new())
+    "#;
+    assert_eq!(run(overridden), "mine\n", "a user class may define it");
+}
