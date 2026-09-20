@@ -142,8 +142,43 @@ fn new_metaclass(vm: &mut Vm, class: ObjectId, name: &str) -> ObjectId {
 }
 
 fn define(vm: &mut Vm, class: ObjectId, signature: &str, function: Primitive) {
+    if !wanted(vm, signature) {
+        return;
+    }
     let symbol = vm.method_names.ensure(signature);
     vm.bind_primitive(class, symbol, function);
+}
+
+/// **The methods the VM calls itself, whatever a program asks for.**
+///
+/// A manifest lists what the *program* calls. It cannot list what the
+/// interpreter calls on the program's behalf: `for` compiles to `iterate(_)`
+/// and `iteratorValue(_)`, string interpolation reaches for `toString`, and
+/// the core's own primitives ask each other for `count` and `==(_)`. Leaving
+/// one of these out produces a missing-method error from a line that never
+/// mentions it, which is the worst kind of fault to be handed.
+const ALWAYS: &[&str] = &[
+    "iterate(_)",
+    "iteratorValue(_)",
+    "toString",
+    "count",
+    "==(_)",
+    "!=(_)",
+    "new()",
+    "call()",
+    "call(_)",
+];
+
+/// Is this method wanted in this build of the core?
+fn wanted(vm: &Vm, signature: &str) -> bool {
+    match &vm.core_filter {
+        // No manifest: the whole core, which is what a host and every
+        // published measurement use.
+        None => true,
+        Some(asked) => {
+            ALWAYS.contains(&signature) || asked.iter().any(|name| name == signature)
+        }
+    }
 }
 
 

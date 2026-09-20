@@ -271,6 +271,17 @@ pub struct Vm {
     /// with more than 256 distinct method signatures simply takes the slow
     /// path for the ones past the end, which is what it does today anyway.
     num_ops: [u8; 256],
+    /// Which core methods to install, or all of them.
+    ///
+    /// **A program's `.wrenc` already names every method it can call**, and
+    /// on a part with kilobytes the rest is not free: every binding interns a
+    /// signature, grows a class's method table and allocates a closure
+    /// object, all of which sit in RAM for the life of the VM. `fib` calls
+    /// ten of the core's one hundred and sixty.
+    ///
+    /// Read by `core::define` during `core::install` and never again, so it
+    /// costs nothing once the VM is running.
+    pub(crate) core_filter: Option<alloc::vec::Vec<alloc::string::String>>,
     /// Every module that has been loaded, main first.
     ///
     /// **A module is a namespace, not a file.** Two files that import each
@@ -547,6 +558,33 @@ impl Vm {
         Vm::with_heap(Heap::new())
     }
 
+    /// A VM carrying only the core methods a program actually calls.
+    ///
+    /// **The list comes from the program's own `.wrenc`** --
+    /// `wrenc::manifest` reads it, and it is the exact set of signatures the
+    /// code can reach. Everything else in the core library is not installed:
+    /// its signature is never interned, no class's method table grows for it,
+    /// and no closure object is allocated. On a part with kilobytes that is
+    /// the difference between carrying a scripting language and carrying the
+    /// part of one a program uses.
+    ///
+    /// What it does *not* do is make the image smaller. The primitives are
+    /// still compiled in, because the `define` call sites still reference
+    /// them; dropping them from flash needs the call sites compiled out, and
+    /// that is a build-time decision rather than this one.
+    ///
+    /// **Methods the interpreter calls itself are always installed** --
+    /// `iterate(_)`, `toString` and the handful of others in `core::ALWAYS`
+    /// -- because a manifest lists what the *program* calls and cannot know
+    /// what the VM asks for on its behalf.
+    ///
+    /// A VM built this way runs that program and is not a general VM: asking
+    /// for a method outside the list reports it missing, which is the honest
+    /// answer and the one a caller can see.
+    pub fn with_core_methods(signatures: &[alloc::string::String]) -> Vm {
+        Vm::build(Heap::new(), Some(signatures.to_vec()))
+    }
+
     /// A VM over a heap that has already been configured.
     ///
     /// **Some heap settings can only be made while the heap is empty**, and
@@ -559,7 +597,11 @@ impl Vm {
     ///
     /// Everything settable at any time -- the growth factor, the headroom --
     /// is still settable through `vm.heap` after this returns.
-    pub fn with_heap(mut heap: Heap) -> Vm {
+    pub fn with_heap(heap: Heap) -> Vm {
+        Vm::build(heap, None)
+    }
+
+    fn build(mut heap: Heap, core_filter: Option<alloc::vec::Vec<alloc::string::String>>) -> Vm {
 
         // The classes have to exist before anything can be dispatched on, and
         // they refer to their own names, so the names are allocated first.
@@ -610,6 +652,7 @@ impl Vm {
             stack: Vec::new(),
             method_names: SymbolTable::new(),
             num_ops: [NUM_OP_NONE; 256],
+            core_filter: None,
             primitives: Vec::new(),
             modules: alloc::vec![Module::new()],
             module_loader: None,
@@ -673,7 +716,9 @@ impl Vm {
             }
         }
 
+        vm.core_filter = core_filter;
         core::install(&mut vm);
+        vm.core_filter = None;
         vm.learn_numeric_operators();
         // **Only now.** The classes above were created empty and populated by
         // `install`, so flattening any earlier would have copied nothing.

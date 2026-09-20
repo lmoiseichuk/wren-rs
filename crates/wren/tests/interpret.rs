@@ -1895,3 +1895,41 @@ fn negation_answers_for_bool_and_null_and_dispatches_for_the_rest() {
     "#;
     assert_eq!(run(overridden), "mine\n", "a user class may define it");
 }
+
+/// A VM built from a manifest runs that program and refuses the rest.
+///
+/// **The selection has to be exact in both directions.** Installing too
+/// little breaks the program; installing everything makes the manifest
+/// pointless. And the methods the interpreter calls on the program's behalf
+/// -- `iterate(_)` for a `for` loop, `toString` for interpolation -- are not
+/// in any manifest and must survive anyway, which is what `core::ALWAYS` is.
+#[test]
+fn a_vm_built_from_a_manifest_runs_that_program_and_nothing_else() {
+    let source = r#"
+        var total = 0
+        for (n in [1, 2, 3]) { total = total + n }
+        System.print("total %(total)")
+    "#;
+
+    // Compile once on a full VM to get the manifest the program implies.
+    let mut host = Vm::new();
+    let chunk = wren::compiler::compile(&mut host, source).expect("compiles");
+    let bytes = wren::wrenc::write(&host, &chunk, source.as_bytes()).expect("writes");
+    let manifest = wren::wrenc::manifest(&bytes).expect("a manifest");
+
+    let mut tailored = Vm::with_core_methods(&manifest.signatures);
+    let loaded = wren::wrenc::load(&mut tailored, &bytes).expect("loads");
+    tailored.run_closure(loaded.closure).expect("runs");
+    assert_eq!(tailored.output_str(), "total 6\n", "the program still works");
+
+    // And a method the program never named is genuinely absent.
+    let mut again = Vm::with_core_methods(&manifest.signatures);
+    match again.interpret("System.print([3, 1, 2].sort)") {
+        Ok(()) => panic!("sort should not be installed: {:?}", again.output_str()),
+        Err(error) => assert!(
+            error.message().contains("does not implement"),
+            "expected a missing method, got {:?}",
+            error.message()
+        ),
+    }
+}
