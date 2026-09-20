@@ -62,6 +62,64 @@ use crate::vm::{RuntimeError, Switch, Vm};
 ///
 /// `System` is the one that does not use this: it builds its metaclass first
 /// and its class afterwards, so there is no class to attach to yet.
+/// `contains`, `startsWith`, `endsWith` and `indexOf`, which differ only in
+/// which `str` method they ask.
+///
+/// **Four copies of the same three lines.** `compare_strings` below already
+/// does this for `<`, `>`, `<=` and `>=`; this is the same move for the
+/// search methods. `indexOf` answers a number and the other three a bool, so
+/// the match returns a `Value` rather than a `bool`.
+fn search_text(vm: &mut Vm, at: usize, mode: u8) -> Result<Value, RuntimeError> {
+    let text = string_text(vm, receiver(vm, at));
+    let needle = string_argument(vm, at, 1)?;
+    Ok(match mode {
+        SEARCH_CONTAINS => Value::bool(text.contains(&needle)),
+        SEARCH_STARTS => Value::bool(text.starts_with(&needle)),
+        SEARCH_ENDS => Value::bool(text.ends_with(&needle)),
+        // `indexOf` reports -1 rather than null when the needle is absent,
+        // which is upstream's answer and not a sentinel this code chose.
+        _ => Value::num(text.find(&needle).map_or(-1.0, |index| index as Num)),
+    })
+}
+
+const SEARCH_CONTAINS: u8 = 0;
+const SEARCH_STARTS: u8 = 1;
+const SEARCH_ENDS: u8 = 2;
+const SEARCH_INDEX: u8 = 3;
+
+/// `trim()`, `trimStart()` and `trimEnd()`, which differ only in which end.
+fn trim_whitespace(vm: &mut Vm, at: usize, start: bool, end: bool) -> Result<Value, RuntimeError> {
+    let text = string_text(vm, receiver(vm, at));
+    let mut trimmed = text.as_str();
+    if start {
+        trimmed = trimmed.trim_start();
+    }
+    if end {
+        trimmed = trimmed.trim_end();
+    }
+    let trimmed = trimmed.to_string();
+    Ok(vm.new_string(&trimmed))
+}
+
+/// `trim(_)`, `trimStart(_)` and `trimEnd(_)`, which take a set of characters.
+///
+/// Separate from `trim_whitespace` because the argument differs; threading an
+/// `Option<&str>` through one function would cost more than the copy saves.
+/// The start is trimmed before the end, which is the order the chain used.
+fn trim_set(vm: &mut Vm, at: usize, start: bool, end: bool) -> Result<Value, RuntimeError> {
+    let text = string_text(vm, receiver(vm, at));
+    let set = string_argument(vm, at, 1)?;
+    let mut trimmed = text.as_str();
+    if start {
+        trimmed = trimmed.trim_start_matches(|c| set.contains(c));
+    }
+    if end {
+        trimmed = trimmed.trim_end_matches(|c| set.contains(c));
+    }
+    let trimmed = trimmed.to_string();
+    Ok(vm.new_string(&trimmed))
+}
+
 fn new_metaclass(vm: &mut Vm, class: ObjectId, name: &str) -> ObjectId {
     let metaclass_name = vm.heap.allocate(Object::String(ObjString::from_text(name)));
     let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
@@ -983,28 +1041,10 @@ fn install_string_extras(vm: &mut Vm) {
         Ok(vm.new_string_bytes(character_bytes(&text, index)))
     });
 
-    define(vm, class, "contains(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let needle = string_argument(vm, at, 1)?;
-        Ok(Value::bool(text.contains(&needle)))
-    });
-    define(vm, class, "startsWith(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let needle = string_argument(vm, at, 1)?;
-        Ok(Value::bool(text.starts_with(&needle)))
-    });
-    define(vm, class, "endsWith(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let needle = string_argument(vm, at, 1)?;
-        Ok(Value::bool(text.ends_with(&needle)))
-    });
-    define(vm, class, "indexOf(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let needle = string_argument(vm, at, 1)?;
-        Ok(Value::num(
-            text.find(&needle).map_or(-1.0, |index| index as Num),
-        ))
-    });
+    define(vm, class, "contains(_)", |vm, at| search_text(vm, at, SEARCH_CONTAINS));
+    define(vm, class, "startsWith(_)", |vm, at| search_text(vm, at, SEARCH_STARTS));
+    define(vm, class, "endsWith(_)", |vm, at| search_text(vm, at, SEARCH_ENDS));
+    define(vm, class, "indexOf(_)", |vm, at| search_text(vm, at, SEARCH_INDEX));
 
     define(vm, class, "isEmpty", |vm, at| {
         Ok(Value::bool(string_bytes(vm, receiver(vm, at)).is_empty()))
@@ -1046,43 +1086,13 @@ fn install_string_extras(vm: &mut Vm) {
         Ok(vm.new_string(&replaced))
     });
 
-    define(vm, class, "trim()", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let trimmed = text.trim().to_string();
-        Ok(vm.new_string(&trimmed))
-    });
-    define(vm, class, "trimStart()", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let trimmed = text.trim_start().to_string();
-        Ok(vm.new_string(&trimmed))
-    });
-    define(vm, class, "trimEnd()", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let trimmed = text.trim_end().to_string();
-        Ok(vm.new_string(&trimmed))
-    });
+    define(vm, class, "trim()", |vm, at| trim_whitespace(vm, at, true, true));
+    define(vm, class, "trimStart()", |vm, at| trim_whitespace(vm, at, true, false));
+    define(vm, class, "trimEnd()", |vm, at| trim_whitespace(vm, at, false, true));
 
-    define(vm, class, "trim(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let set = string_argument(vm, at, 1)?;
-        let trimmed = text
-            .trim_start_matches(|c| set.contains(c))
-            .trim_end_matches(|c| set.contains(c))
-            .to_string();
-        Ok(vm.new_string(&trimmed))
-    });
-    define(vm, class, "trimStart(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let set = string_argument(vm, at, 1)?;
-        let trimmed = text.trim_start_matches(|c| set.contains(c)).to_string();
-        Ok(vm.new_string(&trimmed))
-    });
-    define(vm, class, "trimEnd(_)", |vm, at| {
-        let text = string_text(vm, receiver(vm, at));
-        let set = string_argument(vm, at, 1)?;
-        let trimmed = text.trim_end_matches(|c| set.contains(c)).to_string();
-        Ok(vm.new_string(&trimmed))
-    });
+    define(vm, class, "trim(_)", |vm, at| trim_set(vm, at, true, true));
+    define(vm, class, "trimStart(_)", |vm, at| trim_set(vm, at, true, false));
+    define(vm, class, "trimEnd(_)", |vm, at| trim_set(vm, at, false, true));
 
     define(vm, class, "split(_)", |vm, at| {
         let text = string_text(vm, receiver(vm, at));
