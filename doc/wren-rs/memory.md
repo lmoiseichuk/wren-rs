@@ -392,6 +392,29 @@ program rather than per build. Peak heap at every size, on the ESP32-C6:
 | 512 | 114,100 B | 15,764 B | 163,000 B | 38,124 B |
 | 1024 | 150,916 B | 28,052 B | *out of memory* | — |
 
+And what the same sweep cost in work -- instructions retired, in millions,
+which is the figure that does not move with code placement:
+
+| block | `binary_trees` | `fib` | `list_build` | `method_call` |
+|---|---|---|---|---|
+| flat | **467.2** | **766.7** | **29.1** | **116.4** |
+| 4 | 535.6 | 856.34 | 31.063 | 132.706 |
+| 8 | 529.4 | 856.34 | 31.062 | 132.701 |
+| **16** | **521.8** | 856.35 | 31.065 | 132.707 |
+| 32 | 523.6 | 856.35 | 31.066 | 132.708 |
+| 64 | 530.0 | 856.35 | 31.066 | 132.709 |
+| 128 | 543.1 | 856.35 | 31.067 | 132.710 |
+| 256 | 566.5 | 856.35 | 31.069 | 132.711 |
+| 512 | 623.7 | 856.35 | 31.071 | 132.714 |
+| 1024 | 629.1 | 856.36 | — | — |
+
+**Three of the four columns are flat to five figures**, and that is the point
+of them: the indirection on every object access costs what it costs, and no
+block size buys any of it back. `binary_trees` is the exception because it is
+the only one that makes and drops blocks rather than merely reading through
+them, and the block is what it pays for -- 521.8M at 16 against 623.7M at
+512, a fifth more work for the same program.
+
 **Only `binary_trees` has an interior optimum**, because it is the only one
 that frees in bulk and so the only one a larger block helps: a bigger block
 recovers more of the tree when it is dropped, until the rounding across ten
