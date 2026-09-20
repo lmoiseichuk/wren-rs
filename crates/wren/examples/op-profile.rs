@@ -94,28 +94,39 @@ fn main() {
                 at += len;
             }
         }
+        // **An instruction is measured in u16 units; a byte figure is twice
+        // it.** Mixing the two is how this table came to compare unit counts
+        // against byte counts and report a uniform width as costing twice
+        // what it does.
+        const BYTES_PER_UNIT: usize = core::mem::size_of::<u16>();
+        let actual = walked * BYTES_PER_UNIT;
         println!();
-        println!("instruction lengths, statically ({instructions} instructions, {walked} B)");
+        println!(
+            "instruction lengths, statically ({instructions} instructions, \
+             {walked} units = {actual} B)"
+        );
         for (len, count) in by_length.iter() {
             println!(
-                "  {len} byte{:<3} {count:>6}  {:>5.1}%   {:>6} B",
+                "  {len} unit{:<3} {count:>6}  {:>5.1}%   {:>6} B",
                 if *len == 1 { "" } else { "s" },
                 *count as f64 * 100.0 / instructions.max(1) as f64,
-                len * count
+                len * count * BYTES_PER_UNIT
             );
         }
-        // A uniform 2 bytes cannot hold a `Call` (opcode, arity, u16 symbol),
-        // so the realistic uniform scheme is two widths, ARM-Thumb fashion:
-        // everything short in 2 bytes, everything else in 4.
-        let short: usize = by_length.iter().filter(|(len, _)| **len <= 2).map(|(_, n)| n).sum();
-        let long = instructions - short;
+        // What a uniform width would cost. Six bytes is the width that holds
+        // every instruction here; four holds all but the three-unit ones.
+        let widest = by_length.keys().copied().max().unwrap_or(1);
         for (name, padded) in [
-            ("every instruction 4 bytes", instructions * 4),
-            ("2 bytes if it fits, else 4", short * 2 + long * 4),
+            ("every instruction 4 B", instructions * 4),
+            ("every instruction 6 B", instructions * 6),
         ] {
             println!(
-                "  {name:<28} {padded:>6} B ({:+.0}%)",
-                (padded as f64 - walked as f64) * 100.0 / walked.max(1) as f64
+                "  {name:<28} {padded:>6} B ({:+.0}%){}",
+                (padded as f64 - actual as f64) * 100.0 / actual.max(1) as f64,
+                match widest * BYTES_PER_UNIT > 4 && name.contains('4') {
+                    true => "  -- too narrow for the widest instruction here",
+                    false => "",
+                }
             );
         }
 
@@ -225,6 +236,108 @@ fn main() {
             vm.call_sites.values().filter(|(c, _)| c.len() == 1).count(),
             monomorphic as f64 * 100.0 / sites_total.max(1) as f64
         );
+
+        // **The symbol has to fit in a byte for a one-unit Call to be
+        // possible**, and the count of distinct symbols does not answer that:
+        // a symbol is an index into the VM's whole method-name table, which
+        // holds every core signature whether this program calls it or not. So
+        // report the largest index actually reached, not how many there are.
+        let widest = vm.lookups.keys().map(|&(_, symbol)| symbol).max().unwrap_or(0);
+        println!(
+            "  widest method symbol reached: {widest} -- {} in one byte",
+            match widest < 256 {
+                true => "fits",
+                false => "DOES NOT fit",
+            }
+        );
+
+        // **Where the instructions were written, not only what they were.**
+        // The opcode histogram says what ran; this says which line of the
+        // program asked for it, which is what turns a profile into a thing a
+        // programmer can act on. The right-hand column is the mix, because a
+        // line that is slow for running many cheap instructions wants a
+        // different fix from one that is slow for running few expensive ones.
+        let mut per_line: std::collections::BTreeMap<u16, u64> = Default::default();
+        for (&(line, _), &count) in &vm.line_ops {
+            *per_line.entry(line).or_insert(0) += count;
+        }
+        let executed: u64 = per_line.values().sum();
+        let mut ranked: Vec<(u16, u64)> = per_line.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+        println!();
+        println!(
+            "{:>5} {:>12} {:>7} {:>7}  {:<30} {}",
+            "line", "ops", "share", "cumul", "source", "what it runs"
+        );
+        println!("{}", "-".repeat(110));
+        let text: Vec<&str> = source.lines().collect();
+        let mut running = 0u64;
+        for (line, count) in ranked.iter().take(12) {
+            running += count;
+            // The mix on this line, biggest first.
+            let mut mix: Vec<(u8, u64)> = vm
+                .line_ops
+                .iter()
+                .filter(|(&(at, _), _)| at == *line)
+                .map(|(&(_, op), &n)| (op, n))
+                .collect();
+            mix.sort_by(|a, b| b.1.cmp(&a.1));
+            let mix = mix
+                .iter()
+                .take(4)
+                .map(|(op, n)| match Op::from_byte(*op) {
+                    Some(op) => format!("{op:?} {n}"),
+                    None => format!("<{op}> {n}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let written = text
+                .get(*line as usize - 1)
+                .map(|line| line.trim())
+                .unwrap_or("");
+            let written: String = written.chars().take(30).collect();
+            println!(
+                "{line:>5} {count:>12} {:>6.2}% {:>6.1}%  {written:<30} {mix}",
+                *count as f64 * 100.0 / executed.max(1) as f64,
+                running as f64 * 100.0 / executed.max(1) as f64
+            );
+        }
+
+        // Who the lookups are actually for, by name. This is the table that
+        // says which core methods are worth specialising: a handful of them
+        // carry almost all of the dispatch in every benchmark.
+        let mut by_pair: Vec<((u32, u32), u64)> =
+            vm.lookups.iter().map(|(&key, &count)| (key, count)).collect();
+        by_pair.sort_by(|a, b| b.1.cmp(&a.1));
+        println!();
+        println!(
+            "{:<34} {:>12} {:>8} {:>8}",
+            "receiver class and method", "lookups", "share", "cumul"
+        );
+        println!("{}", "-".repeat(66));
+        let mut running = 0u64;
+        for ((class, symbol), count) in by_pair {
+            running += count;
+            let class_name = match vm.heap.class(wren::ObjectId::new(class)) {
+                Some(object) => match vm.heap.string(object.name) {
+                    Some(text) => text.as_str().unwrap_or("?").to_string(),
+                    None => format!("class#{class}"),
+                },
+                None => format!("class#{class}"),
+            };
+            let method = vm
+                .method_names
+                .name(symbol as usize)
+                .unwrap_or("?")
+                .to_string();
+            println!(
+                "{:<34} {count:>12} {:>7.2}% {:>7.1}%",
+                format!("{class_name}.{method}"),
+                count as f64 * 100.0 / asked.max(1) as f64,
+                running as f64 * 100.0 / asked.max(1) as f64
+            );
+        }
 
         for (index, count) in pairs.into_iter().take(10) {
             let name = |byte: u8| match Op::from_byte(byte) {

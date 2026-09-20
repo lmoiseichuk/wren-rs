@@ -684,20 +684,31 @@ having when it is free, and it is not free here.
 
 ### What a uniform width would cost
 
-Measured statically over the compiled benchmarks -- `op-profile` reports it --
-three quarters of all instructions are three bytes or more, so a uniform two
-bytes cannot hold a `Call` and the realistic scheme is two widths:
+Measured statically over the compiled benchmarks -- `op-profile` reports it.
+The current encoding is already variable and already narrow: an instruction is
+one, two or three `u16` units, and about three quarters of them are two.
 
-| | `binary_trees` | `method_call` | `fib` |
-|---|---|---|---|
-| as compiled | 659 B | 508 B | 183 B |
-| every instruction 4 bytes | +35% | +46% | +36% |
-| 2 bytes if it fits, else 4 | +19% | +24% | +19% |
+| | `binary_trees` | `method_call` | `fib` | `list_build` |
+|---|---|---|---|---|
+| as compiled | 788 B | 630 B | 220 B | 212 B |
+| every instruction 4 B | +13% | +18% | +13% | +19% |
+| every instruction 6 B | +69% | +77% | +69% | +78% |
 
-A fifth to a quarter more code, which on this VM is RAM, because programs are
-compiled on the device. Against that, the decoding it would simplify is not
+**And four bytes is not actually a candidate.** `binary_trees` and `fib` both
+contain three-unit instructions, so the only uniform width that holds every
+instruction in them is six -- which is where the +69% to +78% row is, not the
++13% one. Against that, the decoding a fixed layout would simplify is not
 where the time goes: the operand-window experiment above found the optimiser
-had already merged the bounds checks a fixed layout would remove.
+had already merged the bounds checks it would remove.
+
+*These numbers replace an earlier table that read +35% to +46%. The instrument
+was wrong, not the conclusion: `Chunk::footprint` returned `code.capacity()`
+-- a count of `u16` units -- under a doc comment saying bytes, and `op-profile`
+summed unit lengths into a variable it printed as `B` and then compared
+against byte-based encodings. So the "as compiled" column was half its true
+size and every percentage above it was inflated by the same factor. The
+refusal stands on the corrected figures; it stood on the wrong ones by
+accident.*
 
 ---
 

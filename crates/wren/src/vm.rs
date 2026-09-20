@@ -390,6 +390,15 @@ pub struct Vm {
     /// array nor the increment.
     #[cfg(feature = "profile")]
     pub op_counts: [u64; 256],
+    /// Executions per `(source line, opcode)`.
+    ///
+    /// **This is what says whether a slow line is slow because it runs many
+    /// instructions or because it runs expensive ones**, which the opcode
+    /// histogram alone cannot answer: that one knows what ran and not where
+    /// it was written. Keyed by line rather than by chunk and line because a
+    /// benchmark is one source file, and the question is about the file.
+    #[cfg(feature = "profile")]
+    pub line_ops: alloc::collections::BTreeMap<(u16, u8), u64>,
     /// How many times each opcode followed each other opcode, indexed
     /// `previous * 256 + current`.
     ///
@@ -546,6 +555,8 @@ impl Vm {
             output: Vec::new(),
             #[cfg(feature = "profile")]
             op_counts: [0; 256],
+            #[cfg(feature = "profile")]
+            line_ops: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "profile")]
             op_pairs: alloc::vec![0; 256 * 256],
             #[cfg(feature = "profile")]
@@ -1723,6 +1734,7 @@ impl Vm {
             #[cfg(feature = "profile")]
             {
                 self.op_counts[byte as usize] += 1;
+                *self.line_ops.entry((chunk.line_at(at), byte)).or_insert(0) += 1;
                 let here = Rc::as_ptr(&chunk) as usize;
                 if self.previous_op != u16::MAX
                     && self.previous_end == at

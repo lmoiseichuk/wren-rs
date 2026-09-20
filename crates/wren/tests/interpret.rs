@@ -1743,3 +1743,44 @@ fn a_heap_carries_its_block_size_into_the_vm() {
         "and refuses to move once the VM's own objects are in it"
     );
 }
+
+/// A compiled chunk can be run more than once.
+///
+/// **This is what lets a benchmark repeat without recompiling.** A short
+/// program measured on a device is mostly its own compile time otherwise, and
+/// running it ten times from ten compiles dilutes nothing. Re-running one
+/// chunk re-executes the module initialisers -- classes are made again and
+/// module variables overwritten in place -- which is exactly the behaviour a
+/// repeat wants, and is not obviously true until it is checked.
+#[test]
+fn a_compiled_chunk_can_be_run_again() {
+    use std::rc::Rc;
+    let mut vm = Vm::new();
+    let chunk = Rc::new(
+        wren::compiler::compile(
+            &mut vm,
+            r#"
+                class Counter {
+                    construct new() { _n = 0 }
+                    bump { _n = _n + 1 }
+                    n { _n }
+                }
+                var counter = Counter.new()
+                counter.bump
+                counter.bump
+                System.print(counter.n)
+            "#,
+        )
+        .expect("compiles"),
+    );
+
+    for round in 1..=3 {
+        vm.run(chunk.clone())
+            .unwrap_or_else(|error| panic!("round {round}: {}", error.message));
+    }
+    assert_eq!(
+        vm.output_str(),
+        "2\n2\n2\n",
+        "each run starts from the module initialisers, so each prints 2"
+    );
+}

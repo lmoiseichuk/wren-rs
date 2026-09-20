@@ -797,7 +797,11 @@ impl Chunk {
     #[cfg(feature = "profile")]
     pub fn footprint(&self) -> (usize, usize, usize, usize) {
         (
-            self.code.capacity(),
+            // **Units, not bytes** -- `code` is a `Vec<u16>`, so a capacity of
+            // 394 is 788 bytes. Everything else here multiplies by its element
+            // size and this did not, which made every code figure the profiler
+            // printed half of the truth.
+            self.code.capacity() * core::mem::size_of::<u16>(),
             self.lines.capacity() * core::mem::size_of::<(u32, u16)>(),
             self.constants.capacity() * core::mem::size_of::<Value>(),
             // A `BTreeMap` node holds up to eleven entries plus its links; this

@@ -86,13 +86,47 @@ const fn decimal(text: &str) -> usize {
     value
 }
 
-/// The benchmarks, in the order the published table lists them.
-const BENCHMARKS: &[(&str, &str)] = &[
-    ("binary_trees", include_str!("../../../benchmarks/wren/binary_trees.wren")),
-    ("fib", include_str!("../../../benchmarks/wren/fib.wren")),
-    ("list_build", include_str!("../../../benchmarks/wren/list_build.wren")),
-    ("method_call", include_str!("../../../benchmarks/wren/method_call.wren")),
+/// The benchmarks, in the order the published table lists them, with how many
+/// times each is run.
+///
+/// **A repeat is not the same as a longer benchmark.** The constants in
+/// `benchmarks/wren/` are fixed by `benchmarks/README.md` -- the Wren and
+/// Python versions must match, and every published table was measured at
+/// those values -- so the programs are left exactly as they are and run more
+/// than once instead. What that buys is dilution: `method_call` finishes in
+/// under two seconds, of which compiling it is a fixed slice, and a change
+/// worth two per cent of dispatch is hard to see underneath that. Running one
+/// *compiled* chunk ten times pays the compile once and the dispatch ten
+/// times. Ten compiles would dilute nothing.
+///
+/// **Only the two dispatch benchmarks repeat.** `method_call` is under two
+/// seconds and can afford ten; `fib` is thirteen and five of those is already
+/// a minute. Both hold almost nothing -- 7,484 B and 3,476 B -- so running
+/// them again in the same VM costs nothing but time.
+///
+/// The two allocation benchmarks stay at one, and not only because they are
+/// long. A second run in the same VM overlaps two live sets: `list_build`
+/// overwrites its module variable with a fresh list on its first statement,
+/// but the previous run's 80 KB stays reachable until that store completes,
+/// and the new list's doubling transient lands on top of it -- 227 KB free
+/// does not cover both, and it panics. Repeating an allocation benchmark
+/// measures something other than the benchmark.
+const BENCHMARKS: &[(&str, &str, u32)] = &[
+    ("binary_trees", include_str!("../../../benchmarks/wren/binary_trees.wren"), 1),
+    ("fib", include_str!("../../../benchmarks/wren/fib.wren"), 5),
+    ("list_build", include_str!("../../../benchmarks/wren/list_build.wren"), 1),
+    ("method_call", include_str!("../../../benchmarks/wren/method_call.wren"), 10),
 ];
+
+/// Override every repeat count, for a quick iteration.
+///
+/// The full set at the counts above is minutes per flash, which is right for
+/// a figure that goes in a table and wrong for trying six variants of one
+/// interpreter arm. `WREN_REPEATS=1` gives the short loop back.
+const REPEAT_OVERRIDE: Option<u32> = match option_env!("WREN_REPEATS") {
+    Some(text) => Some(decimal(text) as u32),
+    None => None,
+};
 
 #[main]
 fn main() -> ! {
@@ -118,8 +152,8 @@ fn main() -> ! {
     println!("[vm] resident {resident} B");
     println!();
 
-    for (name, source) in BENCHMARKS {
-        run_one(name, source);
+    for (name, source, repeats) in BENCHMARKS {
+        run_one(name, source, REPEAT_OVERRIDE.unwrap_or(*repeats).max(1));
     }
 
     println!();
@@ -145,8 +179,8 @@ fn fresh_vm() -> Vm {
     Vm::with_heap(heap)
 }
 
-/// Compile and run one benchmark, reporting what it cost.
-fn run_one(name: &str, source: &str) {
+/// Compile one benchmark once, run it `repeats` times, and report what it cost.
+fn run_one(name: &str, source: &str, repeats: u32) {
     // A fresh VM per benchmark, so one program's garbage is never another's
     // starting condition -- the C port restarts the board between runs for the
     // same reason.
@@ -163,16 +197,44 @@ fn run_one(name: &str, source: &str) {
     vm.set_clock(move || origin.elapsed().as_micros() as f64 / 1_000_000.0);
 
     let free_before = esp_alloc::HEAP.free();
-    // **Two runs, because the counter holds one event at a time.** The second
-    // is the same program from the same starting state, so the two figures
-    // describe one run between them: how much work it was, and how long the
-    // part took to do it.
+
+    // **Compiled once, outside the measured region.** The repeat exists to
+    // make the fixed cost of compiling small against the work being measured,
+    // which only happens if the compile is not repeated with it.
+    let chunk = match wren::compiler::compile(&mut vm, source) {
+        Ok(chunk) => alloc::rc::Rc::new(chunk),
+        Err(error) => {
+            println!("{name:<14} COMPILE ERROR line {}: {}", error.line, error.message);
+            return;
+        }
+    };
+
+    // **The counter is 32 bits, and that is what bounds the repeat counts.**
+    // One window covers every repeat, so the ceiling is 4,294,967,295
+    // instructions for the whole set of them: `fib` at 766M a run and five
+    // runs is 3.83e9, which is 89% of the range and the tightest of the four.
+    // A repeat count raised past that would wrap silently and report a number
+    // smaller than a single run -- so the counts in `BENCHMARKS` are not free
+    // to grow without checking this.
     counters::start(counters::INSTRUCTIONS);
     let started = Instant::now();
-    let outcome = vm.interpret(source);
-    let wall: Duration = started.elapsed();
-    let instructions = counters::stop();
-    let free_after = esp_alloc::HEAP.free();
+    let mut outcome = Ok(());
+    // The heap figure is taken after the *first* run, so it keeps meaning what
+    // it meant before repeats existed: what one run of this program leaves
+    // resident. Later runs overwrite the module's variables and make the
+    // previous run's objects garbage, which is a different measurement.
+    let mut free_after = free_before;
+    for round in 0..repeats {
+        outcome = vm.run(chunk.clone());
+        if round == 0 {
+            free_after = esp_alloc::HEAP.free();
+        }
+        if outcome.is_err() {
+            break;
+        }
+    }
+    let wall: Duration = started.elapsed() / repeats;
+    let instructions = counters::stop() / repeats;
 
     match outcome {
         Ok(()) => {
@@ -192,9 +254,13 @@ fn run_one(name: &str, source: &str) {
                 .into();
 
             println!(
-                "{name:<14} elapsed: {reported:<20} wall {} us  heap {} B",
+                "{name:<14} elapsed: {reported:<20} wall {} us  heap {} B{}",
                 wall.as_micros(),
-                free_before.saturating_sub(free_after)
+                free_before.saturating_sub(free_after),
+                match repeats {
+                    1 => alloc::string::String::new(),
+                    n => alloc::format!("  (mean of {n})"),
+                }
             );
             // **The placement-invariant figure.** Seconds move by three to
             // four per cent with code layout alone; this does not, so it is
@@ -203,7 +269,7 @@ fn run_one(name: &str, source: &str) {
             println!("{:<14} -> {answer}", "");
         }
         Err(error) => {
-            println!("{name:<14} ERROR line {}: {}", error.line(), error.message());
+            println!("{name:<14} ERROR line {}: {}", error.line, error.message);
         }
     }
 }
