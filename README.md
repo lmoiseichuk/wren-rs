@@ -257,6 +257,7 @@ benchmarks/     the same programs in both languages, same constants
 doc/examples/   a worked node in Wren, and the bytecode built from it
 doc/wren/       what upstream Wren and MicroPython measured
 doc/wren-rs/    why the Rust implementation is built the way it is
+doc/wren_native.md  building a program into a native executable
 ports/          one directory per (board, implementation) pair
   esp32c6-wren/          the C reference
   esp32c6-micropython/   the baseline
