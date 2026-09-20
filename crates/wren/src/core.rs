@@ -2466,7 +2466,13 @@ fn probe(vm: &Vm, entries: &[MapEntry], key: Value) -> (usize, bool) {
     let mut slot = (hash_value(vm, key) as usize) & mask;
     let mut tombstone: Option<usize> = None;
 
-    loop {
+    // **Bounded by the table, because a full one has no never-used slot to
+    // stop at.** The load factor keeps *live* entries under three quarters
+    // and says nothing about tombstones, so a table that has been churned --
+    // inserted into and removed from repeatedly without ever growing -- can
+    // reach a state where every slot is live or a tombstone. An unbounded
+    // walk then never terminates, and the VM hangs rather than failing.
+    for _ in 0..capacity {
         let entry = entries[slot];
         if entry.key.is_undefined() {
             // A false value marks a slot never used, so the probe ends: no key
@@ -2482,6 +2488,10 @@ fn probe(vm: &Vm, entries: &[MapEntry], key: Value) -> (usize, bool) {
         }
         slot = (slot + 1) & mask;
     }
+    // Every slot walked: the key is not here, and the only place to put one
+    // is a tombstone. There is always at least one, because the load factor
+    // guarantees the table is never full of *live* entries.
+    (tombstone.unwrap_or(slot), false)
 }
 
 /// Grow the table, rehashing every live entry into the new one.
