@@ -362,7 +362,7 @@ fn write_constant(context: &Writing, out: &mut Vec<u8>, value: Value) -> Result<
     match vm.heap.type_of(id) {
         Some(ObjectType::String) => {
             out.push(4);
-            let Some(bytes) = vm.heap.string(id).map(|text| text.bytes.clone()) else {
+            let Some(bytes) = vm.heap.string(id).map(|text| text.bytes.to_vec()) else {
                 return Ok(());
             };
             write_bytes(out, &bytes);

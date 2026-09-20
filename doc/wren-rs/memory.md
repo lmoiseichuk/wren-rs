@@ -789,19 +789,54 @@ mutation, and the heap is not charged for any of it. A flash-and-watch cycle on
 the part is the better part of a minute, and the interesting failures here are
 ones a device reports only as a wrong answer.
 
-##### What is left of the core
+##### Finishing it: `System`, and the names
 
-Two classes are still built in RAM: `System` and its metaclass, because
-`install_system` allocates them directly rather than through the class helper
-the cursor counts. That is 104 B of struct and 56 B of method table.
+Two things were still built in RAM, and both are now in the image.
 
-The class names are still heap strings -- 231 B -- because `ObjString` owns its
-bytes. Giving it a borrowed form is the same change `Methods` and `ClassRef`
-already made twice, and the `String` slot table would shrink with it.
+`System` was, because `install_system` builds its class itself rather than
+through `Vm::build`'s helper -- so the frozen `System` sat unreachable beside a
+second one built at start-up. The first fix was a cursor handed out in creation
+order, which worked in `Vm::build` and was wrong the moment anything built a
+class outside it: a cursor one ahead is not an error, it is every later class
+silently being some other class. `FrozenCore::class_named` looks them up by
+name instead, over twenty-odd names, once. `a_frozen_core_builds_no_class_in_ram`
+is the test, and counting *handles* would not have caught this -- counting how
+many of them are in the image does.
 
-And the arena's overhead is now the largest single item at 1,804 B of the
-5,016: with the classes gone it is no longer competing with anything. Splitting
-a reused hole rather than handing it over whole is the next real lever.
+The names were, because `ObjString` owned its bytes. `Text` gives it the same
+borrowed form `Methods` and `ClassRef` have. This one was expected to be close:
+231 B of text against four more bytes on every string slot, owned strings
+included. It turned out not to be close at all, because the four bytes never
+materialised -- `Text`'s discriminant fits in the niche of the `Vec`'s
+pointer, so `Option<ObjString>` is the sixteen bytes it always was and the
+saving is unopposed.
+
+On `fib`, on the part:
+
+| | frozen classes | ...and `System` and the names |
+|---|---|---|
+| classes built in RAM | 2 of 23 | **0 of 21** |
+| object contents | 167 B | **0** |
+| the VM's own asks | 2,114 B | **1,947 B** |
+| at VM init | 5,016 B | **4,008 B** |
+| peak | 9,160 B | **8,184 B** |
+| blocks | 86 | 59 |
+
+**Nothing in the heap belongs to the core any more.** `object contents` is
+zero: every class, every method table and every class name is in flash, and
+what the heap holds is the slots that address them, the VM's own vectors, and
+whatever the program computes.
+
+The heap peak is 8,184 B against a CH32V006's 8,192 -- which is not the same as
+fitting, because the 1,484 B `Vm` and the call stack sit outside it. But the
+heap was 11,464 B four commits ago, and the part has 8,192.
+
+##### What is left
+
+The arena's own overhead, which is now the largest single item by a wide
+margin: with the core gone it competes with nothing. Splitting a reused hole
+rather than handing it over whole is the next real lever, and after that the
+`Vm` struct's 1,484 bytes of stack.
 
 ### What is left worth building
 

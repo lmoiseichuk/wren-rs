@@ -89,6 +89,27 @@ pub struct FrozenCore {
 }
 
 impl FrozenCore {
+    /// The handle of the class with this name, if the core has one.
+    ///
+    /// **By name rather than by position.** An earlier version handed classes
+    /// out in order, on the argument that the firmware makes the same calls in
+    /// the same sequence the generator did -- which was true in `Vm::build`
+    /// and false the moment `install_system` built a class of its own without
+    /// going through the same helper. A cursor that is one ahead is not an
+    /// error, it is every later class silently being some other class.
+    ///
+    /// Linear, over twenty-odd names, once at start-up.
+    pub fn class_named(&self, name: &str) -> Option<crate::handle::ObjectId> {
+        let index = self
+            .class_names
+            .iter()
+            .position(|candidate| *candidate == name)?;
+        Some(crate::handle::ObjectId::tagged(
+            crate::object::ObjectType::Class.tag(),
+            index as u32,
+        ))
+    }
+
     /// Why this core does not match the VM built from it, if it does not.
     ///
     /// **A frozen method table is a list of symbol numbers**, so a core

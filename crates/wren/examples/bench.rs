@@ -247,7 +247,7 @@ fn contents_detail(
             None => (0, 0, 0),
         },
         ObjectType::String => match heap.string(id) {
-            Some(string) => pair(string.bytes.len(), string.bytes.capacity(), 1),
+            Some(string) => pair(string.bytes.len(), string.bytes.footprint(), 1),
             None => (0, 0, 0),
         },
         ObjectType::Map => match heap.map(id) {

@@ -271,6 +271,15 @@ pub struct Vm {
     /// with more than 256 distinct method signatures simply takes the slow
     /// path for the ones past the end, which is what it does today anyway.
     num_ops: [u8; 256],
+    /// The core library built into the image, if there is one.
+    ///
+    /// **Read by the installers, not by the interpreter.** `install_system`
+    /// builds its class itself rather than through `Vm::build`'s helper, so it
+    /// is the one place that has to ask whether a frozen one already exists --
+    /// otherwise it allocates a second `System` and the frozen one is never
+    /// reached. Anything else that starts building a core class at install
+    /// time has to do the same.
+    pub(crate) frozen: Option<&'static crate::frozen::FrozenCore>,
     /// Which core methods to install, or all of them.
     ///
     /// **A program's `.wrenc` already names every method it can call**, and
@@ -679,26 +688,25 @@ impl Vm {
         // generator saw them.
         if let Some(core) = frozen {
             for name in core.class_names {
-                heap.allocate(Object::String(crate::object::ObjString::from_text(name)));
+                // The text is in the image; only the `ObjString` and its slot
+                // are in the heap. See `crate::object::Text`.
+                heap.allocate(Object::String(crate::object::ObjString::frozen(name)));
             }
             for class in core.classes {
                 heap.adopt_class(class);
             }
         }
-        // Handed out in creation order by the two helpers below, which is the
-        // order the generator recorded because it ran this same function.
-        let taken = ::core::cell::Cell::new(0u32);
 
 
         // The classes have to exist before anything can be dispatched on, and
         // they refer to their own names, so the names are allocated first.
         let class_named = |heap: &mut Heap, name: &str, superclass: Option<ObjectId>| {
-            // Already in the image, and already seeded above: take the next
-            // one rather than building a second copy of it.
-            if frozen.is_some() {
-                let index = taken.get();
-                taken.set(index + 1);
-                return ObjectId::tagged(crate::object::ObjectType::Class.tag(), index);
+            // Already in the image, and already seeded above: find it by
+            // name rather than building a second copy of it.
+            if let Some(core) = frozen {
+                if let Some(id) = core.class_named(name) {
+                    return id;
+                }
             }
             let name = heap.allocate(Object::String(ObjString::from_text(name)));
             heap.allocate(Object::Class(alloc::boxed::Box::new(
@@ -803,6 +811,7 @@ impl Vm {
             stack: Vec::new(),
             method_names: SymbolTable::new(),
             num_ops: [NUM_OP_NONE; 256],
+            frozen,
             core_filter: None,
             primitives: Vec::new(),
             modules: alloc::vec![Module::new()],

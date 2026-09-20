@@ -118,6 +118,36 @@ fn every_frozen_class_is_addressable_and_refused_for_writing() {
     }
 }
 
+/// No class is built in RAM at all.
+///
+/// **The check that `install_system` needed.** It builds its class itself
+/// rather than through `Vm::build`'s helper, so for a while it allocated a
+/// second `System` beside the frozen one -- reachable, correct, and two
+/// classes' worth of RAM spent proving it. Counting handles says nothing;
+/// counting how many of them are in the image says everything.
+#[test]
+fn a_frozen_core_builds_no_class_in_ram() {
+    use wren::handle::ObjectId;
+    use wren::object::ObjectType;
+
+    let manifest = manifest();
+    let vm = wren::Vm::with_frozen_core(&CORE, &manifest);
+
+    let built: Vec<u32> = vm
+        .heap
+        .ids()
+        .into_iter()
+        .filter(|id| id.tag() == ObjectType::Class.tag())
+        .filter(|id| !vm.heap.class_is_static(*id))
+        .map(ObjectId::index)
+        .collect();
+
+    assert!(
+        built.is_empty(),
+        "these classes were built in RAM despite being in the image: {built:?}"
+    );
+}
+
 /// The classes cost the heap nothing, which is the whole point.
 #[test]
 fn a_frozen_core_is_not_charged_to_the_heap() {

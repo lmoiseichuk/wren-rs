@@ -184,7 +184,7 @@ impl Object {
             Object::List(list) => list.elements.capacity() * core::mem::size_of::<Value>(),
             Object::Map(map) => map.entries.capacity() * core::mem::size_of::<MapEntry>(),
             Object::Range(_) => 0,
-            Object::String(string) => string.bytes.capacity(),
+            Object::String(string) => string.bytes.footprint(),
             // The chunk is shared through an `Rc`, so charging its full size
             // to every closure over it would count the same bytes many times.
             Object::Fn(_) => core::mem::size_of::<ObjFn>(),
@@ -209,9 +209,47 @@ impl Object {
 /// upstream neither validates nor rejects the result. Storing `Vec<u8>` rather
 /// than `String` is what keeps that behaviour reachable; the places that need
 /// characters rather than bytes decode on the way past.
+/// A string's bytes, which may be in the image rather than in the heap.
+///
+/// **The same trade as [`Methods`], and a closer one.** A core class's name is
+/// a literal that was settled when the image was built, and allocating
+/// twenty-odd of them at start-up costs both their text and a heap block each.
+/// Borrowing them costs four bytes on every string slot instead, owned strings
+/// included -- so unlike a class, where the saving is fifty-two bytes against
+/// four, this one is close enough that it had to be measured rather than
+/// argued. See `doc/wren-rs/memory.md`.
+#[derive(Debug)]
+pub enum Text {
+    /// A literal in the image.
+    Static(&'static str),
+    /// Built at run time, in the heap.
+    Owned(Vec<u8>),
+}
+
+impl Text {
+    /// What this costs the heap: nothing at all when it is in the image.
+    pub fn footprint(&self) -> usize {
+        match self {
+            Text::Owned(bytes) => bytes.capacity(),
+            Text::Static(_) => 0,
+        }
+    }
+}
+
+impl core::ops::Deref for Text {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Text::Owned(bytes) => bytes,
+            Text::Static(text) => text.as_bytes(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ObjString {
-    pub bytes: Vec<u8>,
+    pub bytes: Text,
     /// Cached because maps hash their keys on every lookup and rehashing a
     /// long string each time is what makes a naive implementation slow.
     /// Upstream caches it in the same place for the same reason.
@@ -221,7 +259,23 @@ pub struct ObjString {
 impl ObjString {
     pub fn new(bytes: Vec<u8>) -> ObjString {
         let hash = hash_bytes(&bytes);
-        ObjString { bytes, hash }
+        ObjString {
+            bytes: Text::Owned(bytes),
+            hash,
+        }
+    }
+
+    /// A string whose bytes are in the image.
+    ///
+    /// The hash is still computed at start-up: `hash_bytes` walks the text,
+    /// and doing it here costs twenty-odd short walks once, against making the
+    /// generator emit a number that would then have to be kept in step with
+    /// the hash function.
+    pub fn frozen(text: &'static str) -> ObjString {
+        ObjString {
+            bytes: Text::Static(text),
+            hash: hash_bytes(text.as_bytes()),
+        }
     }
 
     pub fn from_text(text: &str) -> ObjString {
@@ -1209,6 +1263,6 @@ impl Trace for ObjString {
     fn trace(&self, _gray: &mut Vec<ObjectId>) {}
 
     fn contents_size(&self) -> usize {
-        self.bytes.capacity()
+        self.bytes.footprint()
     }
 }

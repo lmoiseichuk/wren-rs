@@ -871,7 +871,7 @@ fn strings_equal(vm: &Vm, left: Value, right: Value) -> bool {
     match (vm.heap.string(left), vm.heap.string(right)) {
         (Some(a), Some(b)) => {
             // The cached hash is a cheap rejection before comparing bytes.
-            a.hash() == b.hash() && a.bytes == b.bytes
+            a.hash() == b.hash() && *a.bytes == *b.bytes
         }
         _ => false,
     }
@@ -1382,7 +1382,7 @@ fn compare_strings(vm: &Vm, at: usize, accept: fn(i32) -> bool) -> Result<Value,
         .as_object()
         .and_then(|id| vm.heap.string(id))
     {
-        Some(text) => text.bytes.clone(),
+        Some(text) => text.bytes.to_vec(),
         _ => return Err(RuntimeError::new("Right operand must be a string.")),
     };
     let ordering = match left.cmp(&right) {
@@ -1590,7 +1590,7 @@ fn character_bytes(bytes: &[u8], at: usize) -> Vec<u8> {
 
 fn string_bytes(vm: &Vm, value: Value) -> Vec<u8> {
     match value.as_object().and_then(|id| vm.heap.string(id)) {
-        Some(text) => text.bytes.clone(),
+        Some(text) => text.bytes.to_vec(),
         _ => Vec::new(),
     }
 }
@@ -2992,20 +2992,33 @@ fn range_of(vm: &Vm, value: Value) -> Option<ObjRange> {
 
 /// `System`, and the metaclass that holds its static methods.
 fn install_system(vm: &mut Vm) {
-    let metaclass_name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("System metaclass")));
-    let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
-        metaclass_name,
-        Some(vm.class_class),
-    ))));
+    // **`System` is built here rather than in `Vm::build`**, which makes this
+    // the one installer that has to ask whether the image already carries the
+    // class. Without the question it allocates a second `System`, the frozen
+    // one is never reached, and two classes' worth of RAM is spent proving it.
+    let frozen = vm
+        .frozen
+        .and_then(|core| Some((core.class_named("System")?, core.class_named("System metaclass")?)));
 
-    let name = vm
-        .heap
-        .allocate(Object::String(ObjString::from_text("System")));
-    let mut class = ObjClass::new(name, None);
-    class.metaclass = Some(metaclass);
-    let system = vm.heap.allocate(Object::Class(Box::new(class)));
+    let (system, metaclass) = match frozen {
+        Some(pair) => pair,
+        None => {
+            let metaclass_name = vm
+                .heap
+                .allocate(Object::String(ObjString::from_text("System metaclass")));
+            let metaclass = vm.heap.allocate(Object::Class(Box::new(ObjClass::new(
+                metaclass_name,
+                Some(vm.class_class),
+            ))));
+
+            let name = vm
+                .heap
+                .allocate(Object::String(ObjString::from_text("System")));
+            let mut class = ObjClass::new(name, None);
+            class.metaclass = Some(metaclass);
+            (vm.heap.allocate(Object::Class(Box::new(class))), metaclass)
+        }
+    };
 
     define(vm, metaclass, "print(_)", |vm, at| {
         let value = argument(vm, at, 1);
