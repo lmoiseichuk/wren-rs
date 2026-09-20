@@ -58,6 +58,14 @@ fn define(vm: &mut Vm, class: ObjectId, signature: &str, function: Primitive) {
     vm.bind_primitive(class, symbol, function);
 }
 
+
+/// Bind a whole table of primitives to one class.
+fn define_all(vm: &mut Vm, class: ObjectId, table: &[(&str, Primitive)]) {
+    for (signature, function) in table {
+        define(vm, class, signature, *function);
+    }
+}
+
 /// The receiver of the call in progress.
 fn receiver(vm: &Vm, at: usize) -> Value {
     vm.stack[at]
@@ -1452,8 +1460,9 @@ fn string_text(vm: &Vm, value: Value) -> alloc::string::String {
 /// per element and lists are where that shows.
 fn install_sequence(vm: &mut Vm) {
     let class = vm.sequence_class;
+    static SEQUENCE: &[(&str, Primitive)] = &[
 
-    define(vm, class, "count", |vm, at| {
+    ("count", |vm, at| {
         let sequence = receiver(vm, at);
         let mut count = 0.0;
         let mut iterator = Value::NULL;
@@ -1464,30 +1473,30 @@ fn install_sequence(vm: &mut Vm) {
             }
             count += 1.0;
         }
-    });
+    }),
 
-    define(vm, class, "isEmpty", |vm, at| {
+    ("isEmpty", |vm, at| {
         let sequence = receiver(vm, at);
         let first = vm.invoke_with(sequence, "iterate(_)", &[Value::NULL])?;
         Ok(Value::bool(first.is_falsy()))
-    });
+    }),
 
-    define(vm, class, "each(_)", |vm, at| {
+    ("each(_)", |vm, at| {
         let sequence = receiver(vm, at);
         let function = argument(vm, at, 1);
         for element in collect(vm, sequence)? {
             vm.call_function(function, &[element])?;
         }
         Ok(Value::NULL)
-    });
+    }),
 
-    define(vm, class, "toList", |vm, at| {
+    ("toList", |vm, at| {
         let sequence = receiver(vm, at);
         let elements = collect(vm, sequence)?;
         Ok(new_list(vm, elements))
-    });
+    }),
 
-    define(vm, class, "contains(_)", |vm, at| {
+    ("contains(_)", |vm, at| {
         let sequence = receiver(vm, at);
         let wanted = argument(vm, at, 1);
         for element in collect(vm, sequence)? {
@@ -1496,9 +1505,9 @@ fn install_sequence(vm: &mut Vm) {
             }
         }
         Ok(Value::FALSE)
-    });
+    }),
 
-    define(vm, class, "all(_)", |vm, at| {
+    ("all(_)", |vm, at| {
         // **Returns the first falsy result, not `false`.** The value carries
         // more than the verdict does -- it says *which* element failed -- and
         // a program can still use it as a condition because it is falsy.
@@ -1514,9 +1523,9 @@ fn install_sequence(vm: &mut Vm) {
             }
         }
         Ok(result)
-    });
+    }),
 
-    define(vm, class, "any(_)", |vm, at| {
+    ("any(_)", |vm, at| {
         // The mirror of `all`: the first truthy result rather than `true`.
         let sequence = receiver(vm, at);
         let function = function_argument(vm, at, 1)?;
@@ -1528,9 +1537,9 @@ fn install_sequence(vm: &mut Vm) {
             }
         }
         Ok(result)
-    });
+    }),
 
-    define(vm, class, "reduce(_)", |vm, at| {
+    ("reduce(_)", |vm, at| {
         let sequence = receiver(vm, at);
         let function = argument(vm, at, 1);
         expect_arity(vm, function, 2)?;
@@ -1542,9 +1551,9 @@ fn install_sequence(vm: &mut Vm) {
             total = vm.call_function(function, &[total, element])?;
         }
         Ok(total)
-    });
+    }),
 
-    define(vm, class, "reduce(_,_)", |vm, at| {
+    ("reduce(_,_)", |vm, at| {
         let sequence = receiver(vm, at);
         let mut total = argument(vm, at, 1);
         let function = argument(vm, at, 2);
@@ -1553,9 +1562,9 @@ fn install_sequence(vm: &mut Vm) {
             total = vm.call_function(function, &[total, element])?;
         }
         Ok(total)
-    });
+    }),
 
-    define(vm, class, "count(_)", |vm, at| {
+    ("count(_)", |vm, at| {
         let sequence = receiver(vm, at);
         let function = function_argument(vm, at, 1)?;
         let mut count = 0.0;
@@ -1565,14 +1574,14 @@ fn install_sequence(vm: &mut Vm) {
             }
         }
         Ok(Value::num(count))
-    });
+    }),
 
-    define(vm, class, "join()", |vm, at| {
+    ("join()", |vm, at| {
         let sequence = receiver(vm, at);
         let joined = join_sequence(vm, sequence, "")?;
         Ok(vm.new_string(&joined))
-    });
-    define(vm, class, "join(_)", |vm, at| {
+    }),
+    ("join(_)", |vm, at| {
         let sequence = receiver(vm, at);
         let separator = argument(vm, at, 1);
         if !vm.is_string(separator) {
@@ -1581,22 +1590,22 @@ fn install_sequence(vm: &mut Vm) {
         let separator = vm.to_string(separator);
         let joined = join_sequence(vm, sequence, &separator)?;
         Ok(vm.new_string(&joined))
-    });
+    }),
 
     // **The lazy four.** `map` on an infinite sequence has to stay infinite,
     // so these build a view rather than a list. Upstream's own test drives
     // `map` with a Fibonacci iterator that never ends.
-    define(vm, class, "map(_)", |vm, at| {
+    ("map(_)", |vm, at| {
         let function = function_argument(vm, at, 1)?;
         let class = vm.map_sequence_class;
         Ok(new_view(vm, class, &[receiver(vm, at), function]))
-    });
-    define(vm, class, "where(_)", |vm, at| {
+    }),
+    ("where(_)", |vm, at| {
         let function = function_argument(vm, at, 1)?;
         let class = vm.where_sequence_class;
         Ok(new_view(vm, class, &[receiver(vm, at), function]))
-    });
-    define(vm, class, "take(_)", |vm, at| {
+    }),
+    ("take(_)", |vm, at| {
         let count = counting_argument(vm, at, 1)?;
         let class = vm.take_sequence_class;
         Ok(new_view(
@@ -1604,13 +1613,15 @@ fn install_sequence(vm: &mut Vm) {
             class,
             &[receiver(vm, at), Value::num(count), Value::num(0.0)],
         ))
-    });
-    define(vm, class, "skip(_)", |vm, at| {
+    }),
+    ("skip(_)", |vm, at| {
         let count = counting_argument(vm, at, 1)?;
         let class = vm.skip_sequence_class;
         Ok(new_view(vm, class, &[receiver(vm, at), Value::num(count)]))
-    });
+    }),
 
+    ];
+    define_all(vm, class, SEQUENCE);
     install_lazy_sequences(vm);
 }
 
