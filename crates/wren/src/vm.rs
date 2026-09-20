@@ -632,20 +632,51 @@ impl Vm {
         // name string first.
         let class_class = class_named(&mut heap, "Class", root);
         let fn_class = class_named(&mut heap, "Fn", root);
-        let map_entry_class = class_named(&mut heap, "MapEntry", root);
         let fiber_class = class_named(&mut heap, "Fiber", root);
         let sequence_class = class_named(&mut heap, "Sequence", root);
         let iterable = Some(sequence_class);
-        let map_sequence_class = class_named(&mut heap, "MapSequence", iterable);
-        let where_sequence_class = class_named(&mut heap, "WhereSequence", iterable);
-        let take_sequence_class = class_named(&mut heap, "TakeSequence", iterable);
-        let skip_sequence_class = class_named(&mut heap, "SkipSequence", iterable);
-        let map_key_sequence_class = class_named(&mut heap, "MapKeySequence", iterable);
-        let map_value_sequence_class = class_named(&mut heap, "MapValueSequence", iterable);
-        let class_attributes_class = class_named(&mut heap, "ClassAttributes", root);
-        let string_byte_sequence_class = class_named(&mut heap, "StringByteSequence", iterable);
+
+        // **The library classes, built only if the program can reach one.**
+        //
+        // Nine of the forty classes a VM starts with exist to be *returned*:
+        // `map(_)` gives a `MapSequence`, `keys` gives a `MapKeySequence`,
+        // iterating a map gives a `MapEntry`. Each costs an `ObjClass`, a
+        // method table and a name string, and a program that never calls the
+        // method that makes one can never see it.
+        //
+        // When a manifest says the method is absent the field keeps
+        // `object_class` rather than becoming an `Option`: nothing reads it,
+        // because the only code that would is the method that was not
+        // installed. That keeps sixty-odd use sites unchanged.
+        let wants = |signature: &str| match &core_filter {
+            None => true,
+            Some(filter) => filter.iter().any(|name| name == signature),
+        };
+        let library_class = |heap: &mut Heap, name: &str, parent, wanted: bool| match wanted {
+            true => class_named(heap, name, parent),
+            false => object_class,
+        };
+
+        let map_entry_class =
+            library_class(&mut heap, "MapEntry", root, wants("iteratorValue(_)"));
+        let map_sequence_class =
+            library_class(&mut heap, "MapSequence", iterable, wants("map(_)"));
+        let where_sequence_class =
+            library_class(&mut heap, "WhereSequence", iterable, wants("where(_)"));
+        let take_sequence_class =
+            library_class(&mut heap, "TakeSequence", iterable, wants("take(_)"));
+        let skip_sequence_class =
+            library_class(&mut heap, "SkipSequence", iterable, wants("skip(_)"));
+        let map_key_sequence_class =
+            library_class(&mut heap, "MapKeySequence", iterable, wants("keys"));
+        let map_value_sequence_class =
+            library_class(&mut heap, "MapValueSequence", iterable, wants("values"));
+        let class_attributes_class =
+            library_class(&mut heap, "ClassAttributes", root, wants("attributes"));
+        let string_byte_sequence_class =
+            library_class(&mut heap, "StringByteSequence", iterable, wants("bytes"));
         let string_code_point_sequence_class =
-            class_named(&mut heap, "StringCodePointSequence", iterable);
+            library_class(&mut heap, "StringCodePointSequence", iterable, wants("codePoints"));
 
         let mut vm = Vm {
             heap,
