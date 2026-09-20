@@ -263,12 +263,12 @@ fn main() {
         }
         let executed: u64 = per_line.values().sum();
         let mut ranked: Vec<(u16, u64)> = per_line.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|&(_, count)| core::cmp::Reverse(count));
 
         println!();
         println!(
-            "{:>5} {:>12} {:>7} {:>7}  {:<30} {}",
-            "line", "ops", "share", "cumul", "source", "what it runs"
+            "{:>5} {:>12} {:>7} {:>7}  {:<30} what it runs",
+            "line", "ops", "share", "cumul", "source"
         );
         println!("{}", "-".repeat(110));
         let text: Vec<&str> = source.lines().collect();
@@ -282,7 +282,7 @@ fn main() {
                 .filter(|(&(at, _), _)| at == *line)
                 .map(|(&(_, op), &n)| (op, n))
                 .collect();
-            mix.sort_by(|a, b| b.1.cmp(&a.1));
+            mix.sort_by_key(|&(_, count)| core::cmp::Reverse(count));
             let mix = mix
                 .iter()
                 .take(4)
@@ -309,7 +309,7 @@ fn main() {
         // carry almost all of the dispatch in every benchmark.
         let mut by_pair: Vec<((u32, u32), u64)> =
             vm.lookups.iter().map(|(&key, &count)| (key, count)).collect();
-        by_pair.sort_by(|a, b| b.1.cmp(&a.1));
+        by_pair.sort_by_key(|&(_, count)| core::cmp::Reverse(count));
         println!();
         println!(
             "{:<34} {:>12} {:>8} {:>8}",
