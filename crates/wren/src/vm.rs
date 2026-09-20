@@ -491,6 +491,34 @@ const NUM_GT: u8 = 7;
 const NUM_LE: u8 = 8;
 const NUM_GE: u8 = 9;
 
+/// A chunk's code, as a slice whose lifetime is not tied to the `Rc`.
+///
+/// **This only pays together with the unchecked fetch below**, and that is
+/// worth recording because each half measured as a regression on its own:
+/// holding the pointer and the length costs two registers, and the length
+/// only earns one once the bounds check that reads it is gone. Measured on
+/// `method_call`: cache alone +0.31%, unchecked alone +1.04%, both -2.81%.
+///
+/// # Safety
+///
+/// The returned slice must not outlive the `Rc` passed in, and the caller
+/// must hold a strong reference while it reads. In `run_frames` that is
+/// `chunk`, and `follow_chunk!` keeps the two in step -- it points the slice
+/// at the new chunk *before* moving it in, so releasing the old one can never
+/// leave the slice dangling.
+///
+/// A `Chunk` cannot move or change underneath: it lives behind an `Rc`, and
+/// `code` is only written by `bytecode.rs` through `&mut self` during
+/// compilation, which finishes before any of it executes. There is no
+/// `Rc::get_mut`, no `make_mut` and no interior mutability in the crate, so a
+/// `Chunk` reachable through an `Rc` is immutable in fact, not by convention.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn code_units<'a>(chunk: &Rc<Chunk>) -> &'a [u16] {
+    // SAFETY: as documented above.
+    unsafe { ::core::slice::from_raw_parts(chunk.code.as_ptr(), chunk.code.len()) }
+}
+
 impl Vm {
     /// Record which method symbols name arithmetic on two numbers.
     ///
@@ -1776,6 +1804,9 @@ impl Vm {
     /// through `self.frames.last()` for every instruction costs a bounds check
     /// and an indirection per opcode. They are written back to the frame only
     /// when a call or a return changes which frame is running.
+    // **The crate's only `unsafe` lives in this function**, in the fetch and
+    // in `code_units`. The audit is `grep -rn unsafe crates/wren/src`.
+    #[allow(unsafe_code)]
     fn run_frames(&mut self, mut chunk: Rc<Chunk>, floor: usize) -> Result<Value, RuntimeError> {
         let mut ip = self.frames.last().map_or(0, |frame| frame.ip);
         let mut base = self.frames.last().map_or(0, |frame| frame.base);
@@ -1787,6 +1818,21 @@ impl Vm {
             .last()
             .and_then(|frame| self.function_of(frame.closure))
             .map_or(0, |function| function.module);
+
+        // The code, in registers rather than re-read every instruction; see
+        // `code_units`. Named `units` because `code` is already the module of
+        // opcode constants this loop matches on.
+        let mut units: &[u16] = code_units(&chunk);
+        // Declared after `units`: a `macro_rules!` body resolves a name it does
+        // not bind at its *definition* site, so a macro above the `let` would
+        // bind the opcode module instead.
+        macro_rules! follow_chunk {
+            ($next:expr) => {{
+                let next = $next;
+                units = code_units(&next);
+                chunk = next;
+            }};
+        }
 
         'interpret: loop {
             // **The offset, not the line.** `line_at` is a lookup into a table
@@ -1801,7 +1847,17 @@ impl Vm {
             // length in the next two, and a `u8` operand in its high byte --
             // so an instruction like `LoadLocal` is fetched and decoded
             // without touching memory again.
-            let unit = chunk.code[at];
+            // **Unchecked, because the check cannot fail and costs a load
+            // and a branch on every instruction.** `ip` only moves by the
+            // units an instruction occupies, every chunk ends in an
+            // instruction that leaves the loop, and every jump offset is
+            // emitted and patched by `bytecode.rs` against this same chunk.
+            // Bytecode that did not come from the compiler is walked whole by
+            // `wrenc::table_operands` before it can run, which rejects an
+            // unknown opcode and a stream that does not decode.
+            //
+            // SAFETY: `at` is therefore always inside `units`.
+            let unit = unsafe { *units.get_unchecked(at) };
             let byte = Chunk::opcode_of(unit);
             ip += 1;
             #[cfg(feature = "profile")]
@@ -1824,7 +1880,7 @@ impl Vm {
 
             match byte {
                 code::CONSTANT => {
-                    let index = chunk.code[ip] as usize;
+                    let index = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     self.stack.push(chunk.constants[index]);
                 }
@@ -1845,7 +1901,7 @@ impl Vm {
                     // spans a one-unit `LoadLocal` and a two-unit `Constant`,
                     // and nothing moved when they fused -- so the constant is
                     // where the `Constant` put it, past its own dead opcode.
-                    let index = chunk.code[ip + 1] as usize;
+                    let index = unsafe { *units.get_unchecked(ip + 1) } as usize;
                     ip += 2;
                     self.stack.push(self.stack[base + slot]);
                     self.stack.push(chunk.constants[index]);
@@ -1854,7 +1910,7 @@ impl Vm {
                     let first = Chunk::inline_operand(unit) as usize;
                     // The second slot rides inline in what was the second
                     // `LoadLocal`'s own unit.
-                    let second = Chunk::inline_operand(chunk.code[ip]) as usize;
+                    let second = Chunk::inline_operand(unsafe { *units.get_unchecked(ip) }) as usize;
                     ip += 1;
                     self.stack.push(self.stack[base + first]);
                     self.stack.push(self.stack[base + second]);
@@ -1874,12 +1930,12 @@ impl Vm {
                     self.stack[base + slot] = *self.stack.last().unwrap();
                 }
                 code::LOAD_MODULE_VAR => {
-                    let index = chunk.code[ip] as usize;
+                    let index = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     self.stack.push(self.modules[module].values[index]);
                 }
                 code::STORE_MODULE_VAR => {
-                    let index = chunk.code[ip] as usize;
+                    let index = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     self.modules[module].values[index] = *self.stack.last().unwrap();
                 }
@@ -1904,7 +1960,7 @@ impl Vm {
                     // The upvalue count rides inline; the function's constant
                     // index is the unit after, and the descriptors follow it.
                     let count = Chunk::inline_operand(unit) as usize;
-                    let index = chunk.code[ip] as usize;
+                    let index = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     let function = chunk.constants[index]
                         .as_object()
@@ -1914,7 +1970,7 @@ impl Vm {
                     for _ in 0..count {
                         // One unit per upvalue: whether it is a local in the
                         // low byte, which one in the high byte.
-                        let descriptor = chunk.code[ip];
+                        let descriptor = unsafe { *units.get_unchecked(ip) };
                         let is_local = descriptor & 0xff != 0;
                         let index = Chunk::inline_operand(descriptor) as usize;
                         ip += 1;
@@ -1939,7 +1995,7 @@ impl Vm {
                     self.stack.push(class);
                 }
                 code::METHOD_INSTANCE | code::METHOD_STATIC => {
-                    let symbol = chunk.code[ip] as usize;
+                    let symbol = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     let class = self.stack.pop().unwrap_or(Value::NULL);
                     let body = self.stack.pop().unwrap_or(Value::NULL);
@@ -1982,7 +2038,7 @@ impl Vm {
                 code::CALL | code::SUPER => 'call: {
                     // The arity rides inline; the symbol is the unit after.
                     let arity = Chunk::inline_operand(unit) as usize;
-                    let symbol = chunk.code[ip] as usize;
+                    let symbol = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
 
                     // **The arithmetic fast path.**
@@ -2067,7 +2123,7 @@ impl Vm {
                         let error = self.no_such_method(receiver_at, symbol, chunk.line_at(at));
                         match self.deliver_error(error, ip, chunk.clone())? {
                             Some((next_chunk, next_ip, next_base)) => {
-                                chunk = next_chunk;
+                                follow_chunk!(next_chunk);
                                 ip = next_ip;
                                 base = next_base;
                                 module = self.current_module();
@@ -2090,7 +2146,7 @@ impl Vm {
                                 Ok(value) => value,
                                 Err(error) => match self.deliver_error(error, ip, chunk.clone())? {
                                     Some((next_chunk, next_ip, next_base)) => {
-                                        chunk = next_chunk;
+                                        follow_chunk!(next_chunk);
                                         ip = next_ip;
                                         base = next_base;
                                         module = self.current_module();
@@ -2123,7 +2179,7 @@ impl Vm {
                                     };
                                     match self.deliver_error(error, 0, chunk.clone())? {
                                         Some((next_chunk, next_ip, next_base)) => {
-                                            chunk = next_chunk;
+                                            follow_chunk!(next_chunk);
                                             ip = next_ip;
                                             base = next_base;
                                             module = self.current_module();
@@ -2135,7 +2191,7 @@ impl Vm {
                                 // Taking the chunk back is the move that pairs with the one
                                 // the call made, and it empties the field so the frame counts
                                 // as running again.
-                                chunk = self.resume_chunk()?;
+                                follow_chunk!(self.resume_chunk()?);
                                 let frame = self.frames.last().expect("a frame to resume");
                                 ip = frame.ip;
                                 base = frame.base;
@@ -2165,7 +2221,14 @@ impl Vm {
                             // hands and none is cloned or dropped: the caller
                             // stops running exactly here, which is already
                             // where its `ip` is written back.
-                            let caller_chunk = ::core::mem::replace(&mut chunk, target.chunk);
+                            let caller_chunk = {
+                                // Same order as `follow_chunk!`. `replace`
+                                // hands the old chunk back rather than
+                                // dropping it, so nothing is released here.
+                                let next = target.chunk;
+                                units = code_units(&next);
+                                ::core::mem::replace(&mut chunk, next)
+                            };
                             if let Some(frame) = self.frames.last_mut() {
                                 frame.ip = ip;
                                 frame.chunk = Some(caller_chunk);
@@ -2196,7 +2259,7 @@ impl Vm {
                 }
                 code::SET_ATTRIBUTES => self.set_attributes(),
                 code::IMPORT_MODULE => {
-                    let index = chunk.code[ip] as usize;
+                    let index = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     let name = self.to_string(chunk.constants[index]);
                     // Resolved against the module doing the importing.
@@ -2230,14 +2293,14 @@ impl Vm {
                                 frame.ip = ip;
                                 frame.chunk = Some(chunk);
                             }
-                            chunk = self.push_frame(closure, base)?;
+                            follow_chunk!(self.push_frame(closure, base)?);
                             ip = 0;
                             module = self.module_of(closure);
                             continue;
                         }
                         Err(error) => match self.deliver_error(error, ip, chunk.clone())? {
                             Some((next_chunk, next_ip, next_base)) => {
-                                chunk = next_chunk;
+                                follow_chunk!(next_chunk);
                                 ip = next_ip;
                                 base = next_base;
                                 module = self.current_module();
@@ -2248,8 +2311,8 @@ impl Vm {
                     }
                 }
                 code::IMPORT_VARIABLE => {
-                    let module_name = chunk.code[ip] as usize;
-                    let variable_name = chunk.code[ip + 1] as usize;
+                    let module_name = unsafe { *units.get_unchecked(ip) } as usize;
+                    let variable_name = unsafe { *units.get_unchecked(ip + 1) } as usize;
                     ip += 2;
 
                     let module_name = self.to_string(chunk.constants[module_name]);
@@ -2320,7 +2383,7 @@ impl Vm {
                             // Taking the chunk back is the move that pairs with the one
                             // the call made, and it empties the field so the frame counts
                             // as running again.
-                            chunk = self.resume_chunk()?;
+                            follow_chunk!(self.resume_chunk()?);
                             let frame = self.frames.last().expect("a frame to resume");
                             ip = frame.ip;
                             base = frame.base;
@@ -2344,26 +2407,26 @@ impl Vm {
                     // Taking the chunk back is the move that pairs with the one
                     // the call made, and it empties the field so the frame counts
                     // as running again.
-                    chunk = self.resume_chunk()?;
+                    follow_chunk!(self.resume_chunk()?);
                     let frame = self.frames.last().expect("a frame to return to");
                     ip = frame.ip;
                     base = frame.base;
                     module = frame.module;
                 }
                 code::JUMP => {
-                    let offset = chunk.code[ip] as usize;
+                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
                     // One unit for the operand, then the distance -- which is
                     // in units too, and so reaches four times as far as the
                     // byte offset it replaces.
                     ip += 1 + offset;
                 }
                 code::LOOP => {
-                    let offset = chunk.code[ip] as usize;
+                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     ip -= offset;
                 }
                 code::JUMP_IF => {
-                    let offset = chunk.code[ip] as usize;
+                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     let condition = self.stack.pop().unwrap_or(Value::NULL);
                     if condition.is_falsy() {
@@ -2371,7 +2434,7 @@ impl Vm {
                     }
                 }
                 code::AND => {
-                    let offset = chunk.code[ip] as usize;
+                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
                         ip += offset;
@@ -2380,7 +2443,7 @@ impl Vm {
                     }
                 }
                 code::OR => {
-                    let offset = chunk.code[ip] as usize;
+                    let offset = unsafe { *units.get_unchecked(ip) } as usize;
                     ip += 1;
                     if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
                         self.stack.pop();

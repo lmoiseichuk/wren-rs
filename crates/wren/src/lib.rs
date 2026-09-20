@@ -38,10 +38,15 @@
 //!
 //! Three things follow:
 //!
-//! * **No `unsafe`.** A pointer-based object graph with a tracing collector
-//!   needs it throughout; an index does not. A handle to a collected object is
-//!   a failed lookup, never a read of freed memory — so this crate can and does
-//!   `#![forbid(unsafe_code)]`.
+//! * **Almost no `unsafe`.** A pointer-based object graph with a tracing
+//!   collector needs it throughout; an index does not. A handle to a collected
+//!   object is a failed lookup, never a read of freed memory — so the object
+//!   model, the collector and the compiler contain none at all.
+//!
+//!   The exception is the interpreter's instruction fetch, and it is written
+//!   down where it lives. `#![deny(unsafe_code)]` rather than `forbid`, so
+//!   every site has to name itself with an `#[allow]` and carry a `SAFETY`
+//!   argument; `grep -rn "unsafe" crates/wren/src` is the audit.
 //! * **The sweep scans words rather than chasing pointers**, which matters more
 //!   than it sounds on a part with no cache worth the name.
 //! * **The collector is replaceable.** Reclamation policy is confined to
@@ -65,7 +70,7 @@
 //! being measured against upstream Wren and MicroPython on the same board.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 // Kilobytes, not megabytes: anything unused is flash somebody is paying for.
 #![deny(dead_code)]
 
