@@ -1486,8 +1486,11 @@ impl Heap {
     /// might: blocks that were made and dropped are gone, and the difference
     /// between the slots a table addresses and the blocks it still holds is
     /// the memory a flat `Vec` would still be sitting on.
-    #[cfg(feature = "profile")]
-    pub fn block_census(&self) -> (usize, usize, usize) {
+    ///
+    /// `None` when the tables are not blocked, because then there is nothing
+    /// to census: a flat table is one run of slots that only ever grows.
+    #[cfg(all(feature = "profile", feature = "blocked-slots"))]
+    pub fn block_census(&self) -> Option<(usize, usize, usize)> {
         let mut held = 0;
         let mut addressed = 0;
         let mut given_back = 0;
@@ -1515,7 +1518,13 @@ impl Heap {
         walk!(&self.ranges, core::mem::size_of::<Option<ObjRange>>());
         walk!(&self.strings, core::mem::size_of::<Option<ObjString>>());
         walk!(&self.upvalues, core::mem::size_of::<Option<ObjUpvalue>>());
-        (addressed, held, given_back)
+        Some((addressed, held, given_back))
+    }
+
+    /// There are no blocks to report on when the tables are flat.
+    #[cfg(all(feature = "profile", not(feature = "blocked-slots")))]
+    pub fn block_census(&self) -> Option<(usize, usize, usize)> {
+        None
     }
 
     #[cfg(feature = "profile")]

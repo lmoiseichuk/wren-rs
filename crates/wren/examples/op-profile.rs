@@ -119,11 +119,13 @@ fn main() {
             );
         }
 
-        let (addressed, held, given_back) = vm.heap.block_census();
         println!();
-        println!(
-            "slot blocks: {held} held of {addressed} addressed, {given_back} B given back"
-        );
+        match vm.heap.block_census() {
+            Some((addressed, held, given_back)) => println!(
+                "slot blocks: {held} held of {addressed} addressed, {given_back} B given back"
+            ),
+            None => println!("slot blocks: flat tables, nothing to give back"),
+        }
 
         let census = vm.heap.slot_census();
         let held: usize = census.iter().map(|(_, slots, _, size)| slots * size).sum();
