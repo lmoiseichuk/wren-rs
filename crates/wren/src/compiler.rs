@@ -1890,6 +1890,7 @@ impl<'a> Compiler<'a> {
         let mut chunk = state.chunk;
         chunk.finish();
         let function = self.vm.heap.allocate(Object::Fn(Box::new(ObjFn {
+            max_slots: chunk.max_slots(),
             chunk: Rc::new(chunk),
             arity: state.arity,
             num_upvalues: upvalues.len(),

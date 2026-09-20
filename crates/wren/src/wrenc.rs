@@ -658,8 +658,11 @@ fn read_function(
 
     remap(&mut code, symbols, variables)?;
 
+    let chunk = Chunk::from_parts(code, constants, lines);
+    let max_slots = chunk.max_slots();
     let function = vm.heap.allocate(Object::Fn(Box::new(ObjFn {
-        chunk: Rc::new(Chunk::from_parts(code, constants, lines)),
+        chunk: Rc::new(chunk),
+        max_slots,
         arity,
         num_upvalues: upvalues,
         name,

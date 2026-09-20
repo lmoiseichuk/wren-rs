@@ -3234,6 +3234,7 @@ pub fn install_meta(vm: &mut Vm) -> usize {
         };
 
         let function = vm.heap.allocate(Object::Fn(Box::new(crate::object::ObjFn {
+            max_slots: chunk.max_slots(),
             chunk: alloc::rc::Rc::new(chunk),
             arity: 0,
             num_upvalues: 0,

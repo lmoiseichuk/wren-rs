@@ -149,6 +149,13 @@ profile = ["std", "census"]
 # breakdown on the part where the number actually matters. `profile` turns it
 # on because every one of its reports wants it too.
 census = []
+# **Checks the computed stack bound against the running VM.** `Chunk::max_stack`
+# works out the most a function can push; a frame is then given that much room
+# once instead of every push testing for it -- so an under-estimate would be a
+# write past the end. Building the conformance suite with this on is how the
+# analysis is shown to be an upper bound over 829 programs rather than argued
+# to be one. Never shipped.
+verify-slots = []
 # **Reference counting in front of the tracing collector. Off, and measured.**
 #
 # Every heap-to-heap reference is counted and an object whose count reaches

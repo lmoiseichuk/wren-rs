@@ -156,6 +156,16 @@ pub struct Frame {
     pub chunk: Option<Rc<Chunk>>,
     /// The module this frame's code resolves its variables against.
     pub module: usize,
+    /// How deep the stack was when this frame started running.
+    ///
+    /// **Only for `verify-slots`.** The bound `Chunk::max_stack` computes is
+    /// relative to a frame's own starting depth, which is what
+    /// `Vec::reserve` is relative to as well -- and which is *not* always
+    /// `base + 1 + arity`: calling a block with the wrong number of arguments
+    /// enters the frame with more or fewer values than its arity, and the
+    /// conformance suite does exactly that nine times.
+    #[cfg(feature = "verify-slots")]
+    pub entry_len: usize,
     /// Where this method's own fields start in its receiver.
     ///
     /// **Read on every field access**, which is why it is here rather than
@@ -1070,6 +1080,7 @@ impl Vm {
                 })?;
 
             let function = self.heap.allocate(Object::Fn(Box::new(ObjFn {
+                max_slots: chunk.max_slots(),
                 chunk: Rc::new(chunk),
                 arity: 0,
                 num_upvalues: 0,
@@ -1543,7 +1554,11 @@ impl Vm {
             return Err(RuntimeError::new("Stack overflow."));
         }
         let target = self.call_target(closure)?;
+        #[cfg(feature = "verify-slots")]
+        let entry_len = self.stack.len();
         self.frames.push(Frame {
+            #[cfg(feature = "verify-slots")]
+            entry_len,
             closure,
             ip: 0,
             base,
@@ -1966,7 +1981,11 @@ impl Vm {
                 stack.push(value);
             }
             let target = self.call_target(entry)?;
+            #[cfg(feature = "verify-slots")]
+            let entry_len = stack.len();
             frames.push(Frame {
+                #[cfg(feature = "verify-slots")]
+                entry_len,
                 closure: entry,
                 ip: 0,
                 base: 0,
@@ -2143,6 +2162,7 @@ impl Vm {
         // both and `return` at the top level means the same thing it does
         // anywhere else.
         let function = self.heap.allocate(Object::Fn(Box::new(ObjFn {
+            max_slots: chunk.max_slots(),
             chunk: chunk.clone(),
             arity: 0,
             num_upvalues: 0,
@@ -2304,6 +2324,32 @@ impl Vm {
                 self.previous_op = byte as u16;
                 self.previous_chunk = here;
                 self.previous_depth = depth;
+            }
+
+            // **The bound, checked against what actually happens.** See the
+            // `verify-slots` feature: this is what makes `Chunk::max_stack`
+            // something measured rather than reasoned about.
+            #[cfg(feature = "verify-slots")]
+            {
+                if let Some(frame) = self.frames.last() {
+                    let entry_len = frame.entry_len;
+                    if let Some(function) = self.function_of(frame.closure) {
+                        // A function the analysis could not bound would
+                        // simply keep the old behaviour; across the 829
+                        // conformance programs there are none.
+                        if let Some(room) = function.max_slots {
+                            // **Relative to where the frame started**, which
+                            // is what `Vec::reserve` is relative to as well.
+                            if self.stack.len() > entry_len + room {
+                                std::eprintln!(
+                                    "SLOTS-OVER fn '{}' grew {} past a bound of {room}",
+                                    function.name,
+                                    self.stack.len() - entry_len,
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             match byte {
@@ -2744,7 +2790,11 @@ impl Vm {
                                 frame.ip = caller_ip;
                                 frame.chunk = Some(caller_chunk);
                             }
+                            #[cfg(feature = "verify-slots")]
+                            let entry_len = self.stack.len();
                             self.frames.push(Frame {
+                                #[cfg(feature = "verify-slots")]
+                                entry_len,
                                 closure,
                                 ip: 0,
                                 base: receiver_at,

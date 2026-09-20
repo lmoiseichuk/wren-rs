@@ -712,6 +712,152 @@ impl Chunk {
         })
     }
 
+    /// How many values this instruction takes off the stack and puts back.
+    ///
+    /// Read off the interpreter's arms in `vm.rs`; the length of an
+    /// instruction is **not** here, because `instruction_units` is the one
+    /// place that knows it and a second table is what the note there is
+    /// about.
+    fn stack_effect(op: Op, unit: u16) -> (i32, i32) {
+        match op {
+            // Pushes one, takes nothing.
+            Op::Constant
+            | Op::Null
+            | Op::False
+            | Op::True
+            | Op::LoadLocal
+            | Op::LoadModuleVar
+            | Op::LoadUpvalue
+            | Op::LoadFieldThis
+            | Op::LoadStaticField
+            | Op::Closure
+            | Op::ImportModule
+            | Op::ImportVariable => (0, 1),
+            // Writes through what is already on top, leaving it there.
+            Op::StoreLocal
+            | Op::StoreModuleVar
+            | Op::StoreUpvalue
+            | Op::StoreFieldThis
+            | Op::StoreStaticField => (0, 0),
+            // The fused loads, which is why an instruction can push two.
+            Op::LoadLocalConstant | Op::LoadLocalPair => (0, 2),
+            Op::Pop | Op::CloseUpvalue | Op::StoreFieldThisPop => (1, 0),
+            // Takes the receiver and its arguments, leaves the result.
+            Op::Call | Op::Super => (Chunk::inline_operand(unit) as i32 + 1, 1),
+            Op::LoadField => (1, 1),
+            Op::StoreField => (2, 1),
+            Op::Class => (2, 1),
+            Op::MethodInstance | Op::MethodStatic | Op::SetAttributes => (2, 0),
+            // Replaces the receiver slot in place.
+            Op::Construct => (0, 0),
+            // The condition is consumed on both paths.
+            Op::JumpIf => (1, 0),
+            // **Only on the path that falls through.** A short-circuit keeps
+            // its left operand when it jumps, which is why the successors
+            // below give these two different depths.
+            Op::And | Op::Or => (1, 0),
+            Op::Jump | Op::Loop => (0, 0),
+            // These leave the frame; they have no successor here.
+            Op::Return | Op::End | Op::LoadLocalReturn | Op::LoadFieldThisReturn => (0, 0),
+        }
+    }
+
+    /// The deepest this code can drive the stack above its frame base.
+    ///
+    /// **So that a frame can be given its room once instead of testing for it
+    /// on every push.** A `Vec::push` tests the capacity, and the interpreter
+    /// pushes some fifteen million times across the benchmarks; knowing the
+    /// most a function can ever need lets the test happen once per call.
+    ///
+    /// # Why this is a worklist and not a walk
+    ///
+    /// The obvious implementation walks the instructions in order, adding and
+    /// subtracting. That is wrong, and quietly: the instruction after a
+    /// `Return` is reachable only by a jump, so its depth is whatever the
+    /// *jumping* instruction had, not what the linear order suggests --
+    /// `if (x) return a` puts exactly that shape in every program. So this
+    /// propagates a depth to each instruction's real successors and stops when
+    /// nothing changes.
+    ///
+    /// Two paths reaching one instruction must agree on the depth, which is a
+    /// property of code a compiler generates rather than of bytecode in
+    /// general. **Disagreement returns `None` rather than a number**, as does
+    /// an unknown opcode, a truncated instruction or a depth that goes
+    /// negative: the caller is reserving memory it will then write into
+    /// without checking, so "I could not work it out" has to be sayable.
+    pub fn max_stack(code: &[u16]) -> Option<usize> {
+        // The depth on entry to each instruction, once something has reached
+        // it. Sized for one past the end, because a jump may target it.
+        let mut entry: Vec<Option<i32>> = alloc::vec![None; code.len() + 1];
+        let mut pending: Vec<usize> = alloc::vec![0];
+        entry[0] = Some(0);
+        let mut deepest: i32 = 0;
+
+        while let Some(at) = pending.pop() {
+            if at >= code.len() {
+                continue;
+            }
+            let depth = entry[at]?;
+            let unit = code[at];
+            let op = Op::from_byte(Chunk::opcode_of(unit))?;
+            let len = Chunk::instruction_units(code, at)?;
+            let after_at = at + len;
+
+            let (pops, pushes) = Chunk::stack_effect(op, unit);
+            let settled = depth - pops + pushes;
+            if settled < 0 {
+                return None;
+            }
+            // The peak can be either side of an instruction: a `Call` is
+            // deepest before it takes its arguments, a load after it pushes.
+            deepest = deepest.max(depth).max(settled);
+
+            // Where this instruction can go next, and with what depth.
+            let jump = match op {
+                Op::Jump | Op::JumpIf | Op::And | Op::Or => {
+                    Some((after_at + *code.get(at + 1)? as usize, settled))
+                }
+                Op::Loop => Some((after_at.checked_sub(*code.get(at + 1)? as usize)?, settled)),
+                _ => None,
+            };
+            // **A short-circuit keeps its left operand when it jumps.** So the
+            // branch target sees one more than the fall-through does.
+            let jump = match op {
+                Op::And | Op::Or => jump.map(|(target, depth)| (target, depth + 1)),
+                _ => jump,
+            };
+            let fall = match op {
+                // Left the frame, or jumped unconditionally.
+                Op::Return
+                | Op::End
+                | Op::LoadLocalReturn
+                | Op::LoadFieldThisReturn
+                | Op::Jump
+                | Op::Loop => None,
+                _ => Some((after_at, settled)),
+            };
+
+            for (target, depth) in [jump, fall].into_iter().flatten() {
+                match entry.get(target) {
+                    // Already reached, and the two paths must agree.
+                    Some(Some(known)) if *known == depth => {}
+                    Some(Some(_)) => return None,
+                    Some(None) => {
+                        entry[target] = Some(depth);
+                        pending.push(target);
+                    }
+                    None => return None,
+                }
+            }
+        }
+        Some(deepest as usize)
+    }
+
+    /// This chunk's own [`Chunk::max_stack`].
+    pub fn max_slots(&self) -> Option<usize> {
+        Chunk::max_stack(&self.code)
+    }
+
     /// Every offset in `code` that some jump can land on.
     ///
     /// **The one thing fusing has to respect.** Rewriting a pair in place
