@@ -193,6 +193,18 @@ pub enum Op {
 pub mod code {
     use super::Op;
 
+    /// The largest value any opcode has.
+    ///
+    /// **The interpreter's dispatch relies on this.** `Chunk::opcode_of`
+    /// masks to six bits, so a fetched opcode is 0..=63; everything above
+    /// `HIGHEST` is a value no `Op` has, and the interpreter is entitled to
+    /// treat those as impossible because nothing can produce one -- the
+    /// compiler writes `Op as u16`, and `wrenc::table_operands` walks a
+    /// loaded file whole and rejects an unknown opcode before it can run.
+    /// `the_bound_on_opcodes_is_tight` keeps this honest when an `Op` is
+    /// added.
+    pub const HIGHEST: u8 = Op::Closure as u8;
+
     pub const CONSTANT: u8 = Op::Constant as u8;
     pub const NULL: u8 = Op::Null as u8;
     pub const FALSE: u8 = Op::False as u8;
@@ -297,6 +309,30 @@ mod opcode_bytes {
                 assert_eq!(byte_of(op), byte, "{op:?} decodes from a byte it is not");
             }
         }
+    }
+
+    /// `code::HIGHEST` is the largest opcode, and it is the largest one.
+    ///
+    /// **The interpreter tells the optimiser that anything above it cannot
+    /// occur**, which is only true while this passes. Both halves matter: too
+    /// low and a real opcode becomes unreachable, which is undefined
+    /// behaviour rather than a wrong answer; too high and the dispatch table
+    /// carries dead entries for nothing.
+    #[test]
+    fn the_bound_on_opcodes_is_tight() {
+        let highest = (0..=u8::MAX)
+            .filter(|byte| Op::from_byte(*byte).is_some())
+            .max()
+            .expect("there is at least one opcode");
+        assert_eq!(
+            highest,
+            code::HIGHEST,
+            "code::HIGHEST must be the largest opcode -- an Op was added or removed"
+        );
+        assert!(
+            Op::from_byte(code::HIGHEST).is_some(),
+            "code::HIGHEST must itself be an opcode"
+        );
     }
 }
 

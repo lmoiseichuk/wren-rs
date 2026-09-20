@@ -1859,6 +1859,20 @@ impl Vm {
             // SAFETY: `at` is therefore always inside `units`.
             let unit = unsafe { *units.get_unchecked(at) };
             let byte = Chunk::opcode_of(unit);
+            // **No opcode is above `HIGHEST`, and saying so removes a branch
+            // from every instruction.** `opcode_of` masks to six bits, so the
+            // match below would otherwise need a range check to reach a
+            // default arm that nothing can reach: the compiler writes
+            // `Op as u16`, and a loaded file is walked whole by
+            // `wrenc::table_operands`, which rejects an unknown opcode before
+            // any of it runs.
+            //
+            // SAFETY: `byte <= code::HIGHEST` for every chunk that can exist.
+            // `the_bound_on_opcodes_is_tight` in `bytecode.rs` fails if an
+            // added `Op` ever makes that false.
+            if byte > code::HIGHEST {
+                unsafe { ::core::hint::unreachable_unchecked() };
+            }
             ip += 1;
             #[cfg(feature = "profile")]
             {
