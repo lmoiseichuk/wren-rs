@@ -16,7 +16,9 @@ step, no submodule, no `build.rs` compiling somebody else's tree — a `no_std`
 crate that a firmware pulls in the way it pulls in any other.
 
 It is complete: **829 of 829** of upstream's own tests pass, from source and
-through a bytecode round-trip, with no `unsafe` anywhere in the crate.
+through a bytecode round-trip. The object model, the collector and the
+compiler contain no `unsafe`; the interpreter's instruction fetch does, and
+says why at each site.
 
 ## Where it fits
 
@@ -35,14 +37,57 @@ room to spare and does not fit a CH32V006 at all.
 ### µwren
 
 The gap on the small parts is not another feature flag. Dropping the compiler,
-the transcendentals and 64-bit numbers is already possible and already counted
-in that 22,920 B — what is left is **the core library itself**: the classes,
-their method tables and the primitives behind them are most of the figure.
+the transcendentals and 64-bit numbers is already possible — what is left is
+**the core library itself**, and it is now measured rather than asserted.
 
-A part with 8 KB wants a deliberately reduced language — a subset of the core
-library, built with the linker discarding everything unreachable — and that is
-a separate deliverable from this one. It is named here rather than measured,
-because nothing has been measured about it yet.
+**The crate is 111,640 B of flash** in a bytecode-only `-Os` build, the ESP
+HAL excluded because a CH32 would not link it. Where that goes:
+
+| | bytes | |
+|---|---|---|
+| the machine — interpreter 23,962, heap and collector 8,564, handles 3,470, loader 3,398, value/object/bytecode/symbol 2,622 | **42,016** | 38% |
+| `Num` | 15,008 | 13% |
+| `core::install` — the signature strings and the binding calls | 9,306 | 8% |
+| `String` | 8,638 | 8% |
+| `List` 6,016, `Map` 3,372, `Sequence` 3,008 | 12,396 | 11% |
+| core helpers — indexing, bitwise, the hash probe | 2,912 | 3% |
+| `random` 2,460, `meta` 746 | 3,206 | 3% |
+| Rust monomorphisations — `BTreeMap<String, usize>` 1,320, two sorts 1,412, `str` pattern search 368 | 3,100 | 3% |
+| `Range` 1,320, `Fiber` 1,018, `System` 858, `Object`/`Class` 752, `Bool`/`Null` 398, `Fn` 308 | 4,654 | 4% |
+
+**The core library is 55 KB of the 111 KB — about half**, which is what the
+paragraph above used to claim without a number behind it. The machine is the
+other 42 KB, and a 62 KB part needs both to come down.
+
+What the table says to remove, largest first:
+
+- **`Num`, 15,008 B, and almost none of it is arithmetic.** The operators are
+  a few hundred bytes; the bulk is `toString` — float-to-decimal formatting
+  pulls in a large chunk of Rust's formatting machinery — plus parsing and the
+  numeric conversions. An integer-only `toString` is the single biggest cut
+  available anywhere in the crate.
+- **`core::install`, 9,306 B**, is the signature strings and one `define` call
+  per method. It shrinks in direct proportion to how many methods survive, so
+  every class dropped below is paid twice.
+- **`String`, 8,638 B** — interpolation, `split`, `indexOf`, the UTF-8 rules,
+  and Rust's substring search with it. A node that formats one number wants a
+  fraction of this.
+- **`Map`, `Sequence` and `List` together, 12,396 B.** A program that reports a
+  reading needs a list at most; the lazy `map`/`where`/`take`/`skip` protocol
+  and a hash table are what a workstation language is for.
+- **The `.wrenc` loader, 3,398 B**, is only needed to *parse* bytecode. A part
+  that links one program at a fixed layout does not parse anything.
+- **`random` and `meta`, 3,206 B**, are optional modules already built lazily.
+- **The symbol table's `BTreeMap<String, usize>`, 1,320 B plus its sorts.**
+  Method signatures are fixed once the core is installed, so a sorted `Vec` or
+  a table computed at build time would remove the map and the string
+  comparisons behind it.
+- **`Fiber`, 1,018 B** plus the switch and park machinery inside the
+  interpreter's 23,962 B.
+
+That is a route to roughly 55 KB, which fits a CH32V006's flash and leaves
+little for the program — so µwren is a smaller *language*, not a smaller
+build of this one, and it stays a separate deliverable.
 
 What *does* transfer to a small part today, because it was built for one:
 
@@ -74,7 +119,8 @@ identical constants on every implementation. Method and caveats:
 
 **Four to seven times slower than C, and 72% smaller resident.** The speed is
 the honest cost of reaching objects by a bounds-checked index rather than a
-pointer, which is what lets the crate forbid `unsafe`; the memory is what
+pointer, which is what keeps `unsafe` out of the object model; the memory is
+what
 compiling no core library at start-up buys.
 
 **Judged by work, not only by time.** The chip's performance counter reports
@@ -275,7 +321,7 @@ Everything the language has: classes with constructors, fields, inheritance,
 `super`, static members and static fields; closures with upvalues; fibers as
 real coroutines, and the error handling built on them; modules and `import`;
 maps as a hash table; `Sequence` with lazy `map`/`where`/`take`/`skip`; class
-attributes; string interpolation and Wren's UTF-8 rules. No `unsafe`.
+attributes; string interpolation and Wren's UTF-8 rules.
 
 **One difference that matters for benchmarking, stated before any numbers.**
 Upstream writes a good deal of its core library *in Wren* — `Sequence` and its

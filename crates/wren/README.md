@@ -4,7 +4,8 @@
 
 Wren is a small class-based scripting language with a bytecode VM, closures,
 fibers and a garbage collector. This crate re-implements it to run on parts with
-kilobytes rather than megabytes — `no_std`, no dependencies, no `unsafe`.
+kilobytes rather than megabytes — `no_std`, no dependencies, and `unsafe`
+confined to the instruction fetch.
 
 ```toml
 [dependencies]
@@ -29,7 +30,10 @@ number. The constants are upstream's, so the two can be read side by side.
 
 The usual objection is that NaN tagging needs `unsafe` pointer punning. It does
 not here: `f64::to_bits` is safe, and the payload is a 32-bit table index rather
-than a pointer. **The crate is `#![forbid(unsafe_code)]`.**
+than a pointer. **Nothing in the value representation or the object model needs
+`unsafe`** — the crate is `#![deny(unsafe_code)]`, and the only place that lifts
+it is the interpreter's fetch, where reading the next instruction without
+re-deriving its bounds was worth 2.8% of `method_call`.
 
 The alternative — a tagged enum — is 16 bytes, and doubling every stack slot,
 list element and instance field is not affordable on these parts.
@@ -55,10 +59,12 @@ Here a `Value` holds an `ObjectId(u32)` indexing one table the heap owns, and
 Three things fall out of it, and they are why the representation is worth the
 departure:
 
-* **No `unsafe`.** A pointer-based object graph with a tracing collector needs
-  `unsafe` throughout, or `Rc`/`RefCell` overhead on every object. An index
-  sidesteps the question — and a handle to a collected object is a failed
-  lookup returning `None`, never a read of freed memory.
+* **No `unsafe` in the object graph.** A pointer-based one with a tracing
+  collector needs it throughout, or `Rc`/`RefCell` overhead on every object. An
+  index sidesteps the question — and a handle to a collected object is a failed
+  lookup returning `None`, never a read of freed memory. The exception is the
+  instruction fetch, which is `unsafe` and documented as such; `grep -rn unsafe
+  crates/wren/src` is the audit.
 * **A sweep that scans words, not pointers.** Marks in a side bitmap mean the
   collector walks 64 bits of mark at a time instead of chasing a linked list
   through objects scattered across the heap. On a part with no cache worth the

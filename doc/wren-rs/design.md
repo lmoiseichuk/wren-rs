@@ -77,8 +77,10 @@ the same conclusion for the same reason.
 
 The usual objection to NaN tagging is that it needs `unsafe` pointer punning.
 It does not here, for two reasons: `f64::to_bits` and `f64::from_bits` are safe,
-and — see below — the payload is a 32-bit index rather than a pointer. The crate
-keeps `#![forbid(unsafe_code)]`.
+and — see below — the payload is a 32-bit index rather than a pointer. So the
+value representation needs no `unsafe`, and neither does the object model built
+on it. The crate is `#![deny(unsafe_code)]` rather than `forbid`, because the
+interpreter's fetch lifts it; nothing here does.
 
 **What this costs.** Wren has a single numeric type, so every number is an
 `f64`. On RV32IMAC with no FPU that is soft-float, and the C6 measurements show
