@@ -29,7 +29,7 @@ blocked-slots = ["wren/blocked-slots"]
 
 [dependencies]
 # This port compiles on the device, so it takes the compiler.
-wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "libm", "compiler"] }
+wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "libm", "compiler", "core_full"] }
 esp-hal = { version = "1.2", features = ["esp32c6", "unstable"] }
 esp-alloc = { version = "0.11", features = ["esp32c6"] }
 esp-println = { version = "0.16", features = ["esp32c6"] }
