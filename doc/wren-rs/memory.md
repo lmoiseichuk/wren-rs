@@ -350,9 +350,9 @@ All three are now settled by measurement rather than argument.
 
 #### Chunked slot tables — built, measured, behind a feature
 
-`--features blocked-slots`. A table's slots live in blocks of 32; a block goes
-back to the allocator when the last slot in it is freed, and blocks past the
-end of what the table addresses are dropped for good after a collection.
+`--features blocked-slots`. A table's slots live in blocks; a block goes back
+to the allocator when the last slot in it is freed, and blocks past the end of
+what the table addresses are dropped for good after a collection.
 
 **A flat table can only grow.** Freeing a slot returns it to a free list, not
 to the allocator, so a program that builds something large and drops it keeps
@@ -360,25 +360,96 @@ the high-water mark for the rest of its life. On a device that runs for months
 after booting, that is the difference that matters -- and the *peak* is
 unchanged either way, because at the peak every slot is in use.
 
-| | flat | blocked | |
+| | flat | blocked, 16 | |
 |---|---|---|---|
-| `binary_trees` peak | 115,024 B | **87,632 B** | **−23.8%** |
-| `fib` peak | 3,476 B | 4,244 B | +22.1% |
-| `method_call` peak | 7,484 B | 9,324 B | +24.6% |
-| `list_build` peak | 132,288 B | 134,208 B | +1.5% |
-| work, all four | — | — | **+6 to +9%** |
+| `binary_trees` peak | 115,016 B | **87,872 B** | **−23.6%** |
+| `fib` peak | 3,476 B | 4,116 B | +18.4% |
+| `method_call` peak | 7,484 B | 8,612 B | +15.1% |
+| `list_build` peak | 132,288 B | 133,248 B | +0.7% |
+| work, all four | — | — | **+7 to +14%** |
 
-**One benchmark a quarter better and three worse**, because a block is 32
-slots across ten tables and a small program never fills one; and every object
-access pays an indirection. So it is off by default and on for a program
-shaped like `binary_trees`: something large built and then let go, on a part
-where the peak is what runs out.
+**One benchmark a quarter better and three worse**, because a block is some
+number of slots across ten tables and a small program never fills one; and
+every object access pays an indirection. So it is off by default and on for a
+program shaped like `binary_trees`: something large built and then let go, on
+a part where the peak is what runs out.
+
+##### How big a block, measured
+
+`Heap::set_slot_block` takes the size at start-up, so this has an answer per
+program rather than per build. Peak heap at every size, on the ESP32-C6:
+
+| block | `binary_trees` | `fib` | `list_build` | `method_call` |
+|---|---|---|---|---|
+| flat | 115,016 B | **3,476 B** | **132,288 B** | **7,484 B** |
+| 4 | 96,592 B | 3,716 B | 132,656 B | 7,932 B |
+| 8 | 90,672 B | 3,956 B | 132,896 B | 8,172 B |
+| **16** | 87,872 B | 4,116 B | 133,248 B | 8,612 B |
+| 32 | **87,632 B** | 4,244 B | 134,208 B | 9,324 B |
+| 64 | 89,680 B | 5,012 B | 136,128 B | 11,244 B |
+| 128 | 92,880 B | 6,548 B | 139,968 B | 15,084 B |
+| 256 | 101,904 B | 9,620 B | 147,648 B | 22,764 B |
+| 512 | 114,100 B | 15,764 B | 163,000 B | 38,124 B |
+| 1024 | 150,916 B | 28,052 B | *out of memory* | — |
+
+**Only `binary_trees` has an interior optimum**, because it is the only one
+that frees in bulk and so the only one a larger block helps: a bigger block
+recovers more of the tree when it is dropped, until the rounding across ten
+tables costs more than it recovers. Its minimum is at 32, and 256 gives back
+14 KB *less* than 32 does. For the other three every doubling is a straight
+loss, and `list_build` is worse than flat at every size -- it builds one list
+and holds it to the end, so there is nothing to give back and the block tail
+is pure overhead.
+
+**16 is the default, and the hardcoded 32 it replaces was a better guess than
+it looked.** 32 was written before any of this was measured and is within 0.3%
+of the peak optimum. 16 wins the default because it is the same number for
+`binary_trees` -- 240 B worse on peak, but the *fastest* and the least work of
+any blocked size, 8.47 s and 521.8M instructions against 8.50 s and 523.6M --
+and strictly better than 32 on the other three benchmarks.
+
+**Block size was expected to trade only memory, and mostly it does.** `fib`
+retires 856.34M instructions at every size from 4 to 512: the indirection on
+each object access costs the same whatever the block is. But `binary_trees`
+moves, from 521.8M at 16 to 623.7M at 512, because it is the one that actually
+makes and drops blocks, and a 512-slot block is 12 KB to fill with `None` and
+hand back every time round.
+
+**And 1024 ended the program.** `list_build` panicked with *memory allocation
+of 131,072 bytes failed* -- its own element vector doubling to 128 KB, which
+fits at every smaller block size and does not once ten tables are rounding up
+to 1024 slots each.
+
+##### What the right size depends on, which is not only this VM
+
+**The allocator underneath decides as much as the workload does.** `esp-alloc`
+is a first-fit free list with no size classes, so a large block is one large
+request that either fits or ends the program -- which is exactly how 1024
+died. Under an allocator with size classes and arenas -- jemalloc, ptmalloc,
+tcmalloc -- a request that size is routine, and the same sweep would bottom
+out somewhere else. This table measures a block size *on this allocator, for
+objects of these sizes*, and neither half of that travels.
+
+So read the number as a range to start from, not as a constant:
+
+| part | sensible range |
+|---|---|
+| ESP32-class, hundreds of KB | 16–64 |
+| CH32-class, a few KB of RAM | 8–16 |
+| unknown allocator, be careful | 4–32 |
+
+**32, 64 and 128 are a `binary_trees` answer, not a general one.** All three
+sit near that benchmark's optimum, and all three are worse than 16 for every
+other program measured here -- `method_call` pays 8,612 B at 16 and 15,084 B
+at 128, for a program that holds a few dozen objects. A firmware that does not
+build and drop a large structure should take the small end of its range; one
+that does not do it at all should leave the feature off.
 
 *Two attempts were needed. The first dropped a freed block's indices from the
-free list, which abandoned the other 31 slots for ever -- the tables addressed
-34,272 slots where they had held 2,560, and nothing was given back at all. The
-free list has to keep them: an allocation landing on one makes the block
-again, and until one does the memory is back.*
+free list, which abandoned the other slots in it for ever -- the tables
+addressed 34,272 slots where they had held 2,560, and nothing was given back
+at all. The free list has to keep them: an allocation landing on one makes the
+block again, and until one does the memory is back.*
 
 #### A chunk as a hidden object — not built, and the measurement says why
 

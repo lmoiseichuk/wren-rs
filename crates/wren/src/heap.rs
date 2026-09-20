@@ -135,9 +135,16 @@ impl Collection {
 /// block wastes less on pointers and more on rounding -- a table holding four
 /// objects still pays for a whole one, and there are ten tables -- and a
 /// small block is the other way about and gives memory back in finer steps.
-/// The measurements are in `doc/wren-rs/memory.md`.
+///
+/// **Sixteen is where the sweep in `doc/wren-rs/memory.md` came out**, on an
+/// ESP32-C6 and on that part's allocator. It is 240 B off the best peak any
+/// size reached on `binary_trees`, the one benchmark that frees in bulk, and
+/// it is the fastest and the least work of any blocked size *and* better than
+/// every larger one on the three benchmarks that do not. The optimum moves
+/// with the allocator underneath and with how big the objects are, so a port
+/// that knows its own should say so rather than take this.
 #[cfg(feature = "blocked-slots")]
-pub const SLOT_BLOCK: usize = 32;
+pub const SLOT_BLOCK: usize = 16;
 
 /// The largest block a caller may ask for.
 ///
