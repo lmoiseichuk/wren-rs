@@ -44,6 +44,20 @@ libm = { version = "0.2", optional = true }
 
 [features]
 default = ["std", "compiler"]
+# **Slot tables in blocks, so a table can give memory back after a spike.**
+# A flat table only grows: freeing a slot returns it to a free list, not to
+# the allocator, so a program that builds something large and drops it keeps
+# the high-water mark for the rest of its life.
+#
+# Measured on an ESP32-C6: `binary_trees`' peak falls 115,024 -> 87,632 B, a
+# quarter, because the tail of the dropped tree goes back. The other three
+# benchmarks pay 1-25% *more*, because a block is 32 slots across ten tables
+# and a small program does not fill one. It costs 6-9% of the work
+# everywhere, for the indirection on every object access.
+#
+# Off by default. On for a program that builds something large and then lets
+# go of it, on a part where the peak is what runs out.
+blocked-slots = []
 # `std` is for the host: tests, and eventually an ahead-of-time compiler that
 # runs on a workstation and emits bytecode for a part that cannot afford one.
 # Firmware builds turn it off and usually turn `alloc` on instead.

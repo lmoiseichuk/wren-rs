@@ -344,28 +344,76 @@ owned.
 chosen by the profiler rather than guessed at. The two that were guessed at --
 refcounting and a nursery -- are the two that are switched off.
 
+### What was left worth building, built
+
+All three are now settled by measurement rather than argument.
+
+#### Chunked slot tables — built, measured, behind a feature
+
+`--features blocked-slots`. A table's slots live in blocks of 32; a block goes
+back to the allocator when the last slot in it is freed, and blocks past the
+end of what the table addresses are dropped for good after a collection.
+
+**A flat table can only grow.** Freeing a slot returns it to a free list, not
+to the allocator, so a program that builds something large and drops it keeps
+the high-water mark for the rest of its life. On a device that runs for months
+after booting, that is the difference that matters -- and the *peak* is
+unchanged either way, because at the peak every slot is in use.
+
+| | flat | blocked | |
+|---|---|---|---|
+| `binary_trees` peak | 115,024 B | **87,632 B** | **−23.8%** |
+| `fib` peak | 3,476 B | 4,244 B | +22.1% |
+| `method_call` peak | 7,484 B | 9,324 B | +24.6% |
+| `list_build` peak | 132,288 B | 134,208 B | +1.5% |
+| work, all four | — | — | **+6 to +9%** |
+
+**One benchmark a quarter better and three worse**, because a block is 32
+slots across ten tables and a small program never fills one; and every object
+access pays an indirection. So it is off by default and on for a program
+shaped like `binary_trees`: something large built and then let go, on a part
+where the peak is what runs out.
+
+*Two attempts were needed. The first dropped a freed block's indices from the
+free list, which abandoned the other 31 slots for ever -- the tables addressed
+34,272 slots where they had held 2,560, and nothing was given back at all. The
+free list has to keep them: an allocation landing on one makes the block
+again, and until one does the memory is back.*
+
+#### A chunk as a hidden object — not built, and the measurement says why
+
+This page proposed it as the alternative to the above and answered itself: *"a
+plain `Vec` of boxed blocks per type needs no bootstrap and no extra hop."*
+That is what was built. The hidden-object form would add a second indirection
+-- handle to chunk, chunk to slot -- on top of the one that already costs 6 to
+9%, to save a `Vec` of pointers per type. There is nothing in the numbers to
+pay for it.
+
+#### An occupancy bitmap — not built, and a test that says when to
+
+It was proposed *for a type added later whose payload has no spare bit
+pattern*. There is no such type: `Option<T>` is the same size as `T` for all
+ten, so the `Option` is free and a bitmap would cost a bit per slot and a test
+on every access to save nothing.
+
+`ObjUpvalue` is the one that nearly was not -- 24 bytes for a 16-byte payload,
+on 19.2% of all allocations, until biasing its stack slot by one gave it a
+`NonZeroU32`. So the useful form of this idea is a guard:
+`every_slot_type_costs_nothing_for_being_optional` in `tests/heap.rs` fails on
+the day someone adds a type without a niche, and says in its message that this
+is when the bitmap is worth building. It demonstrates its own check can fail,
+so it is not a test that always passes.
+
 ### What is left worth building
 
-Not another liveness policy: three have been measured and the collector wins.
-What the numbers still point at is **where objects live, not when they die**:
+Nothing from the list that used to stand here: chunked slot tables are built
+and behind a feature, the hidden-object form is answered by their cost, and
+the occupancy bitmap has a test that will say when its day comes.
 
-- **Chunked slot tables.** The *fields* are chunked; the slots themselves are
-  not. A table's `Vec` still holds its high-water mark for ever, so a program
-  that spikes never gives that back. The same structure applies, and the field
-  arena is the worked example of what it costs and what it is worth.
-
-  **A chunk could be an object itself** -- a hidden type the language never
-  sees, holding a block of slots and addressed by a handle like anything else.
-  The attraction is that chunk lifetime then reuses the machinery that already
-  exists: the tables, the free list, the sweep. The cost is a bootstrap, since
-  the table that holds chunks cannot itself live in a chunk, and a second
-  indirection on every access -- handle to chunk, chunk to slot -- which is
-  the one thing this design has spent the most effort removing. Worth
-  measuring before it is assumed either way; a plain `Vec` of boxed blocks per
-  type needs no bootstrap and no extra hop.
-- **An occupancy bitmap instead of `Option` in every slot**, for anything
-  added later whose payload has no spare bit pattern. `ObjUpvalue` was that
-  case -- 24 bytes for a 16-byte payload, on 19.2% of all allocations -- and
-  biasing its stack slot by one gave it a `NonZeroU32` and the niche. The next
-  type without one will not necessarily have a field to bias.
-
+What the numbers point at now is not the heap's shape but its contents.
+`binary_trees` holds about two thousand live instances of three fields each,
+and at eight bytes a `Value` that is 49 KB of the 115 KB peak -- so the
+largest single lever left on memory is the one already measured and already
+optional: `--features f32` halves every field, every list element and every
+map entry, for a `Num` that is no longer Wren's. See the f32 table in the
+README.

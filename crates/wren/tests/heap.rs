@@ -372,3 +372,57 @@ fn a_nonsense_ceiling_cannot_collect_forever() {
     heap.set_headroom(None);
     assert_eq!(heap.headroom(), None);
 }
+
+/// **Every slot type still has a spare bit pattern, so `Option` is free.**
+///
+/// memory.md lists an occupancy bitmap -- one bit per slot, beside the table,
+/// instead of an `Option` inside every slot -- as worth building *for a type
+/// added later whose payload has no niche*. It is not worth building now,
+/// because there is no such type: `Option<T>` is the same size as `T` for all
+/// ten, and a bitmap would cost a bit per slot and a test on every access to
+/// save nothing.
+///
+/// `ObjUpvalue` is the one that nearly was not. It holds a stack slot and a
+/// closed-over value, and a plain `usize` slot has no spare pattern -- 24
+/// bytes for a 16-byte payload, on 19.2% of all allocations. Biasing the slot
+/// by one made it a `NonZeroU32` and gave the enum its niche back.
+///
+/// This fails on the day someone adds a type without one. That is the day the
+/// bitmap is worth building, and this is where they will find out.
+#[test]
+fn every_slot_type_costs_nothing_for_being_optional() {
+    macro_rules! niche {
+        ($type:ty) => {
+            assert_eq!(
+                core::mem::size_of::<Option<$type>>(),
+                core::mem::size_of::<$type>(),
+                concat!(
+                    stringify!($type),
+                    " has no spare bit pattern, so `Option` costs it a word. ",
+                    "Either give it a niche -- see `ObjUpvalue`'s biased slot -- ",
+                    "or build the occupancy bitmap that memory.md describes."
+                )
+            );
+        };
+    }
+
+    niche!(std::boxed::Box<wren::object::ObjClass>);
+    niche!(wren::object::ObjClosure);
+    niche!(std::boxed::Box<wren::object::ObjFn>);
+    niche!(std::boxed::Box<wren::object::ObjFiber>);
+    niche!(wren::object::ObjInstance);
+    niche!(wren::object::ObjList);
+    niche!(wren::object::ObjMap);
+    niche!(wren::object::ObjRange);
+    niche!(wren::object::ObjString);
+    niche!(wren::object::ObjUpvalue);
+
+    // **The check can fail**, which is worth demonstrating rather than
+    // assuming: a payload with no spare bit pattern grows by a word when it
+    // is wrapped, and that is exactly what the assertions above would catch.
+    assert_ne!(
+        core::mem::size_of::<Option<(u32, u64)>>(),
+        core::mem::size_of::<(u32, u64)>(),
+        "a type with no niche should grow -- if it does not, this test proves nothing"
+    );
+}

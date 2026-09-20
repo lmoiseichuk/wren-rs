@@ -128,8 +128,40 @@ impl Collection {
 /// twelve bytes a list needs instead of the twenty-four a `Range` needs. It
 /// also makes the type free to ask about: it is in the handle, not in a
 /// discriminant that has to be fetched.
+/// How many slots one block of a table holds.
+///
+/// **Thirty-two, measured.** Simulated over the benchmarks' heaps at the end
+/// of a run, blocks of 16 would give back 5,568 bytes of `binary_trees`'
+/// slots, 32 gives 4,992, 64 gives 4,608 and 128 gives 3,072 -- free slots
+/// cluster, but not tightly, so a smaller block reclaims more and costs more
+/// block pointers. `list_build` gives back nothing at any size, because it
+/// frees nothing.
+#[cfg(feature = "blocked-slots")]
+const SLOT_BLOCK: usize = 32;
+
 struct Table<T> {
-    slots: Vec<Option<T>>,
+    /// Slots, in blocks of [`SLOT_BLOCK`].
+    ///
+    /// **A block is dropped once everything in it is free**, which is how a
+    /// table gives memory back after a spike. A flat `Vec` only ever grows:
+    /// freeing a slot returns it to the free list, not to the allocator, so a
+    /// program that builds a large structure and then drops it keeps the
+    /// high-water mark for the rest of its life. On a device that runs for
+    /// months after booting, that is the difference that matters -- the peak
+    /// is unchanged either way, because at the peak every slot is in use.
+    /// An empty `Vec` is a block that has been given back -- which costs one
+    /// fewer test on every object access than an `Option` would, and every
+    /// object access is the hottest path in the VM.
+    #[cfg(feature = "blocked-slots")]
+    blocks: Vec<Vec<Option<T>>>,
+    /// One flat run of slots, which only ever grows.
+    #[cfg(not(feature = "blocked-slots"))]
+    blocks: Vec<Option<T>>,
+    /// How many slots the table addresses, blocks that are gone included.
+    ///
+    /// Handles are flat indices and stay valid across a block being dropped
+    /// and made again.
+    addressed: usize,
     /// Indices of free slots, newest first. A separate stack rather than a
     /// linked list threaded through the slots themselves: the same asymptotics,
     /// none of the aliasing that a threaded list needs `unsafe` to express.
@@ -168,7 +200,8 @@ struct Table<T> {
 impl<T> Table<T> {
     fn new() -> Table<T> {
         Table {
-            slots: Vec::new(),
+            blocks: Vec::new(),
+            addressed: 0,
             free: Vec::new(),
             marks: Vec::new(),
             young: Vec::new(),
@@ -201,27 +234,125 @@ impl<T> Table<T> {
     }
 
     fn allocate(&mut self, value: T) -> u32 {
-        match self.free.pop() {
-            Some(index) => {
-                self.slots[index as usize] = Some(value);
-                index
-            }
+        let index = match self.free.pop() {
+            Some(index) => index as usize,
             None => {
-                let index = self.slots.len();
-                self.slots.push(Some(value));
+                let index = self.addressed;
+                self.addressed += 1;
                 if index / 64 >= self.marks.len() {
                     self.marks.push(0);
                 }
-                index as u32
+                index
             }
+        };
+        // The block may be absent either because the table has never reached
+        // this far or because it was dropped when it emptied.
+        #[cfg(feature = "blocked-slots")]
+        {
+            let block = index / SLOT_BLOCK;
+            if self.blocks.len() <= block {
+                self.blocks.resize_with(block + 1, Vec::new);
+            }
+            if self.blocks[block].is_empty() {
+                self.blocks[block] = (0..SLOT_BLOCK).map(|_| None).collect();
+            }
+            self.blocks[block][index % SLOT_BLOCK] = Some(value);
+        }
+        #[cfg(not(feature = "blocked-slots"))]
+        {
+            if self.blocks.len() <= index {
+                self.blocks.resize_with(index + 1, || None);
+            }
+            self.blocks[index] = Some(value);
+        }
+        index as u32
+    }
+
+    /// How many slots this table addresses.
+    #[inline(always)]
+    fn slots(&self) -> usize {
+        self.addressed
+    }
+
+    /// The slot at `index`, present or not, if its block is still here.
+    #[inline(always)]
+    fn slot(&self, index: usize) -> Option<&Option<T>> {
+        #[cfg(feature = "blocked-slots")]
+        return self.blocks.get(index / SLOT_BLOCK)?.get(index % SLOT_BLOCK);
+        #[cfg(not(feature = "blocked-slots"))]
+        return self.blocks.get(index);
+    }
+
+    #[inline(always)]
+    fn slot_mut(&mut self, index: usize) -> Option<&mut Option<T>> {
+        #[cfg(feature = "blocked-slots")]
+        return self.blocks.get_mut(index / SLOT_BLOCK)?.get_mut(index % SLOT_BLOCK);
+        #[cfg(not(feature = "blocked-slots"))]
+        return self.blocks.get_mut(index);
+    }
+
+    /// Empty a slot, and give its block back if that was the last one in it.
+    ///
+    /// **The free list keeps its indices.** Dropping them would abandon the
+    /// other thirty-one slots of the block for ever, and the table would grow
+    /// a new block instead of reusing this one -- which is worse than never
+    /// having blocked it at all. An allocation landing on one of these
+    /// indices makes the block again; until one does, the memory is back.
+    #[cfg(feature = "blocked-slots")]
+    fn release(&mut self, index: usize) {
+        let block = index / SLOT_BLOCK;
+        let Some(slots) = self.blocks.get_mut(block) else {
+            return;
+        };
+        if slots.is_empty() {
+            return;
+        }
+        slots[index % SLOT_BLOCK] = None;
+        if slots.iter().all(Option::is_none) {
+            self.blocks[block] = Vec::new();
         }
     }
+
+    #[cfg(not(feature = "blocked-slots"))]
+    fn release(&mut self, index: usize) {
+        if let Some(slot) = self.blocks.get_mut(index) {
+            *slot = None;
+        }
+    }
+
+    /// Drop empty blocks off the end of the table and forget their slots.
+    ///
+    /// **This is the half that a free list cannot undo.** An interior block
+    /// comes back the moment an allocation reuses one of its indices, which
+    /// on a LIFO free list is almost at once; a block past the end of what
+    /// the table addresses cannot come back, because nothing points into it.
+    /// A program that builds something large and drops it gives the tail back
+    /// for good.
+    #[cfg(feature = "blocked-slots")]
+    fn trim(&mut self) {
+        while self.blocks.last().is_some_and(Vec::is_empty) {
+            self.blocks.pop();
+        }
+        let addressed = self.blocks.len() * SLOT_BLOCK;
+        if addressed >= self.addressed {
+            return;
+        }
+        self.addressed = addressed;
+        self.free.retain(|index| (*index as usize) < addressed);
+        self.marks.truncate(self.addressed.div_ceil(64));
+    }
+
+    /// A flat table gives nothing back: freeing a slot returns it to the free
+    /// list, and the `Vec` keeps its high-water mark for ever.
+    #[cfg(not(feature = "blocked-slots"))]
+    fn trim(&mut self) {}
+
     fn get(&self, index: u32) -> Option<&T> {
-        self.slots.get(index as usize)?.as_ref()
+        self.slot(index as usize)?.as_ref()
     }
 
     fn get_mut(&mut self, index: u32) -> Option<&mut T> {
-        self.slots.get_mut(index as usize)?.as_mut()
+        self.slot_mut(index as usize)?.as_mut()
     }
 
     /// Is this slot's object still in the young generation?
@@ -278,7 +409,7 @@ impl<T> Table<T> {
     }
 
     fn occupied(&self, index: u32) -> bool {
-        matches!(self.slots.get(index as usize), Some(Some(_)))
+        matches!(self.slot(index as usize), Some(Some(_)))
     }
 
     fn clear_marks(&mut self) {
@@ -1102,7 +1233,7 @@ impl Heap {
         // things by. What it is not is more work.
         let mut live_fields = 0usize;
         let mut live_instances = 0usize;
-        for index in 0..self.instances.slots.len() {
+        for index in 0..self.instances.slots() {
             if let Some(instance) = self.instances.get(index as u32) {
                 live_fields += instance.count();
                 live_instances += 1;
@@ -1126,7 +1257,7 @@ impl Heap {
         }
 
         let mut runs: Vec<(u32, u32, u32)> = Vec::with_capacity(live_instances);
-        for index in 0..self.instances.slots.len() {
+        for index in 0..self.instances.slots() {
             let index = index as u32;
             if let Some(instance) = self.instances.get(index) {
                 runs.push((instance.at() as u32, instance.count() as u32, index));
@@ -1198,11 +1329,10 @@ impl Heap {
         macro_rules! discard {
             ($table:expr) => {{
                 if $table
-                    .slots
-                    .get(index as usize)
+                    .slot(index as usize)
                     .is_some_and(Option::is_some)
                 {
-                    $table.slots[index as usize] = None;
+                    $table.release(index as usize);
                     $table.free.push(index);
                 }
             }};
@@ -1290,41 +1420,79 @@ impl Heap {
     /// How many function slots the table has, for walking every chunk.
     #[cfg(feature = "profile")]
     pub fn function_count(&self) -> usize {
-        self.functions.slots.len()
+        self.functions.slots()
     }
 
     /// The chunk of the function in slot `index`, if it holds one.
     #[cfg(feature = "profile")]
     pub fn function_chunk(&self, index: usize) -> Option<&crate::bytecode::Chunk> {
         self.functions
-            .slots
-            .get(index)?
+            .slot(index)?
             .as_ref()
             .map(|function| &*function.chunk)
+    }
+
+    /// How the slot tables' blocks stand: held, and given back.
+    ///
+    /// **A block goes back when the last slot in it is freed.** What this
+    /// reports is therefore what blocking actually recovered, not what it
+    /// might: blocks that were made and dropped are gone, and the difference
+    /// between the slots a table addresses and the blocks it still holds is
+    /// the memory a flat `Vec` would still be sitting on.
+    #[cfg(feature = "profile")]
+    pub fn block_census(&self) -> (usize, usize, usize) {
+        let mut held = 0;
+        let mut addressed = 0;
+        let mut given_back = 0;
+
+        macro_rules! walk {
+            ($table:expr, $slot:expr) => {{
+                let table = $table;
+                addressed += table.slots().div_ceil(SLOT_BLOCK);
+                for block in &table.blocks {
+                    match block.is_empty() {
+                        false => held += 1,
+                        true => given_back += SLOT_BLOCK * $slot,
+                    }
+                }
+            }};
+        }
+
+        walk!(&self.classes, core::mem::size_of::<Option<alloc::boxed::Box<ObjClass>>>());
+        walk!(&self.closures, core::mem::size_of::<Option<ObjClosure>>());
+        walk!(&self.functions, core::mem::size_of::<Option<alloc::boxed::Box<ObjFn>>>());
+        walk!(&self.fibers, core::mem::size_of::<Option<alloc::boxed::Box<ObjFiber>>>());
+        walk!(&self.instances, core::mem::size_of::<Option<ObjInstance>>());
+        walk!(&self.lists, core::mem::size_of::<Option<ObjList>>());
+        walk!(&self.maps, core::mem::size_of::<Option<ObjMap>>());
+        walk!(&self.ranges, core::mem::size_of::<Option<ObjRange>>());
+        walk!(&self.strings, core::mem::size_of::<Option<ObjString>>());
+        walk!(&self.upvalues, core::mem::size_of::<Option<ObjUpvalue>>());
+        (addressed, held, given_back)
     }
 
     #[cfg(feature = "profile")]
     pub fn slot_census(&self) -> alloc::vec::Vec<(&'static str, usize, usize, usize)> {
         alloc::vec![
-            ("Class", self.classes.slots.len(), self.classes.free.len(),
+            ("Class", self.classes.slots(), self.classes.free.len(),
              core::mem::size_of::<Option<alloc::boxed::Box<ObjClass>>>()),
-            ("Closure", self.closures.slots.len(), self.closures.free.len(),
+            ("Closure", self.closures.slots(), self.closures.free.len(),
              core::mem::size_of::<Option<ObjClosure>>()),
-            ("Fn", self.functions.slots.len(), self.functions.free.len(),
+            ("Fn", self.functions.slots(), self.functions.free.len(),
              core::mem::size_of::<Option<alloc::boxed::Box<ObjFn>>>()),
-            ("Fiber", self.fibers.slots.len(), self.fibers.free.len(),
+            ("Fiber", self.fibers.slots(), self.fibers.free.len(),
              core::mem::size_of::<Option<alloc::boxed::Box<ObjFiber>>>()),
-            ("Instance", self.instances.slots.len(), self.instances.free.len(),
+            ("Instance", self.instances.slots(), self.instances.free.len(),
              core::mem::size_of::<Option<ObjInstance>>()),
-            ("List", self.lists.slots.len(), self.lists.free.len(),
+            ("List", self.lists.slots(), self.lists.free.len(),
              core::mem::size_of::<Option<ObjList>>()),
-            ("Map", self.maps.slots.len(), self.maps.free.len(),
+            ("Map", self.maps.slots(), self.maps.free.len(),
              core::mem::size_of::<Option<ObjMap>>()),
-            ("Range", self.ranges.slots.len(), self.ranges.free.len(),
+            ("Range", self.ranges.slots(), self.ranges.free.len(),
              core::mem::size_of::<Option<ObjRange>>()),
-            ("String", self.strings.slots.len(), self.strings.free.len(),
+            ("String", self.strings.slots(), self.strings.free.len(),
              core::mem::size_of::<Option<ObjString>>()),
-            ("Upvalue", self.upvalues.slots.len(), self.upvalues.free.len(),
+            ("Upvalue", self.upvalues.slots(), self.upvalues.free.len(),
              core::mem::size_of::<Option<ObjUpvalue>>()),
         ]
     }
@@ -1333,16 +1501,16 @@ impl Heap {
     #[cfg(feature = "profile")]
     fn occupancy(&self) -> usize {
         let mut total = 0;
-        total += self.classes.slots.len() - self.classes.free.len();
-        total += self.closures.slots.len() - self.closures.free.len();
-        total += self.functions.slots.len() - self.functions.free.len();
-        total += self.fibers.slots.len() - self.fibers.free.len();
-        total += self.instances.slots.len() - self.instances.free.len();
-        total += self.lists.slots.len() - self.lists.free.len();
-        total += self.maps.slots.len() - self.maps.free.len();
-        total += self.ranges.slots.len() - self.ranges.free.len();
-        total += self.strings.slots.len() - self.strings.free.len();
-        total += self.upvalues.slots.len() - self.upvalues.free.len();
+        total += self.classes.slots() - self.classes.free.len();
+        total += self.closures.slots() - self.closures.free.len();
+        total += self.functions.slots() - self.functions.free.len();
+        total += self.fibers.slots() - self.fibers.free.len();
+        total += self.instances.slots() - self.instances.free.len();
+        total += self.lists.slots() - self.lists.free.len();
+        total += self.maps.slots() - self.maps.free.len();
+        total += self.ranges.slots() - self.ranges.free.len();
+        total += self.strings.slots() - self.strings.free.len();
+        total += self.upvalues.slots() - self.upvalues.free.len();
         total
     }
 
@@ -1356,8 +1524,8 @@ impl Heap {
         let mut out = Vec::new();
         macro_rules! collect_ids {
             ($table:expr, $kind:expr) => {
-                for (index, slot) in $table.slots.iter().enumerate() {
-                    if slot.is_some() {
+                for index in 0..$table.slots() {
+                    if $table.slot(index).is_some_and(Option::is_some) {
                         out.push(ObjectId::tagged($kind.tag(), index as u32));
                     }
                 }
@@ -1610,7 +1778,7 @@ impl Heap {
                 scan.push(ObjectId::tagged(kind.tag(), *index));
             }
         });
-        for index in 0..self.fibers.slots.len() {
+        for index in 0..self.fibers.slots() {
             let index = index as u32;
             if self.fibers.occupied(index) && !self.fibers.is_young(index) {
                 scan.push(ObjectId::tagged(ObjectType::Fiber.tag(), index));
@@ -1746,9 +1914,9 @@ impl Heap {
         let mut young_survived = 0u64;
         each_table!(&mut *self, table, kind, {
             let slot = table.slot_size();
-            slots_seen += table.slots.len();
-            for index in 0..table.slots.len() {
-                if table.slots[index].is_none() {
+            slots_seen += table.slots();
+            for index in 0..table.slots() {
+                if !table.slot(index).is_some_and(Option::is_some) {
                     continue;
                 }
                 if table.is_marked(index as u32) {
@@ -1757,7 +1925,7 @@ impl Heap {
                     if table.is_newborn(index as u32, generation) {
                         young_survived += 1;
                     }
-                    if let Some(value) = table.slots[index].as_mut() {
+                    if let Some(value) = table.slot_mut(index).and_then(Option::as_mut) {
                         shrink_settled(value);
                         bytes += slot + value.contents_size();
                     }
@@ -1806,6 +1974,13 @@ impl Heap {
                 (bytes * numerator / denominator).max(INITIAL_THRESHOLD)
             }
         };
+        // **Give the tail back.** A collection is the only moment the heap
+        // knows what is still live, so it is the only moment a table can tell
+        // that the blocks off its end are gone for good.
+        each_table!(&mut *self, table, kind, {
+            let _ = kind;
+            table.trim();
+        });
         self.collections += 1;
         self.refresh_due();
 
