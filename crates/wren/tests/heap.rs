@@ -515,3 +515,59 @@ fn a_flat_table_has_no_block_to_size() {
     );
     assert_eq!(heap.slot_block(), None);
 }
+
+/// A class in the image gets a handle, costs the heap nothing, and survives.
+///
+/// **The three properties a static core rests on**, checked together because
+/// each is uninteresting without the others: a frozen class must be reachable
+/// through an ordinary handle, so dispatch and `class_of` need no special
+/// case; it must not be charged to `Heap::bytes`, or the collector schedules
+/// against memory the heap does not hold; and it must survive a collection
+/// that marks nothing, because sweeping it would lose a handle the whole
+/// program dispatches through.
+#[test]
+fn a_class_in_the_image_is_addressable_free_and_permanent() {
+    use wren::handle::ObjectId;
+    use wren::object::{ObjClass, ObjectType};
+
+    // The method table a build-time step would have computed. Its contents do
+    // not matter here; that it is borrowed rather than owned does.
+    static METHODS: [u32; 4] = [0, 1, 2, 3];
+    static FROZEN: ObjClass = ObjClass::frozen(
+        ObjectId::tagged(ObjectType::String.tag(), 0),
+        None,
+        None,
+        &METHODS,
+    );
+
+    let mut heap = wren::heap::Heap::new();
+    let before = heap.bytes();
+
+    let id = heap.adopt_class(&FROZEN);
+
+    // Addressable exactly like any other class.
+    let class = heap.class(id).expect("a frozen class should be reachable");
+    assert_eq!(class.methods.len(), 4);
+    assert_eq!(class.method_entry(2), 2);
+
+    // Free: the slot is the heap's, the struct and the table are the image's.
+    assert_eq!(
+        heap.bytes(),
+        before,
+        "a class in flash must not be charged to the heap"
+    );
+
+    // Refused for writing, which is what keeps `install` away from it.
+    assert!(
+        heap.class_mut(id).is_none(),
+        "a frozen class must not be handed out for mutation"
+    );
+
+    // Permanent: collect with no roots at all, and it is still there.
+    heap.collect(core::iter::empty());
+    assert!(
+        heap.class(id).is_some(),
+        "a frozen class must survive a collection that marks nothing"
+    );
+    assert_eq!(heap.class(id).unwrap().methods.len(), 4);
+}

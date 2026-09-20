@@ -42,7 +42,7 @@ impl ObjectType {
     ///
     /// The enum's own discriminant, named rather than cast at each use so that
     /// the handle encoding and the profiler's array both point at one place.
-    pub fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         self as u8
     }
 
@@ -424,6 +424,34 @@ pub struct ObjClass {
 
 impl ObjClass {
     /// A class with no methods yet.
+    /// A class built into the image, with its method table already computed.
+    ///
+    /// **`const`, which is the whole point**: this is what lets a core class
+    /// be a `static` item in `.rodata` instead of something start-up builds in
+    /// RAM. Every argument has to be known when the image is built -- which is
+    /// exactly what a manifest makes true, since it fixes the symbol numbering
+    /// and so the shape of every method table.
+    ///
+    /// `num_fields` is zero because a built-in class has no instance fields;
+    /// a class that does is a class the program declared, and that is built at
+    /// run time in the ordinary way.
+    pub const fn frozen(
+        name: ObjectId,
+        superclass: Option<ObjectId>,
+        metaclass: Option<ObjectId>,
+        methods: &'static [u32],
+    ) -> ObjClass {
+        ObjClass {
+            name,
+            superclass,
+            num_fields: 0,
+            metaclass,
+            methods: Methods::Static(methods),
+            attributes: Value::NULL,
+            static_fields: Vec::new(),
+        }
+    }
+
     pub fn new(name: ObjectId, superclass: Option<ObjectId>) -> ObjClass {
         ObjClass {
             name,
@@ -464,6 +492,80 @@ impl ObjClass {
             Some(entry) => *entry,
             None => NO_METHOD,
         }
+    }
+}
+
+/// A class in the heap's table, which may instead be a class in flash.
+///
+/// **Why the indirection is here and not in the handle.** A static class needs
+/// an `ObjectId` that the rest of the VM can pass around, and the obvious way
+/// -- reserving part of the index space -- would put an offset into the
+/// collector's mark bits, its free list, its nursery sets and its sweep, where
+/// one missed site is silent corruption rather than a compile error. Holding
+/// the choice in the slot instead leaves every index exactly what it was: a
+/// static class occupies a real slot and a real handle, and only what the slot
+/// points at differs.
+///
+/// The cost is four bytes on every class slot, against the fifty-two plus a
+/// method table that a static class stops occupying.
+#[derive(Debug)]
+pub enum ClassRef {
+    /// Built when the image was built; lives in flash and is never swept.
+    Static(&'static ObjClass),
+    /// Built at start-up, in the heap.
+    Owned(Box<ObjClass>),
+}
+
+impl ClassRef {
+    /// The class for writing, or `None` when it is in flash.
+    pub fn as_mut(&mut self) -> Option<&mut ObjClass> {
+        match self {
+            ClassRef::Owned(class) => Some(class),
+            ClassRef::Static(_) => None,
+        }
+    }
+
+    /// Whether this class is in flash, and so costs the heap nothing and must
+    /// never be swept.
+    pub fn is_static(&self) -> bool {
+        matches!(self, ClassRef::Static(_))
+    }
+}
+
+impl core::ops::Deref for ClassRef {
+    type Target = ObjClass;
+
+    fn deref(&self) -> &ObjClass {
+        match self {
+            ClassRef::Owned(class) => class,
+            ClassRef::Static(class) => class,
+        }
+    }
+}
+
+impl Trace for ClassRef {
+    fn trace(&self, gray: &mut Vec<ObjectId>) {
+        (**self).trace(gray);
+    }
+
+    /// **Nothing, when the class is in flash.** The struct and its method
+    /// table are in the image, so charging the heap for them would make the
+    /// collector schedule against memory it does not hold.
+    fn contents_size(&self) -> usize {
+        match self {
+            ClassRef::Owned(class) => core::mem::size_of::<ObjClass>() + class.methods.footprint(),
+            ClassRef::Static(_) => 0,
+        }
+    }
+
+    fn settle(&mut self) {
+        if let ClassRef::Owned(class) = self {
+            class.settle();
+        }
+    }
+
+    fn is_permanent(&self) -> bool {
+        self.is_static()
     }
 }
 
@@ -894,6 +996,19 @@ pub trait Trace {
     /// when to collect, and not claimed to be more. The table adds the slot.
     fn contents_size(&self) -> usize {
         0
+    }
+
+    /// Whether this object is in the image rather than the heap.
+    ///
+    /// **A permanent object is live whether or not anything marked it.** The
+    /// collector reaches objects from roots, and a class frozen into flash is
+    /// reachable from the roots today only because every core class is listed
+    /// there by hand. That is a property of one list in one function, and
+    /// sweeping a static class out of its slot would lose a handle the whole
+    /// program dispatches through -- so the sweep asks here instead of
+    /// trusting the list to stay right.
+    fn is_permanent(&self) -> bool {
+        false
     }
 
     /// Give back memory this object over-reserved, now that it has settled.

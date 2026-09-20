@@ -677,6 +677,57 @@ name strings (209 B, and the `String` table shrinks with them), then static
 method tables once symbol assignment is done at build time, then the class
 objects themselves. Only the last needs the handle space split.
 
+#### A class that lives in flash: the mechanism
+
+Built, proved, and not yet used by anything -- which is the honest state to
+record it in, because right now it costs 240 bytes and saves none.
+
+Two representation changes carry it. `Methods` is a class's method table as
+either a `&'static [u32]` or a `Vec<u32>`, so an `ObjClass` need not own its
+table; `ClassRef` is what a class *slot* holds, either `&'static ObjClass` or
+`Box<ObjClass>`, so the heap need not own the class.
+
+**The second one is where the design decision is.** A static class needs an
+`ObjectId` the rest of the VM can pass around, and the obvious way to get one
+is to reserve part of the index space. That would put an offset into the
+collector's mark bits, its free list, its nursery sets and its sweep -- five
+places where a missed site is silent corruption rather than a compile error.
+Holding the choice in the slot instead leaves every index exactly what it was:
+a static class takes a real slot and a real handle, and only what the slot
+points at differs. Nothing in the collector's arithmetic changed.
+
+Three invariants make it safe, and `a_class_in_the_image_is_addressable_free_
+and_permanent` in `tests/heap.rs` checks them together:
+
+  - **Addressable.** `heap.class(id)` returns it like any other, so dispatch
+    and `class_of` need no special case.
+  - **Free.** `contents_size` is zero for a static class, so `Heap::bytes` is
+    not charged for memory the heap does not hold -- otherwise the collector
+    schedules against the image.
+  - **Permanent.** `Trace::is_permanent` makes both sweeps treat it as live
+    whatever the marks say. The core classes are reachable from the root list
+    today, but that is a property of one list in one function, and sweeping a
+    static class out of its slot would lose a handle the whole program
+    dispatches through.
+
+`Heap::class_mut` returns `None` for one, which is what keeps `define`,
+`inherit_methods` and the post-install shrink away from a table that was
+already flattened when the image was built.
+
+What it costs today, on `fib`: a class slot goes from 4 bytes to 8, so the
+`Class` table is 256 B rather than 128 and the VM starts at 6,660 B rather
+than 6,420. What it buys, once classes are actually frozen, is the 1,092 B of
+structs and 380 B of method tables measured above -- so the mechanism pays for
+itself about six times over, but only after the generator exists.
+
+**That generator is the next piece, and it is the real work.** A method table
+is indexed by symbol, and symbols are numbered by the order `install` interns
+them -- at run time. Freezing a table means fixing that numbering when the
+image is built, which a manifest makes possible and nothing currently does. So
+the step is a host-side pass that takes a `.wrenc`, builds the tailored VM it
+implies, and emits the resulting symbol table and class table as a Rust module
+the firmware includes instead of running `install`.
+
 ### What is left worth building
 
 Nothing from the list that used to stand here: chunked slot tables are built

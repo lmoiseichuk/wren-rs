@@ -27,11 +27,11 @@ impl ObjectId {
     /// is not promised to refer to anything**; the heap answers `None` for one
     /// that does not, which is why this cannot be unsound even when it is
     /// wrong.
-    pub fn new(index: u32) -> ObjectId {
+    pub const fn new(index: u32) -> ObjectId {
         ObjectId(index)
     }
 
-    pub fn raw(self) -> u32 {
+    pub const fn raw(self) -> u32 {
         self.0
     }
 
@@ -46,17 +46,17 @@ impl ObjectId {
     const TAG_MASK: u32 = (1 << Self::TAG_BITS) - 1;
 
     /// Build a handle naming both a type and a slot within that type's table.
-    pub fn tagged(tag: u8, index: u32) -> ObjectId {
-        ObjectId((index << Self::TAG_BITS) | (u32::from(tag) & Self::TAG_MASK))
+    pub const fn tagged(tag: u8, index: u32) -> ObjectId {
+        ObjectId((index << Self::TAG_BITS) | (tag as u32 & Self::TAG_MASK))
     }
 
     /// Which type's table this handle indexes. See `ObjectType::from_tag`.
-    pub fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         (self.0 & Self::TAG_MASK) as u8
     }
 
     /// Where in that table.
-    pub fn index(self) -> u32 {
+    pub const fn index(self) -> u32 {
         self.0 >> Self::TAG_BITS
     }
 }

@@ -576,7 +576,7 @@ macro_rules! each_table {
 
 /// The object tables, and the collector over them.
 pub struct Heap {
-    classes: Table<alloc::boxed::Box<ObjClass>>,
+    classes: Table<crate::object::ClassRef>,
     closures: Table<ObjClosure>,
     functions: Table<alloc::boxed::Box<ObjFn>>,
     fibers: Table<alloc::boxed::Box<ObjFiber>>,
@@ -798,7 +798,11 @@ impl Heap {
         // and the growth threshold is set from one and tested against the
         // other.
         let (id, cost) = match object {
-            Object::Class(class) => Self::place(&mut self.classes, ObjectType::Class, class),
+            Object::Class(class) => Self::place(
+                &mut self.classes,
+                ObjectType::Class,
+                crate::object::ClassRef::Owned(class),
+            ),
             Object::Closure(closure) => {
                 Self::place(&mut self.closures, ObjectType::Closure, closure)
             }
@@ -874,6 +878,25 @@ impl Heap {
         (ObjectId::tagged(kind.tag(), table.allocate(value)), cost)
     }
 
+    /// Take a class that lives in the image, and give it a handle.
+    ///
+    /// **The class is not copied and never freed.** It occupies a slot and a
+    /// handle like any other, so every dispatch, every `class_of` and every
+    /// bytecode reference works on it unchanged -- but the struct and its
+    /// method table stay in flash, and `Heap::bytes` is not charged for them.
+    ///
+    /// A class adopted this way is already complete: its method table was
+    /// computed when the image was built and is already flattened, so
+    /// `class_mut` refuses it and the installers skip it. See
+    /// [`ClassRef`](crate::object::ClassRef).
+    pub fn adopt_class(&mut self, class: &'static ObjClass) -> ObjectId {
+        self.live += 1;
+        let index = self.classes.allocate(crate::object::ClassRef::Static(class));
+        // Deliberately not `make_young` and deliberately no `bytes` charge:
+        // it is neither in the nursery nor in the heap's footprint.
+        ObjectId::tagged(ObjectType::Class.tag(), index)
+    }
+
     /// Look up an object of a known type.
     ///
     /// **This is the API the VM uses.** Almost every access already knows what
@@ -894,7 +917,13 @@ impl Heap {
 
     pub fn class_mut(&mut self, id: ObjectId) -> Option<&mut ObjClass> {
         match id.tag() == ObjectType::Class.tag() {
-            true => self.classes.get_mut(id.index()).map(|class| &mut **class),
+            // **`None` for a class in flash**, which is the guard that keeps
+            // every mutating path away from one: `define`, `inherit_methods`
+            // and the post-install shrink all go through here first.
+            true => self
+                .classes
+                .get_mut(id.index())
+                .and_then(crate::object::ClassRef::as_mut),
             false => None,
         }
     }
@@ -1551,7 +1580,7 @@ impl Heap {
             }};
         }
 
-        walk!(&self.classes, core::mem::size_of::<Option<alloc::boxed::Box<ObjClass>>>());
+        walk!(&self.classes, core::mem::size_of::<Option<crate::object::ClassRef>>());
         walk!(&self.closures, core::mem::size_of::<Option<ObjClosure>>());
         walk!(&self.functions, core::mem::size_of::<Option<alloc::boxed::Box<ObjFn>>>());
         walk!(&self.fibers, core::mem::size_of::<Option<alloc::boxed::Box<ObjFiber>>>());
@@ -1574,7 +1603,7 @@ impl Heap {
     pub fn slot_census(&self) -> alloc::vec::Vec<(&'static str, usize, usize, usize)> {
         alloc::vec![
             ("Class", self.classes.slots(), self.classes.free.len(),
-             core::mem::size_of::<Option<alloc::boxed::Box<ObjClass>>>()),
+             core::mem::size_of::<Option<crate::object::ClassRef>>()),
             ("Closure", self.closures.slots(), self.closures.free.len(),
              core::mem::size_of::<Option<ObjClosure>>()),
             ("Fn", self.functions.slots(), self.functions.free.len(),
@@ -2075,7 +2104,13 @@ impl Heap {
         let mut promoted = 0usize;
         each_table!(&mut *self, table, kind, {
             for index in core::mem::take(&mut table.young) {
-                match table.is_marked(index) {
+                // A permanent object is never made young, so this should not
+                // arise -- but the minor sweep frees without consulting the
+                // roots at all, so it is the worst place to rely on that.
+                let permanent = table
+                    .get(index)
+                    .is_some_and(Trace::is_permanent);
+                match permanent || table.is_marked(index) {
                     true => promoted += 1,
                     false => dead.push(ObjectId::tagged(kind.tag(), index)),
                 }
@@ -2182,7 +2217,13 @@ impl Heap {
                 if !table.slot(index).is_some_and(Option::is_some) {
                     continue;
                 }
-                if table.is_marked(index as u32) {
+                // A class in flash is live whatever the marks say; see
+                // `Trace::is_permanent`.
+                let permanent = table
+                    .slot(index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(Trace::is_permanent);
+                if permanent || table.is_marked(index as u32) {
                     live += 1;
                     #[cfg(feature = "profile")]
                     if table.is_newborn(index as u32, generation) {
