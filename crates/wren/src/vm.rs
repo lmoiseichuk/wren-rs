@@ -258,6 +258,20 @@ pub struct Vm {
     pub primitives: Vec<crate::object::Primitive>,
     /// Method signatures, interned. `Op::Call` carries an index into this.
     pub method_names: SymbolTable,
+    /// Which numeric operation a method symbol names, or `NUM_OP_NONE`.
+    ///
+    /// **The arithmetic fast path's whole lookup.** `Num.+` and its siblings
+    /// are the most-called methods in every benchmark here -- 71% of `fib`'s
+    /// dispatches and 22% of `method_call`'s -- and each one resolves a class,
+    /// indexes a method table, decodes an entry and calls a primitive, to add
+    /// two doubles. This turns the question "is this symbol one of them?" into
+    /// one bounds check and one byte load.
+    ///
+    /// Indexed by method symbol. 256 entries because the widest symbol any of
+    /// the benchmarks reaches is 162 and the core interns about 160; a program
+    /// with more than 256 distinct method signatures simply takes the slow
+    /// path for the ones past the end, which is what it does today anyway.
+    num_ops: [u8; 256],
     /// Every module that has been loaded, main first.
     ///
     /// **A module is a namespace, not a file.** Two files that import each
@@ -458,7 +472,52 @@ pub struct Vm {
     previous_depth: usize,
 }
 
+/// No numeric fast path for this method symbol.
+const NUM_OP_NONE: u8 = 0;
+/// The numeric operations the `Call` arm handles without dispatching.
+///
+/// **Only the ones whose primitive is pure arithmetic on two doubles.** `==`
+/// and `!=` are deliberately absent: they are defined on `Object` and answer
+/// for every pair of values, so a number-only fast path for them would be a
+/// second implementation of equality rather than a shortcut through one.
+/// `..` and `...` allocate a range, which is a different kind of work.
+const NUM_ADD: u8 = 1;
+const NUM_SUB: u8 = 2;
+const NUM_MUL: u8 = 3;
+const NUM_DIV: u8 = 4;
+const NUM_MOD: u8 = 5;
+const NUM_LT: u8 = 6;
+const NUM_GT: u8 = 7;
+const NUM_LE: u8 = 8;
+const NUM_GE: u8 = 9;
+
 impl Vm {
+    /// Record which method symbols name arithmetic on two numbers.
+    ///
+    /// Run once, after the core library has interned its signatures. A symbol
+    /// the core did not define is simply absent, so a build without `Num` --
+    /// there is none today, but the lookup does not assume it -- gets an empty
+    /// table and the slow path.
+    fn learn_numeric_operators(&mut self) {
+        for (signature, operation) in [
+            ("+(_)", NUM_ADD),
+            ("-(_)", NUM_SUB),
+            ("*(_)", NUM_MUL),
+            ("/(_)", NUM_DIV),
+            ("%(_)", NUM_MOD),
+            ("<(_)", NUM_LT),
+            (">(_)", NUM_GT),
+            ("<=(_)", NUM_LE),
+            (">=(_)", NUM_GE),
+        ] {
+            if let Some(symbol) = self.method_names.find(signature) {
+                if symbol < self.num_ops.len() {
+                    self.num_ops[symbol] = operation;
+                }
+            }
+        }
+    }
+
     pub fn new() -> Vm {
         Vm::with_heap(Heap::new())
     }
@@ -525,6 +584,7 @@ impl Vm {
             heap,
             stack: Vec::new(),
             method_names: SymbolTable::new(),
+            num_ops: [NUM_OP_NONE; 256],
             primitives: Vec::new(),
             modules: alloc::vec![Module::new()],
             module_index: BTreeMap::new(),
@@ -590,6 +650,7 @@ impl Vm {
         }
 
         core::install(&mut vm);
+        vm.learn_numeric_operators();
         // **Only now.** The classes above were created empty and populated by
         // `install`, so flattening any earlier would have copied nothing.
         vm.flatten_class_hierarchy();
@@ -1727,7 +1788,7 @@ impl Vm {
             .and_then(|frame| self.function_of(frame.closure))
             .map_or(0, |function| function.module);
 
-        loop {
+        'interpret: loop {
             // **The offset, not the line.** `line_at` is a lookup into a table
             // as long as the code, and the line is wanted only when something
             // fails -- which is never, in the overwhelming majority of
@@ -1918,11 +1979,57 @@ impl Vm {
                     let instance = self.instantiate(class)?;
                     self.stack[base] = instance;
                 }
-                code::CALL | code::SUPER => {
+                code::CALL | code::SUPER => 'call: {
                     // The arity rides inline; the symbol is the unit after.
                     let arity = Chunk::inline_operand(unit) as usize;
                     let symbol = chunk.code[ip] as usize;
                     ip += 1;
+
+                    // **The arithmetic fast path.**
+                    //
+                    // `Num.+` and its siblings are the most-called methods in
+                    // every benchmark here -- 71% of `fib`'s dispatches, 22%
+                    // of `method_call`'s -- and their primitives are exactly
+                    // `a + b` on two doubles; see `arithmetic!` in `core`. So
+                    // when both operands are numbers, the dispatch can only
+                    // arrive at the code written below: `Num` is a core class
+                    // and Wren cannot reopen a class, so nothing can replace
+                    // the method that would be found.
+                    //
+                    // Everything else falls through to the real dispatch and
+                    // behaves exactly as before -- a string on either side, a
+                    // user class defining `+`, a `super` call, any arity but
+                    // one. The fast path can only *skip* work, never change an
+                    // answer, which is what makes it safe to take before
+                    // knowing the receiver's class.
+                    if byte == code::CALL && arity == 1 && symbol < self.num_ops.len() {
+                        let operation = self.num_ops[symbol];
+                        if operation != NUM_OP_NONE {
+                            let top = self.stack.len();
+                            // Receiver and argument, in the order the caller
+                            // pushed them.
+                            let left = self.stack[top - 2].as_num();
+                            let right = self.stack[top - 1].as_num();
+                            if let (Some(a), Some(b)) = (left, right) {
+                                let value = match operation {
+                                    NUM_ADD => Value::num(a + b),
+                                    NUM_SUB => Value::num(a - b),
+                                    NUM_MUL => Value::num(a * b),
+                                    NUM_DIV => Value::num(a / b),
+                                    NUM_MOD => Value::num(a % b),
+                                    NUM_LT => Value::bool(a < b),
+                                    NUM_GT => Value::bool(a > b),
+                                    NUM_LE => Value::bool(a <= b),
+                                    // `learn_numeric_operators` writes nothing
+                                    // else, so this is `>=`.
+                                    _ => Value::bool(a >= b),
+                                };
+                                self.stack.truncate(top - 2);
+                                self.stack.push(value);
+                                break 'call;
+                            }
+                        }
+                    }
 
                     let start_from = if byte == code::SUPER {
                         self.frames
@@ -1964,7 +2071,7 @@ impl Vm {
                                 ip = next_ip;
                                 base = next_base;
                                 module = self.current_module();
-                                continue;
+                                continue 'interpret;
                             }
                             None => unreachable!("deliver_error returns or switches"),
                         }
@@ -1987,7 +2094,7 @@ impl Vm {
                                         ip = next_ip;
                                         base = next_base;
                                         module = self.current_module();
-                                        continue;
+                                        continue 'interpret;
                                     }
                                     None => unreachable!("deliver_error returns or switches"),
                                 },
@@ -2020,7 +2127,7 @@ impl Vm {
                                             ip = next_ip;
                                             base = next_base;
                                             module = self.current_module();
-                                            continue;
+                                            continue 'interpret;
                                         }
                                         None => unreachable!("deliver_error returns or switches"),
                                     }
@@ -2033,7 +2140,7 @@ impl Vm {
                                 ip = frame.ip;
                                 base = frame.base;
                                 module = frame.module;
-                                continue;
+                                continue 'interpret;
                             }
                             self.stack.push(value);
                         }

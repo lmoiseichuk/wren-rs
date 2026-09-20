@@ -1784,3 +1784,61 @@ fn a_compiled_chunk_can_be_run_again() {
         "each run starts from the module initialisers, so each prints 2"
     );
 }
+
+// --- the arithmetic fast path ----------------------------------------------
+
+/// The fast path may skip work; it must never change an answer.
+///
+/// **Each of these is a case where the operands are not two numbers**, so the
+/// `Call` arm has to fall through to real dispatch. They are written out
+/// because the fast path is taken *before* the receiver's class is known --
+/// that is the whole of its speed -- so the guard that sends these down the
+/// slow path is the only thing keeping them correct.
+#[test]
+fn operators_that_are_not_numeric_still_dispatch() {
+    assert_eq!(run(r#"System.print("a" + "b")"#), "ab\n", "string concatenation");
+    assert_eq!(run("System.print([1] + [2])"), "[1, 2]\n", "list concatenation");
+    let money = r#"
+        class Money {
+            construct new(amount) { _amount = amount }
+            amount { _amount }
+            +(other) {
+                return Money.new(_amount + other.amount)
+            }
+        }
+        System.print((Money.new(2) + Money.new(3)).amount)
+    "#;
+    assert_eq!(run(money), "5\n", "a user class defining an operator");
+    assert_eq!(
+        error("System.print(1 + \"x\")"),
+        "Right operand must be a number.",
+        "a number and a non-number still raises the primitive's own error"
+    );
+    assert_eq!(
+        error("System.print(\"x\" - 1)"),
+        "String does not implement '-(_)'.",
+        "a non-number receiver is still a missing method"
+    );
+}
+
+/// The inlined arithmetic agrees with the primitive it replaces.
+///
+/// Including the corners: `%` follows C's fmod and takes the sign of the
+/// dividend, division by zero is an infinity rather than a fault, and every
+/// comparison against NaN is false.
+#[test]
+fn inlined_arithmetic_matches_the_primitive() {
+    assert_eq!(run("System.print(7 % 3)"), "1\n");
+    assert_eq!(run("System.print(-7 % 3)"), "-1\n", "sign of the dividend");
+    assert_eq!(run("System.print(1 / 0)"), "infinity\n");
+    assert_eq!(run("System.print(2 - 5)"), "-3\n");
+    assert_eq!(run("System.print(2.5 * 4)"), "10\n");
+    assert_eq!(run("System.print(1 < 2)"), "true\n");
+    assert_eq!(run("System.print(2 <= 2)"), "true\n");
+    assert_eq!(run("System.print(3 > 4)"), "false\n");
+    assert_eq!(run("System.print(3 >= 4)"), "false\n");
+    let nan = "var n = 0 / 0\n";
+    assert_eq!(run(&format!("{nan}System.print(n < 1)")), "false\n");
+    assert_eq!(run(&format!("{nan}System.print(n >= 1)")), "false\n");
+    assert_eq!(run(&format!("{nan}System.print(n <= n)")), "false\n");
+}
