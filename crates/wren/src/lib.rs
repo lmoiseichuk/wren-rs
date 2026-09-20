@@ -97,6 +97,7 @@ pub mod heap;
 pub mod object;
 #[cfg(feature = "alloc")]
 pub mod symbol;
+pub mod uheap;
 pub mod value;
 #[cfg(feature = "alloc")]
 pub mod vm;
