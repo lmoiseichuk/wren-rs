@@ -183,6 +183,9 @@ pub struct Frame {
 /// See [`Vm::call_target`], which fills it in with a single walk of the heap.
 struct CallTarget {
     chunk: Rc<Chunk>,
+    /// See [`ObjFn::max_slots`]. Carried here so reserving a frame's room
+    /// needs no second walk out to the function.
+    max_slots: usize,
     arity: usize,
     module: usize,
     field_offset: u16,
@@ -1206,6 +1209,69 @@ impl Vm {
         class != self.object_class
     }
 
+    /// Push a value the frame has already been given room for.
+    ///
+    /// **The capacity test, moved from every push to once per call.** A
+    /// `Vec::push` compares the length against the capacity and branches; the
+    /// interpreter does that some fifteen million times across the benchmarks,
+    /// always with the same answer, because `push_frame` reserved the most the
+    /// function can ever need before its first instruction ran.
+    ///
+    /// # Safety
+    ///
+    /// The slot must be inside the capacity. Three things together make that
+    /// true, and all three are load-bearing:
+    ///
+    /// 1. [`Chunk::max_slots`] is an upper bound on how far a function can
+    ///    drive the stack above where its frame starts -- computed by a
+    ///    worklist over the control-flow graph, and *total*: when it cannot
+    ///    settle a depth it returns two slots per instruction, which is an
+    ///    over-estimate rather than a guess.
+    /// 2. Every frame reserves that much when it starts, and `Vec::reserve`
+    ///    is relative to the current length, which is what the bound is
+    ///    relative to as well. Nothing shrinks the stack's capacity.
+    /// 3. A fiber's stack and its frames move together -- `park_current`
+    ///    takes both and `perform_switch` restores both -- so a frame always
+    ///    runs against the vector its reservation was made on, and a move
+    ///    carries the capacity with it.
+    ///
+    /// **Checked, not argued.** `--features verify-slots` compares the bound
+    /// against what the interpreter actually does, and the conformance suite
+    /// runs all 829 programs under it. The first version of the bound failed
+    /// that check in 55 places; this one passes in none.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn push_reserved(&mut self, value: Value) {
+        debug_assert!(
+            self.stack.len() < self.stack.capacity(),
+            "pushed past the room the frame reserved"
+        );
+        let len = self.stack.len();
+        // SAFETY: as documented above.
+        unsafe {
+            ::core::ptr::write(self.stack.as_mut_ptr().add(len), value);
+            self.stack.set_len(len + 1);
+        }
+    }
+
+    /// Two of [`Vm::push_reserved`], for the fused loads that push a pair.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn push_reserved_pair(&mut self, first: Value, second: Value) {
+        debug_assert!(
+            self.stack.len() + 1 < self.stack.capacity(),
+            "pushed past the room the frame reserved"
+        );
+        let len = self.stack.len();
+        // SAFETY: as documented on `push_reserved`; the bound counts both.
+        unsafe {
+            let at = self.stack.as_mut_ptr().add(len);
+            ::core::ptr::write(at, first);
+            ::core::ptr::write(at.add(1), second);
+            self.stack.set_len(len + 2);
+        }
+    }
+
     /// What `System.print` has written so far.
     pub fn output_str(&self) -> &str {
         ::core::str::from_utf8(&self.output).unwrap_or("<not utf-8>")
@@ -1554,6 +1620,9 @@ impl Vm {
             return Err(RuntimeError::new("Stack overflow."));
         }
         let target = self.call_target(closure)?;
+        // **The frame's room, once.** Every push inside it then writes
+        // without testing the capacity; see `Vm::push_reserved`.
+        self.stack.reserve(target.max_slots);
         #[cfg(feature = "verify-slots")]
         let entry_len = self.stack.len();
         self.frames.push(Frame {
@@ -1600,6 +1669,7 @@ impl Vm {
         };
         Ok(CallTarget {
             chunk: function.chunk.clone(),
+            max_slots: function.max_slots,
             arity: function.arity,
             module: function.module,
             field_offset: function.field_offset as u16,
@@ -1979,6 +2049,7 @@ impl Vm {
                 stack.push(value);
             }
             let target = self.call_target(entry)?;
+            stack.reserve(target.max_slots);
             #[cfg(feature = "verify-slots")]
             let entry_len = stack.len();
             frames.push(Frame {
@@ -2332,19 +2403,15 @@ impl Vm {
                 if let Some(frame) = self.frames.last() {
                     let entry_len = frame.entry_len;
                     if let Some(function) = self.function_of(frame.closure) {
-                        // A function the analysis could not bound would
-                        // simply keep the old behaviour; across the 829
-                        // conformance programs there are none.
-                        if let Some(room) = function.max_slots {
-                            // **Relative to where the frame started**, which
-                            // is what `Vec::reserve` is relative to as well.
-                            if self.stack.len() > entry_len + room {
-                                std::eprintln!(
-                                    "SLOTS-OVER fn '{}' grew {} past a bound of {room}",
-                                    function.name,
-                                    self.stack.len() - entry_len,
-                                );
-                            }
+                        let room = function.max_slots;
+                        // **Relative to where the frame started**, which is
+                        // what `Vec::reserve` is relative to as well.
+                        if self.stack.len() > entry_len + room {
+                            std::eprintln!(
+                                "SLOTS-OVER fn '{}' grew {} past a bound of {room}",
+                                function.name,
+                                self.stack.len() - entry_len,
+                            );
                         }
                     }
                 }
@@ -2354,14 +2421,14 @@ impl Vm {
                 code::CONSTANT => {
                     let index = unsafe { *ip } as usize;
                     ip = unsafe { ip.add(1) };
-                    self.stack.push(constants[index]);
+                    self.push_reserved(constants[index]);
                 }
-                code::NULL => self.stack.push(Value::NULL),
-                code::FALSE => self.stack.push(Value::FALSE),
-                code::TRUE => self.stack.push(Value::TRUE),
+                code::NULL => self.push_reserved(Value::NULL),
+                code::FALSE => self.push_reserved(Value::FALSE),
+                code::TRUE => self.push_reserved(Value::TRUE),
                 code::LOAD_LOCAL => {
                     let slot = Chunk::inline_operand(unit) as usize;
-                    self.stack.push(self.stack[base + slot]);
+                    self.push_reserved(self.stack[base + slot]);
                 }
                 // **The fused pairs.** Each occupies exactly the bytes of the
                 // two instructions it replaces, so the operands sit where they
@@ -2380,8 +2447,7 @@ impl Vm {
                     // between them a fifth of everything the benchmarks
                     // execute, so the second test is worth removing even
                     // though each one is only a compare and a branch.
-                    let pair = [self.stack[base + slot], constants[index]];
-                    self.stack.extend_from_slice(&pair);
+                    self.push_reserved_pair(self.stack[base + slot], constants[index]);
                 }
                 code::LOAD_LOCAL_PAIR => {
                     let first = Chunk::inline_operand(unit) as usize;
@@ -2405,7 +2471,7 @@ impl Vm {
                         true => a,
                         false => self.stack[base + second],
                     };
-                    self.stack.extend_from_slice(&[a, b]);
+                    self.push_reserved_pair(a, b);
                 }
                 code::STORE_FIELD_THIS_POP => {
                     let index = Chunk::inline_operand(unit) as usize;
@@ -2426,7 +2492,7 @@ impl Vm {
                 code::LOAD_MODULE_VAR => {
                     let index = unsafe { *ip } as usize;
                     ip = unsafe { ip.add(1) };
-                    self.stack.push(self.modules[module].values[index]);
+                    self.push_reserved(self.modules[module].values[index]);
                 }
                 code::STORE_MODULE_VAR => {
                     let index = unsafe { *ip } as usize;
@@ -2788,6 +2854,7 @@ impl Vm {
                                 frame.ip = caller_ip;
                                 frame.chunk = Some(caller_chunk);
                             }
+                            self.stack.reserve(target.max_slots);
                             #[cfg(feature = "verify-slots")]
                             let entry_len = self.stack.len();
                             self.frames.push(Frame {

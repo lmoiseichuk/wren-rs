@@ -853,9 +853,18 @@ impl Chunk {
         Some(deepest as usize)
     }
 
-    /// This chunk's own [`Chunk::max_stack`].
-    pub fn max_slots(&self) -> Option<usize> {
-        Chunk::max_stack(&self.code)
+    /// This chunk's own [`Chunk::max_stack`], as a number the caller can use.
+    ///
+    /// **Total, because the interpreter writes on the strength of it.** When
+    /// the analysis cannot settle a depth it says so, and this turns that into
+    /// two slots per instruction -- a real upper bound, since the widest
+    /// instruction pushes two and most push one or none. That is far too much
+    /// to reserve for a large function, and it is never reached: across the
+    /// 829 conformance programs the analysis settles every function. Having a
+    /// number rather than an `Option` is what keeps the branch out of the
+    /// interpreter's push.
+    pub fn max_slots(&self) -> usize {
+        Chunk::max_stack(&self.code).unwrap_or(2 * self.code.len())
     }
 
     /// Every offset in `code` that some jump can land on.

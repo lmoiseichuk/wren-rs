@@ -894,13 +894,15 @@ mod layout {
 #[derive(Debug)]
 pub struct ObjFn {
     pub chunk: Rc<Chunk>,
-    /// The deepest this function can drive the stack above its frame base,
-    /// or `None` when [`Chunk::max_stack`] could not establish one.
+    /// The deepest this function can drive the stack above where its frame
+    /// starts; see [`Chunk::max_slots`].
     ///
     /// **So a frame can be given its room once**, instead of every push
-    /// testing for it. `None` means the interpreter reserves nothing and
-    /// keeps testing, which is what it did before this existed.
-    pub max_slots: Option<usize>,
+    /// testing for it. The interpreter reserves this much when the frame
+    /// starts and then writes without checking, which is only sound because
+    /// the number is an upper bound and is checked against 829 programs --
+    /// see the `verify-slots` feature.
+    pub max_slots: usize,
     pub arity: usize,
     pub num_upvalues: usize,
     /// For error messages and stack traces.
