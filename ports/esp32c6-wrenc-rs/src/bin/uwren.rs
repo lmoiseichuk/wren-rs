@@ -23,10 +23,13 @@ use wren::Vm;
 
 #[path = "../appdesc.rs"]
 mod appdesc;
-use appdesc as _;
 
-/// 8,192 bytes, which is a CH32V006's whole RAM.
-const HEAP_BYTES: usize = 48 * 1024;
+/// The whole heap this program gets -- there is no other allocator, so this is
+/// the RAM figure a board has to meet. `fib` peaks at 11,464 bytes of it (run
+/// the program and read the `peak` column), so 16 KiB is the smallest round
+/// size that holds it. A CH32V006 has 8,192 bytes, and that is still 3.3 KiB
+/// short: see `doc/wren-rs/memory.md` for where the excess goes.
+const HEAP_BYTES: usize = 16 * 1024;
 const HEAP_UNITS: usize = HEAP_BYTES / core::mem::size_of::<Unit>();
 
 #[global_allocator]

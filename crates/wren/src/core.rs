@@ -283,12 +283,18 @@ pub fn install(vm: &mut Vm) {
     install_bool(vm);
     install_null(vm);
     install_string(vm);
+    #[cfg(feature = "str_extras")]
     install_string_extras(vm);
+    #[cfg(feature = "str_views")]
     install_string_views(vm);
+    #[cfg(feature = "num_extras")]
     install_num_extras(vm);
+    #[cfg(feature = "sequence")]
     install_sequence(vm);
     install_list(vm);
+    #[cfg(feature = "list_extras")]
     install_list_extras(vm);
+    #[cfg(feature = "map")]
     install_map(vm);
     install_range(vm);
     install_system(vm);
@@ -853,6 +859,7 @@ fn strings_equal(vm: &Vm, left: Value, right: Value) -> bool {
 }
 
 /// The rest of `Num`.
+#[cfg(feature = "num_extras")]
 fn install_num_extras(vm: &mut Vm) {
     let class = vm.num_class;
 
@@ -1147,6 +1154,7 @@ fn bitwise(vm: &Vm, at: usize, operation: fn(u32, u32) -> u32) -> Result<Value, 
 }
 
 /// The rest of `String`.
+#[cfg(feature = "str_extras")]
 fn install_string_extras(vm: &mut Vm) {
     let class = vm.string_class;
 
@@ -1438,6 +1446,7 @@ fn code_point_at(bytes: &[u8], at: usize) -> Option<char> {
 /// sequence is a real question with the answer -1. Numbering code points
 /// consecutively would make `s.codePoints[i]` and `s[i]` disagree about what
 /// `i` means, which is worse than an occasional -1.
+#[cfg(feature = "str_views")]
 fn install_string_views(vm: &mut Vm) {
     let class = vm.string_byte_sequence_class;
 
@@ -1582,6 +1591,7 @@ fn string_text(vm: &Vm, value: Value) -> alloc::string::String {
 /// `List` overrides several of them with direct versions, because going
 /// through the protocol to read an element it could index costs a method call
 /// per element and lists are where that shows.
+#[cfg(feature = "sequence")]
 fn install_sequence(vm: &mut Vm) {
     let class = vm.sequence_class;
     static SEQUENCE: &[(&str, Primitive)] = &[
@@ -1746,10 +1756,12 @@ fn install_sequence(vm: &mut Vm) {
 
     ];
     define_all(vm, class, SEQUENCE);
+    #[cfg(feature = "sequence")]
     install_lazy_sequences(vm);
 }
 
 /// The lazy views. Each holds its source and delegates the protocol to it.
+#[cfg(feature = "sequence")]
 fn install_lazy_sequences(vm: &mut Vm) {
     // `map`: same iteration, transformed values.
     let class = vm.map_sequence_class;
@@ -2032,6 +2044,7 @@ fn install_list(vm: &mut Vm) {
 /// costs a compile of several hundred lines at every start-up — 33 KB of
 /// compiler stack on the C6 — so here they are primitives on the types that
 /// need them.
+#[cfg(feature = "list_extras")]
 fn install_list_extras(vm: &mut Vm) {
     let class = vm.list_class;
 
@@ -2300,6 +2313,7 @@ fn resolve_index(index: Num, length: usize) -> Result<usize, RuntimeError> {
 }
 
 /// `Map`, and the `MapEntry` its iteration yields.
+#[cfg(feature = "map")]
 fn install_map(vm: &mut Vm) {
     let class = vm.map_class;
 

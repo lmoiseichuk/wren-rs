@@ -43,7 +43,36 @@ required-features = ["profile", "std"]
 libm = { version = "0.2", optional = true }
 
 [features]
-default = ["std", "compiler"]
+default = ["std", "compiler", "core_full"]
+# **The core library, in pieces a small target can decline.**
+#
+# All of these are on by default, because the published measurements and the
+# 829-test suite are full Wren. A firmware turns them off by taking
+# `default-features = false` and naming only what it needs -- which is what
+# `uwren` does.
+#
+# Each is one installer function, measured on the bytecode-only `-Os` image:
+core_full = [
+    "str_extras",
+    "str_views",
+    "list_extras",
+    "num_extras",
+    "sequence",
+    "map",
+]
+# `String`'s second half: splitting, replacing, padding, case. 11,320 B.
+str_extras = []
+# `bytes` and `codePoints`, which are sequences over a string. 2,258 B.
+str_views = []
+# `List` beyond indexing and `add`: sorting, joining, slicing. 5,658 B.
+list_extras = []
+# `Num`'s conversions and the bitwise operators.
+num_extras = []
+# The `Sequence` protocol and its lazy views -- `map`, `where`, `take`,
+# `skip`. 5,502 B, of which the lazy half is 2,264 B.
+sequence = []
+# Maps. A sensor that reports a number has no use for a hash table.
+map = []
 # **Slot tables in blocks, so a table can give memory back after a spike.**
 # A flat table only grows: freeing a slot returns it to a free list, not to
 # the allocator, so a program that builds something large and drops it keeps

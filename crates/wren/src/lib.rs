@@ -73,6 +73,14 @@
 #![deny(unsafe_code)]
 // Kilobytes, not megabytes: anything unused is flash somebody is paying for.
 #![deny(dead_code)]
+// **A reduced core leaves its helpers behind, and that is not rot.**
+// `install_string_extras` and the rest are cargo features, so a build that
+// declines one compiles out every call to the helpers only it used --
+// `trim_set`, `join_sequence`, `map_entries`. The full build still denies
+// dead code, which is where the lint earns its keep; a reduced one would
+// otherwise need a `cfg` on each of twenty-nine helpers, each naming the
+// exact set of features that reaches it, and one of those would be wrong.
+#![cfg_attr(not(feature = "core_full"), allow(dead_code))]
 
 pub mod handle;
 #[cfg(feature = "compiler")]

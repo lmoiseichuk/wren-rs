@@ -24,7 +24,13 @@ publish = false
 # **32-bit numbers.** Not Wren -- see `crates/wren`'s own `f32` feature and
 # `doc/wren-rs/design.md`. Built here so the cost and the saving can be
 # measured on the part rather than argued about.
-default = []
+# **`main.rs` needs the whole core and `uwren.rs` does not**, and a cargo
+# feature is resolved per package rather than per binary -- so the default
+# carries the full core for the benchmark runner, and the tailored image is
+# `cargo build --bin uwren --no-default-features`. That is the build the
+# footprint numbers in `doc/wren-rs/memory.md` come from.
+default = ["core_full"]
+core_full = ["wren/core_full"]
 f32 = ["wren/f32"]
 
 [dependencies]
@@ -32,7 +38,7 @@ f32 = ["wren/f32"]
 # is handed `.wrenc` built on a workstation, so the lexer and the parser are
 # never linked. What this package measures is how much of the firmware they
 # were.
-wren = { path = "../../crates/wren", default-features = false, features = ["alloc", "nofp"] }
+wren = { path = "../../crates/wren", default-features = false, features = ["uwren"] }
 esp-hal = { version = "1.2", features = ["esp32c6", "unstable"] }
 esp-alloc = { version = "0.11", features = ["esp32c6"] }
 esp-println = { version = "0.16", features = ["esp32c6"] }

@@ -885,6 +885,9 @@ impl Vm {
             module.define(&variable, value);
         }
         self.modules.push(module);
+        // Only the compiler arm below uses this, and a build without one is
+        // warned about an unused binding otherwise.
+        #[cfg(feature = "compiler")]
         let index = self.modules.len() - 1;
         // The name was set above, *before* compiling, so a module that imports
         // itself finds the partially built one rather than looping forever.

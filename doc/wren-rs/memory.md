@@ -498,6 +498,66 @@ the day someone adds a type without a niche, and says in its message that this
 is when the bitmap is worth building. It demonstrates its own check can fail,
 so it is not a test that always passes.
 
+### Leaving the unused core out of the image
+
+A `.wrenc` file carries a symbol table, and that table *is* a manifest: it lists
+every signature the program will ever send. `fib` asks for ten core methods.
+Everything else in the core -- `String`'s search and slicing, `List`'s sort and
+insert, `Sequence`'s whole iterator protocol, `Map` -- is built at start-up,
+occupies flash for its code and heap for its `ObjFn`s, and is then never called.
+
+Two ways to not pay for it, and they save different things:
+
+  - **`Vm::with_core_methods(&manifest.signatures)`** filters `define` at
+    run time. The code is still in flash; the methods are never allocated, so
+    it saves heap.
+  - **Cargo features** leave the installers out of the build entirely. That
+    saves flash, and the heap saving comes with it.
+
+Both are in. The features are `str_extras`, `str_views`, `list_extras`,
+`num_extras`, `sequence` and `map`, with `core_full` turning on all six and
+carried by the crate's default. Measured on `ports/esp32c6-wrenc-rs`'s `uwren`
+binary, which is `fib` and nothing else:
+
+| build | `wren` in flash | whole image |
+|---|---|---|
+| `--features uwren,core_full` | 83,296 B | 189,008 B |
+| `--features uwren` | **52,638 B** | **161,872 B** |
+| saving | 30,658 B | 27,136 B |
+
+**52,638 B fits a CH32V006's 63,488 B of flash**, which is the first time any
+build of this VM has. The crate figure sums the symbols mangled into the `wren`
+crate; attributing generic instantiations more loosely puts it 16,784 B higher,
+so the *delta* is the trustworthy half of that column and the absolute is a
+floor. The image figure needs no board -- `espflash save-image --chip esp32c6`
+writes it to a file.
+
+The reduced core still runs: `fib` prints 46368 and the suite is unchanged,
+because the suite builds with `core_full`.
+
+#### What a fixed heap then says about RAM
+
+`uheap` is the other half -- a fixed buffer with no `alloc` under it, so the
+peak it reports is the whole RAM requirement rather than a residual. Running
+`fib` through it with the reduced core, at a 16 KiB `HEAP_BYTES`:
+
+| moment | used | peak |
+|---|---|---|
+| after the VM is built | 7,296 B | 7,300 B |
+| after the program loads | 8,284 B | 8,548 B |
+| after the run | 11,464 B | 11,464 B |
+
+Of which 2,785 B is objects; 185 block records are another 740 B. The core
+split took the VM's resident set from 8,428 B to 7,296 B, and the run adds
+3.2 KB on top: `fib` recurses, the `stack` and `frames` vectors double as they
+grow, and a doubling allocates the new block before releasing the old -- which
+`uheap` will not split, so each one leaves a hole behind.
+
+**So flash fits a CH32V006 and RAM does not**, by 3,272 bytes against its 8,192.
+The gap is not in the core any more; it is in how the VM's two growing vectors
+are sized. Reserving them once at a depth the manifest can imply, rather than
+doubling into them, is where the next measurement should go.
+
 ### What is left worth building
 
 Nothing from the list that used to stand here: chunked slot tables are built
@@ -511,3 +571,8 @@ largest single lever left on memory is the one already measured and already
 optional: `--features f32` halves every field, every list element and every
 map entry, for a `Num` that is no longer Wren's. See the f32 table in the
 README.
+
+On a part small enough for the fixed heap above to be the whole of RAM, the
+lever is a different one and it is named at the end of the previous section:
+the `stack` and `frames` vectors doubling their way to a size a manifest could
+have told them at start-up.

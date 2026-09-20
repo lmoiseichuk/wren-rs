@@ -22,7 +22,6 @@ use esp_println::println;
 use wren::Vm;
 
 mod appdesc;
-use appdesc as _;
 
 const HEAP_BYTES: usize = 320 * 1024;
 
