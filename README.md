@@ -30,9 +30,18 @@ says why at each site.
 | ESP32-C3 | 4 MB | 400 KB | comfortable |
 | ESP32-C6 | 4 MB | 512 KB | the development board, comfortable |
 
-**The measured floor is 22,920 B resident**, before a line of user code runs
-and with the compiler left out of the image entirely. That fits an ESP32 with
-room to spare and does not fit a CH32V006 at all.
+**The measured floor is 23,176 B resident** for full Wren, before a line of
+user code runs and with the compiler left out of the image entirely; 21,316 B
+with `nofp`. That fits an ESP32 with room to spare and does not fit a CH32V006.
+
+**Tailored to one program it is 4,008 B.** A `.wrenc` file names every method
+its code can call and every variable it can reach, so a VM can be built with
+only those -- and a build step can freeze the resulting classes, method tables
+and names into the image rather than constructing them in RAM at start-up. On
+`fib` that leaves nothing of the core in the heap at all, and a run peaking at
+8,184 B against a CH32V006's 8,192. See
+**[`doc/wren_native.md`](doc/wren_native.md)** and
+**[`doc/wren-rs/memory.md`](doc/wren-rs/memory.md)**.
 
 ### µwren
 
@@ -140,13 +149,14 @@ identical constants on every implementation. Method and caveats:
 
 | benchmark | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| `binary_trees` depth 9 | 7.625 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 13.497 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.489 s | **0.130 s** | 0.154 s |
-| `method_call` | 1.952 s | **0.350 s** | 1.748 s |
-| **VM resident** | **22,920 B** | 83,036 B | — |
+| `binary_trees` depth 9 | 5.717 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 9.727 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.430 s | **0.130 s** | 0.154 s |
+| `method_call` | 1.598 s | **0.350 s** | 1.748 s |
+| **VM resident** | **23,176 B** | 83,036 B | — |
 
-**Four to seven times slower than C, and 72% smaller resident.** The speed is
+**Between two and a half and four and a half times slower than C, and 72%
+smaller resident.** The speed is
 the honest cost of reaching objects by a bounds-checked index rather than a
 pointer, which is what keeps `unsafe` out of the object model; the memory is
 what
@@ -155,8 +165,12 @@ compiling no core library at start-up buys.
 **Judged by work, not only by time.** The chip's performance counter reports
 instructions retired, which does not move when the code moves — so a change
 that removes work can be told from one that merely landed better. Every change
-here is decided that way, and three that looked obviously right were thrown out
-because the work went up.
+here is decided that way, and rather more of them have been thrown out than
+kept: the most recent pass over the interpreter kept nine and refused eleven,
+with the numbers for all twenty in
+**[`doc/wren-rs/profiling.md`](doc/wren-rs/profiling.md)**. Four of the
+refusals removed a cost the compiler had already removed, and two removed a
+test that was redundant as a predicate and load-bearing as a filter.
 
 **Read the seconds to about two percent.** The board is exact -- the same image gives
 the same time to the microsecond, three flashes running -- but *where the
@@ -169,35 +183,37 @@ the *data* changes nothing at all, and the chip's performance counter that
 settles both are in
 **[`doc/wren-rs/profiling.md`](doc/wren-rs/profiling.md)**.
 
-### `f32` against `f64`
+### The three numeric modes
 
-`Num` is a double in Wren, and `--features f32` makes it a single. Same board,
-same commit, same programs:
+`Num` is a double in Wren. `--features f32` makes it a single and `--features
+nofp` makes it a 32-bit integer. Same board, same commit, same programs, one
+run each:
 
-*Measured before branch-target padding was adopted, so the `f64` column reads
-3-4% slower than the table above; the comparison is between the two columns and
-is unaffected.*
-
-| | `f64` | `f32` | |
+| | `f64` | `f32` | `nofp` |
 |---|---|---|---|
-| `binary_trees` | 9.104 s | **8.207 s** | −9.9% |
-| `fib` | 16.966 s | **15.905 s** | −6.3% |
-| `list_build` | 0.579 s | **0.525 s** | −9.3% |
-| `method_call` | 2.519 s | **2.420 s** | −3.9% |
-| `binary_trees` peak | 117,384 B | **94,524 B** | −19.5% |
-| `list_build` peak | 132,844 B | **67,208 B** | −49.4% |
-| VM resident | 22,920 B | **22,632 B** | −1.3% |
-| image | 465,456 B | **447,280 B** | −3.9% |
+| `binary_trees` | 5.717 s | 5.308 s | **5.247 s** |
+| `fib` ×5 | 9.727 s | 8.805 s | **7.930 s** |
+| `list_build` | 0.430 s | 0.389 s | **0.267 s** |
+| `method_call` | 1.598 s | 1.533 s | **1.492 s** |
+| `binary_trees` peak | 115,024 B | 92,164 B | **92,000 B** |
+| `list_build` peak | 132,288 B | 66,652 B | **66,632 B** |
+| VM resident | 23,176 B | 22,888 B | **21,316 B** |
+| image | 471,552 B | 455,664 B | **399,872 B** |
 
-Faster *and* smaller, because `riscv32imac` has neither the `F` nor the `D`
-extension — both widths are software and the narrower one is less work. A
-`Value` halves to four bytes, which is why `list_build`, whose whole memory is
-a list of numbers, halves with it.
+Both narrower modes are faster *and* smaller, because `riscv32imac` has neither
+the `F` nor the `D` extension — every width is software and the narrow ones are
+less work. A `Value` halves to four bytes, which is why `list_build`, whose
+whole memory is a list of numbers, halves with it.
 
-**It is not Wren, and the cost is exact rather than vague.** An `f32` is exact
+**Neither is Wren, and the cost is exact rather than vague.** An `f32` is exact
 on integers only to 2^24, so `list_build` — which sums to 49,995,000 — prints
-**49,992,896**, and upstream's suite goes from 829 of 829 to **798**. Off by
-default; conformance and every other table here are `f64`.
+**49,992,896**, and upstream's suite goes from 829 of 829 to **798**. `nofp`
+prints 49,995,000 correctly, an `i32` having room for it, but has no fractions
+at all and caps at 2^30. Both are off by default; conformance and every other
+table here are `f64`.
+
+`nofp` is what a part with no FPU and no room for one would run, and it is the
+mode [`doc/wren_native.md`](doc/wren_native.md)'s tailored build uses.
 
 ### Memory, from the first run on hardware
 
@@ -214,6 +230,37 @@ default; conformance and every other table here are `f64`.
 profiler. The two steps that were *guessed* at — reference counting and a young
 generation — are the two that are switched off:
 **[`doc/wren-rs/memory.md`](doc/wren-rs/memory.md)**.
+
+*(The rows are a history and each was measured when it landed; the current
+figures are the table above. Resident has since risen to 23,176 B, because a
+class slot and a method table each grew a word to be able to point into flash
+— which is what the tailored build below spends to save four times as much.)*
+
+### Tailoring the VM to one program
+
+A `.wrenc` file carries a manifest: every method signature its code can call
+and every module variable it can name. That is enough to build a VM with only
+the core those need, and enough for a build step to compute the resulting
+classes, method tables and names *at image build time* and compile them in as
+`static` data. `tools/make_native_executable.sh --uwren` does both.
+
+On `fib`, on the same board, with a fixed heap and no allocator underneath it:
+
+| | bytes |
+|---|---|
+| the core's classes, tables and names in RAM | **0** |
+| heap in use once the VM is built | 4,008 B |
+| heap at the run's peak | 8,184 B |
+| image | 170,832 B |
+
+**Nothing of the core is in the heap.** Twenty-one classes, their flattened
+method tables and their names all live in `.rodata`; what the heap holds is the
+slots that address them, the VM's own vectors, and whatever the program
+computes. A CH32V006 has 8,192 B of RAM and 63,488 B of flash — the heap peak
+now fits it, though the `Vm` struct and the call stack sit outside that figure.
+
+How it is built, how to test it on the host without a board, and the one way to
+get it wrong: **[`doc/wren_native.md`](doc/wren_native.md)**.
 
 ### The ceiling on garbage, and why a small part pays nothing for it
 
