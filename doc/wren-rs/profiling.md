@@ -710,6 +710,48 @@ size and every percentage above it was inflated by the same factor. The
 refusal stands on the corrected figures; it stood on the wrong ones by
 accident.*
 
+### The loop's live set is the thing that costs, not the arm
+
+Four changes that each remove work were measured and refused, and they refuse
+for the same reason -- so it is worth stating once rather than four times.
+
+| change | `fib` | `method_call` | `binary_trees` |
+|---|---|---|---|
+| arms for the unused opcode space | — | +1.82% | — |
+| the code slice cached, bounds check kept | +0.31% | +0.31% | — |
+| the bounds check dropped, slice not cached | — | +1.04% | — |
+| `Pop` and `JumpIf` popping unchecked | −0.44% | −0.26% | **+3.48%** |
+| the dead length dropped from the slice | ±0.000% | ±0.000% | **+3.67%** |
+
+**The last two are the instructive pair.** Both strictly remove work from an
+arm. Both leave `fib` and `method_call` unchanged or slightly better -- and
+both cost `binary_trees` three and a half per cent.
+
+And `binary_trees` is not being noisy. Padding every branch target to 16 bytes
+instead of 4 -- which moves every address in the image and changes nothing
+else -- moves its count by **700 instructions in 411.8 million**, 0.00017%.
+The same sweep moves `fib` by five. Instructions retired is address-invariant
+to five decimal places, so a three per cent difference is a real three per
+cent of work.
+
+What separates `binary_trees` from the other two is what it does *between*
+instructions: it is the one that allocates, collects, and switches chunks
+through the constructor path rather than the ordinary call path. A change to
+the set of values the loop keeps live is free on a benchmark that stays in
+the loop and expensive on one that keeps leaving it.
+
+**So the pair to measure against is `fib` and `method_call`, and the one that
+decides is `binary_trees`.** The first two reproduce to within twenty
+instructions across every build in this session and say whether an arm got
+cheaper; the third says whether the loop as a whole got worse, and it is the
+one that has refused every change that looked free.
+
+*An earlier reading of this data blamed a register-allocation cliff in the
+dispatch -- five instructions appearing before the fetch. That was wrong: the
+loop branches back past them, to the fetch itself, and only the two
+chunk-switch paths pay them. The disassembly has to be read for where the
+loop re-enters, not from the top of the block.*
+
 ---
 
 ## The protocol, as it now stands
