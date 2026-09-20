@@ -1690,6 +1690,28 @@ impl Heap {
         }
         row!("Class", self.classes);
         row!("String", self.strings);
+        // The two that decide what a static core would have to replace: the
+        // struct itself against the tables hanging off it.
+        {
+            let mut methods = 0;
+            let mut statics = 0;
+            let mut structs = 0;
+            for index in 0..self.classes.slots() {
+                if let Some(Some(class)) = self.classes.slot(index) {
+                    structs += core::mem::size_of::<ObjClass>();
+                    methods += class.methods.footprint();
+                    statics += class.static_fields.capacity() * core::mem::size_of::<Value>();
+                }
+            }
+            out.push((" of which struct", core::mem::size_of::<ObjClass>(), structs));
+            out.push((" of which methods", 0, methods));
+            out.push((" of which statics", 0, statics));
+            out.push((
+                " String slot is",
+                core::mem::size_of::<Option<ObjString>>(),
+                0,
+            ));
+        }
         row!("Fn", self.functions);
         row!("Closure", self.closures);
         row!("List", self.lists);

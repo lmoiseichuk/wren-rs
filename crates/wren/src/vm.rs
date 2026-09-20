@@ -1197,21 +1197,24 @@ impl Vm {
     /// already hold their own definitions of things like `toString`.
     fn inherit_methods(&mut self, child_id: ObjectId, parent: ObjectId) {
         let inherited = match self.heap.class(parent) {
-            Some(parent) => parent.methods.clone(),
+            Some(parent) => parent.methods.to_vec(),
             _ => return,
         };
         let Some(child) = self.heap.class_mut(child_id) else {
             return;
         };
-        if child.methods.len() < inherited.len() {
-            child
-                .methods
-                .resize(inherited.len(), crate::object::NO_METHOD);
+        // A class whose table is in flash was flattened when the image was
+        // built, so there is nothing to copy down into it.
+        let Some(entries) = child.methods.as_mut() else {
+            return;
+        };
+        if entries.len() < inherited.len() {
+            entries.resize(inherited.len(), crate::object::NO_METHOD);
         }
         let mut copied: Vec<ObjectId> = Vec::new();
         for (symbol, entry) in inherited.iter().enumerate() {
-            if child.methods[symbol] == crate::object::NO_METHOD {
-                child.methods[symbol] = *entry;
+            if entries[symbol] == crate::object::NO_METHOD {
+                entries[symbol] = *entry;
                 // Copying an entry down makes the child refer to the parent's
                 // closure as well, which the barrier has to hear about.
                 if let Some(closure) = crate::object::entry_closure(*entry) {
@@ -1295,7 +1298,9 @@ impl Vm {
         // number, so it should be the honest one.
         for (_, id) in &classes {
             if let Some(class) = self.heap.class_mut(*id) {
-                class.methods.shrink_to_fit();
+                if let Some(entries) = class.methods.as_mut() {
+                    entries.shrink_to_fit();
+                }
             }
         }
     }

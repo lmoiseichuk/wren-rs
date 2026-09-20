@@ -178,7 +178,7 @@ impl Object {
         let inner = match self {
             Object::Class(class) => {
                 core::mem::size_of::<ObjClass>()
-                    + class.methods.capacity() * core::mem::size_of::<u32>()
+                    + class.methods.footprint()
             }
             Object::Instance(instance) => instance.count() * core::mem::size_of::<Value>(),
             Object::List(list) => list.elements.capacity() * core::mem::size_of::<Value>(),
@@ -400,7 +400,7 @@ pub struct ObjClass {
     /// table. **Closures decode with no extra load**, which is what makes this
     /// preferable to paging the symbol space -- that would have saved slightly
     /// more and put a second dependent load on every single call.
-    pub methods: Vec<u32>,
+    pub methods: Methods,
     /// The class's attributes, or null when it has none the runtime can see.
     ///
     /// Built at compile time and attached when the class is created. Only
@@ -430,7 +430,7 @@ impl ObjClass {
             superclass,
             num_fields: 0,
             metaclass: None,
-            methods: Vec::new(),
+            methods: Methods::new(),
             attributes: Value::NULL,
             static_fields: Vec::new(),
         }
@@ -442,10 +442,16 @@ impl ObjClass {
     /// primitive needs the VM's primitive table, which a class cannot see.
     /// [`Vm::bind_primitive`](crate::vm::Vm) and `core::define` do the packing.
     pub fn define(&mut self, symbol: usize, entry: u32) {
-        if self.methods.len() <= symbol {
-            self.methods.resize(symbol + 1, NO_METHOD);
+        // A table in flash is already complete; see [`Methods`]. Nothing
+        // should reach here with one, and silently doing nothing is better
+        // than a panic in a firmware -- `Heap::class_mut` is the guard.
+        let Some(entries) = self.methods.as_mut() else {
+            return;
+        };
+        if entries.len() <= symbol {
+            entries.resize(symbol + 1, NO_METHOD);
         }
-        self.methods[symbol] = entry;
+        entries[symbol] = entry;
     }
 
     /// The packed entry bound to a symbol; `NO_METHOD` when there is none.
@@ -457,6 +463,74 @@ impl ObjClass {
         match self.methods.get(symbol) {
             Some(entry) => *entry,
             None => NO_METHOD,
+        }
+    }
+}
+
+/// A class's method table, which may live in flash rather than in the heap.
+///
+/// **The whole point of the borrowed arm.** A tailored core's classes are
+/// decided when the image is built -- the same names, the same methods, the
+/// same symbol numbers on every boot -- so there is nothing about them that
+/// has to be built at start-up into RAM a small part does not have. Holding
+/// the table as a `&'static [u32]` is what lets an `ObjClass` be a `static`
+/// item in `.rodata` instead.
+///
+/// A borrowed table is immutable, and that is not a limitation but the
+/// invariant: a class whose table was computed at build time is already
+/// complete and already flattened, so nothing should be defining into it.
+/// [`Methods::as_mut`] returns `None` rather than quietly copying, and
+/// `Heap::class_mut` refuses a static class for the same reason, so the
+/// mutating paths never reach one.
+///
+/// Costs four bytes per *dynamic* class, for the discriminant, against the
+/// fifty-two a static one no longer occupies. One representation for both
+/// rather than a feature-gated pair: a second code path through the dispatch
+/// table is a worse thing to own than four bytes per class.
+#[derive(Debug)]
+pub enum Methods {
+    /// Computed when the image was built; lives in flash.
+    Static(&'static [u32]),
+    /// Built at start-up, and still being defined into.
+    Owned(Vec<u32>),
+}
+
+impl Methods {
+    /// An empty table, which is what every class starts with.
+    pub const fn new() -> Methods {
+        Methods::Owned(Vec::new())
+    }
+
+    /// The table for writing, or `None` when it is in flash.
+    pub fn as_mut(&mut self) -> Option<&mut Vec<u32>> {
+        match self {
+            Methods::Owned(entries) => Some(entries),
+            Methods::Static(_) => None,
+        }
+    }
+
+    /// What this table costs the heap: nothing at all when it is in flash.
+    pub fn footprint(&self) -> usize {
+        match self {
+            Methods::Owned(entries) => entries.capacity() * core::mem::size_of::<u32>(),
+            Methods::Static(_) => 0,
+        }
+    }
+}
+
+impl Default for Methods {
+    fn default() -> Methods {
+        Methods::new()
+    }
+}
+
+impl core::ops::Deref for Methods {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        match self {
+            Methods::Owned(entries) => entries,
+            Methods::Static(entries) => entries,
         }
     }
 }
@@ -891,7 +965,7 @@ impl Trace for ObjClass {
         //
         // A primitive is a Rust function pointer with no heap object behind
         // it, so only the closures are worth following.
-        for entry in &self.methods {
+        for entry in self.methods.iter() {
             if let Some(closure) = entry_closure(*entry) {
                 gray.push(closure);
             }
@@ -900,11 +974,13 @@ impl Trace for ObjClass {
 
     fn contents_size(&self) -> usize {
         // Boxed, so the struct itself is a separate allocation.
-        core::mem::size_of::<ObjClass>() + self.methods.capacity() * core::mem::size_of::<u32>()
+        core::mem::size_of::<ObjClass>() + self.methods.footprint()
     }
 
     fn settle(&mut self) {
-        self.methods.shrink_to_fit();
+        if let Some(entries) = self.methods.as_mut() {
+            entries.shrink_to_fit();
+        }
     }
 }
 

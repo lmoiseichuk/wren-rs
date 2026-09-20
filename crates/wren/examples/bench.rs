@@ -258,7 +258,7 @@ fn contents_detail(
         // it is still boxed.
         ObjectType::Class => match heap.class(id) {
             Some(class) => {
-                let (used, bytes, blocks) = pair(class.methods.len(), class.methods.capacity(), 4);
+                let (used, bytes, blocks) = pair(class.methods.len(), class.methods.footprint() / 4, 4);
                 (used + 56, bytes + 56, blocks + 1)
             }
             None => (0, 0, 0),
@@ -319,7 +319,7 @@ fn report_method_tables(vm: &wren::Vm) {
         let length = class.methods.len();
         longest = longest.max(length);
         today += length * ENTRY;
-        reserved += class.methods.capacity() * ENTRY;
+        reserved += class.methods.footprint();
         defined += class
             .methods
             .iter()
