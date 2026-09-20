@@ -2516,15 +2516,27 @@ impl Vm {
                     // one. The fast path can only *skip* work, never change an
                     // answer, which is what makes it safe to take before
                     // knowing the receiver's class.
-                    if byte == code::CALL && arity == 1 && symbol < self.num_ops.len() {
-                        let operation = self.num_ops[symbol];
+                    // **One bounds test, not a compare and then an index.**
+                    // `get` is the range check and the load together; the
+                    // separate `symbol < len` was the same test written twice.
+                    if byte == code::CALL && arity == 1 {
+                        let operation = match self.num_ops.get(symbol) {
+                            Some(operation) => *operation,
+                            None => NUM_OP_NONE,
+                        };
                         if operation != NUM_OP_NONE {
                             let top = self.stack.len();
                             // Receiver and argument, in the order the caller
                             // pushed them.
-                            let left = self.stack[top - 2].as_num();
-                            let right = self.stack[top - 1].as_num();
-                            if let (Some(a), Some(b)) = (left, right) {
+                            let left = self.stack[top - 2];
+                            let right = self.stack[top - 1];
+                            // **Tested first, extracted after.** `as_num`
+                            // gives an `Option<Num>`, which for a double has
+                            // no niche and so is sixteen bytes in memory --
+                            // two of them and a tuple match, on the hottest
+                            // path there is. See `Value::num_unchecked`.
+                            if left.is_num() && right.is_num() {
+                                let (a, b) = (left.num_unchecked(), right.num_unchecked());
                                 #[allow(clippy::float_cmp)]
                                 let value = match operation {
                                     // **Dividing by zero declines rather than

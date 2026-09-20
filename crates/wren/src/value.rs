@@ -292,9 +292,12 @@ impl Value {
     /// The number this holds, or `None` if it is not one.
     ///
     /// Upstream's `AS_NUM` does no checking and the caller is expected to have
-    /// tested first. Returning an `Option` instead costs nothing once inlined
-    /// and removes a whole class of mistake, so the unchecked form is not
-    /// offered.
+    /// tested first. Returning an `Option` instead removes a whole class of
+    /// mistake, and for every caller but one it costs nothing once inlined.
+    /// The exception is the interpreter's arithmetic fast path, which builds
+    /// two of them and matches the pair ten million times across the
+    /// benchmarks -- `Option<f64>` has no niche, so it is sixteen bytes and
+    /// lives in memory. That caller uses [`Value::num_unchecked`].
     #[cfg(not(feature = "nofp"))]
     pub fn as_num(self) -> Option<Num> {
         if self.is_num() {
@@ -312,6 +315,29 @@ impl Value {
         } else {
             None
         }
+    }
+
+    /// The number this holds, when [`Value::is_num`] has already said it does.
+    ///
+    /// **The one place the `Option` above is not free.** `Option<f64>` has no
+    /// niche, so it is sixteen bytes and lives in memory rather than a
+    /// register -- and the interpreter's arithmetic fast path builds two of
+    /// them and matches the pair on every call it takes, which across the
+    /// benchmarks is about ten million times. Testing both values first and
+    /// extracting after is the same work without the options.
+    ///
+    /// Nothing unsafe happens on a value that is not a number: the bits are
+    /// reinterpreted and the answer is some other number. That is a wrong
+    /// answer, which is why this is `pub(crate)` and has exactly one caller.
+    #[cfg(not(feature = "nofp"))]
+    pub(crate) fn num_unchecked(self) -> Num {
+        Num::from_bits(self.0)
+    }
+
+    /// See the note on the other arm; an arithmetic shift, as in `as_num`.
+    #[cfg(feature = "nofp")]
+    pub(crate) fn num_unchecked(self) -> Num {
+        (self.0 as i32) >> 1
     }
 
     /// The object handle this holds, or `None` if it is not one.
