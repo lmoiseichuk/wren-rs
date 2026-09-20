@@ -446,6 +446,16 @@ pub struct Vm {
     previous_end: usize,
     #[cfg(feature = "profile")]
     previous_chunk: usize,
+    /// How deep the frame stack was when the previous instruction was fetched.
+    ///
+    /// **Without this, a self-recursive call counts as an adjacent pair.** The
+    /// callee's first instruction is at `at == 0` because `ip` was reset, the
+    /// chunk is the same chunk, and `previous_end` is 0 -- so both of the
+    /// other guards pass and the `Call` appears to fall through into the body
+    /// it just entered. `previous_chunk` was added to kill exactly this and
+    /// only catches the cross-function case.
+    #[cfg(feature = "profile")]
+    previous_depth: usize,
 }
 
 impl Vm {
@@ -569,6 +579,8 @@ impl Vm {
             previous_end: usize::MAX,
             #[cfg(feature = "profile")]
             previous_chunk: 0,
+            #[cfg(feature = "profile")]
+            previous_depth: usize::MAX,
         };
         // `List`, `Map`, `Range` and `String` are sequences.
         for class in [list_class, map_class, range_class, string_class] {
@@ -1736,14 +1748,17 @@ impl Vm {
                 self.op_counts[byte as usize] += 1;
                 *self.line_ops.entry((chunk.line_at(at), byte)).or_insert(0) += 1;
                 let here = Rc::as_ptr(&chunk) as usize;
+                let depth = self.frames.len();
                 if self.previous_op != u16::MAX
                     && self.previous_end == at
                     && self.previous_chunk == here
+                    && self.previous_depth == depth
                 {
                     self.op_pairs[self.previous_op as usize * 256 + byte as usize] += 1;
                 }
                 self.previous_op = byte as u16;
                 self.previous_chunk = here;
+                self.previous_depth = depth;
             }
 
             match byte {
