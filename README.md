@@ -1,13 +1,29 @@
 # wren-rs
 
-Re-implementing [Wren](https://wren.io/) in Rust, small enough to embed in a
-microcontroller — and measured against MicroPython on the same hardware so the
-claim is a number rather than an opinion.
+Technically that is a Friday project which goes out of control for whole weekend.
+As I have several projects on ch32xxx and esp32cX I am looking something to
+replace MicroPython but a bit more modern then forth, lisp, basic or lua.
 
-Wren is a good candidate for this. It is a class-based scripting language with
-a compact bytecode VM, closures, fibers and a real garbage collector, and the
-reference implementation in C is about six thousand lines. Small, but not
-trivial: it is the smallest interesting target rather than a toy.
+The Squirrel/Quirrel was strong candidate but suddently [wren](https://github.com/wren-lang/wren)
+hit my attention.  Wren is a good candidate for this. It is a class-based 
+scripting language with a compact bytecode VM, closures, fibers and a real 
+garbage collector, and the reference implementation in C is about six thousand lines. 
+Small, but not trivial: it is the smallest interesting target rather than a toy.
+
+
+With Claude help porting to esp32c6 (as it was plugged)
+happened fast but memory consumption demonstrated higher then for MicroPython.
+
+And here everything goes under control, so now what is added:
+- rust version of wren
+- boot.wren / main.wren during start as Micropython does
+- nofp/fp32/fp64 support, on slow emulating platforms fp64 is no-go
+- bytecode generator
+- uWren - packing image (nostd) for your bytecode
+- memory shrinked to ch32v006 8KB and 62KB flash (see below)
+- ... something else, I do not remember
+
+Basically very early draft, still slower then original but not much. 
 
 ## What this is for
 
