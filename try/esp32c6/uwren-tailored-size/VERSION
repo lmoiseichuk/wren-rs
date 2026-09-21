@@ -1,0 +1,8 @@
+variant : uwren-tailored-size
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:23Z
+profile : size
+flags   : --no-default-features --features census
+file    : uwren
+bytes   : 392624
+what    : The small one: integers, no compiler, only the core methods fib's manifest asks for, and that core frozen into the image.

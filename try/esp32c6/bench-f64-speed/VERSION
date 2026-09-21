@@ -1,0 +1,8 @@
+variant : bench-f64-speed
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:25:59Z
+profile : speed
+flags   : (none)
+file    : esp32c6-wren-rs
+bytes   : 806904
+what    : Full Wren, doubles, compiler on the device. The benchmark runner, and the build every published speed number comes from.

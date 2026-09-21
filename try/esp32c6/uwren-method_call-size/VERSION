@@ -1,0 +1,8 @@
+variant : uwren-method_call-size
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:35Z
+profile : size
+flags   : --no-default-features --features census
+file    : method_call
+bytes   : 393196
+what    : Tailored image for method_call: integers, no compiler, only the core its manifest asks for, frozen into flash.

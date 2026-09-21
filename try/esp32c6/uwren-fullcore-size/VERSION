@@ -1,0 +1,8 @@
+variant : uwren-fullcore-size
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:24Z
+profile : size
+flags   : (none)
+file    : uwren
+bytes   : 456060
+what    : The same program carrying the whole core library, so the tailoring can be priced.

@@ -1,0 +1,8 @@
+variant : binary_trees-full
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:24:34Z
+profile : release
+flags   : --full
+file    : binary_trees
+bytes   : 761600
+what    : Full Wren as a host executable, with the program compiled in as bytecode.

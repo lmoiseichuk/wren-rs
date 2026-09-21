@@ -1,0 +1,8 @@
+variant : boot-compiler
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:29Z
+profile : size
+flags   : --features compiler
+file    : esp32c6-wren-boot
+bytes   : 596940
+what    : The same, with the compiler linked, which is what the compiler costs in flash.

@@ -1,0 +1,8 @@
+variant : bench-f32-speed
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:16Z
+profile : speed
+flags   : --features f32
+file    : esp32c6-wren-rs
+bytes   : 791388
+what    : Singles instead of doubles. Faster and smaller, and not Wren: exact on integers only to 2^24.

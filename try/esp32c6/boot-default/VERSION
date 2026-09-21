@@ -1,0 +1,8 @@
+variant : boot-default
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:26Z
+profile : size
+flags   : (none)
+file    : esp32c6-wren-boot
+bytes   : 476856
+what    : The smallest thing that starts a VM at all.

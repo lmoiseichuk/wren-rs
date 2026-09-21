@@ -19,8 +19,9 @@ And here everything goes under control, so now what is added:
 - boot.wren / main.wren during start as Micropython does
 - nofp/fp32/fp64 support, on slow emulating platforms fp64 is no-go
 - bytecode generator
-- uWren - packing image (nostd) for your bytecode
+- [b]uwren[/b] - packing image (bare metal / nostd) for your bytecode
 - memory shrinked to ch32v006 8KB and 62KB flash (see below)
+- primitive but working allocator with very minimal overhead
 - ... something else, I do not remember
 
 Basically very early draft, still slower then original but not much. 

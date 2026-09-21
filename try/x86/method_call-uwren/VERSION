@@ -1,0 +1,8 @@
+variant : method_call-uwren
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:25:12Z
+profile : release
+flags   : --uwren
+file    : method_call
+bytes   : 502528
+what    : Tailored: integers, no compiler, only the core the program's manifest asks for, frozen into the image.

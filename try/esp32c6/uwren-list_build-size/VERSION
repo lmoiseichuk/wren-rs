@@ -1,0 +1,8 @@
+variant : uwren-list_build-size
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:33Z
+profile : size
+flags   : --no-default-features --features census
+file    : list_build
+bytes   : 393396
+what    : Tailored image for list_build: integers, no compiler, only the core its manifest asks for, frozen into flash.

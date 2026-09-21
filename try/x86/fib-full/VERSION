@@ -1,0 +1,8 @@
+variant : fib-full
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:24:46Z
+profile : release
+flags   : --full
+file    : fib
+bytes   : 760512
+what    : Full Wren as a host executable, with the program compiled in as bytecode.

@@ -1,0 +1,8 @@
+variant : bench-nofp-speed
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:22Z
+profile : speed
+flags   : --features nofp
+file    : esp32c6-wren-rs
+bytes   : 640712
+what    : Integers only. The fastest and smallest of the three, with no fractions at all.

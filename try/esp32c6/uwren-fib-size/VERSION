@@ -1,0 +1,8 @@
+variant : uwren-fib-size
+commit  : 54919ce37ac8
+built   : 2026-09-21T01:26:32Z
+profile : size
+flags   : --no-default-features --features census
+file    : fib
+bytes   : 393196
+what    : Tailored image for fib: integers, no compiler, only the core its manifest asks for, frozen into flash.
