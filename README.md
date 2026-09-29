@@ -154,7 +154,7 @@ What *does* transfer to a small part today, because it was built for one:
   to 2^24 — so it is off by default.
 - **A ceiling on garbage**, `Heap::set_headroom`: peak memory becomes *the live
   set plus a constant you choose*. **On a part holding few objects it is free**
-  — `method_call` runs identically from a 32 KB ceiling down to 1 KB — because
+  — `method_call` runs within 0.1% from a 32 KB ceiling down to 1 KB — because
   a collection costs the live set, and a small part has a small one.
 
 ## The numbers
@@ -167,16 +167,16 @@ identical constants on every implementation. Method and caveats:
 
 | benchmark | wren-rs | C Wren `-O2` | MicroPython |
 |---|---|---|---|
-| `binary_trees` depth 9 | 5.678 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 9.605 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.420 s | **0.130 s** | 0.154 s |
-| `method_call` | 1.601 s | **0.350 s** | 1.748 s |
+| `binary_trees` depth 9 | 2.539 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 4.119 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.175 s | **0.130 s** | 0.154 s |
+| `method_call` | 0.660 s | **0.350 s** | 1.748 s |
 | **VM resident** | **23,176 B** | 83,036 B | — |
 
-**Between two and a half and four and a half times slower than C, and 72%
-smaller resident.** Against MicroPython it is *slower* on three of the four and
-faster on `method_call`; `--features nofp` closes most of that gap and still
-does not overtake it on `list_build`. The speed is
+**Between 1.2 and 1.9 times slower than C, and 72%
+smaller resident.** Against MicroPython it is *faster* on three of the four and
+slower on `list_build`; `--features nofp` overtakes it there too, at 0.095 s
+against 0.154. The speed is
 the honest cost of reaching objects by a bounds-checked index rather than a
 pointer, which is what keeps `unsafe` out of the object model; the memory is
 what
@@ -192,16 +192,35 @@ with the numbers for all twenty in
 refusals removed a cost the compiler had already removed, and two removed a
 test that was redundant as a predicate and load-bearing as a filter.
 
+The pass after that (2026-09-29) went through upstream's C for every technique
+it uses for speed and priced each one against this VM before building it --
+the table is in profiling.md, under *Upstream's speed, technique by technique*.
+Five changes stayed: a frame holds its code by pointer rather than counting
+it, the interpreter asks about collection only after an instruction that
+allocates, LLVM's constant hoisting is off, iteration, equality and `!` on
+built-in types are answered without a call, and `class_of` asks about objects
+first. Together: **9.9% less work and 11-18% less time on every benchmark**, at
+the same clock. That pass also added a rule: when instructions retired and
+time disagree, time decides -- if it holds at several code placements.
+
 **Read the seconds to about two percent.** The board is exact -- the same image gives
 the same time to the microsecond, three flashes running -- but *where the
-instructions land* is worth more than that: padding every branch target to eight
-bytes, with the source untouched, takes `fib` from 16.774 s to 16.127. So a
-small difference between two builds is a fact about placement until it has been
-measured at several placements, and consistency across all four benchmarks is
-not the check it looks like. The experiment, the mirror one showing that moving
+instructions land* is worth more than that: padding every branch target to four
+bytes, with the source untouched, takes `fib` from 4.180 s to 4.119 and
+`binary_trees` from 2.577 s to 2.539, 1.5% on each, for identical instructions
+retired. (At the 80 MHz the board first ran at, the same padding was worth 3
+to 4%.) So a small difference between two builds is a fact about placement
+until it has been measured at several placements, and consistency across all
+four benchmarks is not the check it looks like. The experiment, the mirror one showing that moving
 the *data* changes nothing at all, and the chip's performance counter that
 settles both are in
 **[`doc/wren-rs/profiling.md`](doc/wren-rs/profiling.md)**.
+
+> Times are at 160 MHz. Rust-port times measured before 2026-09-29 were taken
+> at 80 MHz — esp-hal's default clock — and are shown halved: the clock fix
+> measured every benchmark at 50.0-50.2% of its 80 MHz time with identical
+> instructions retired ([`doc/wren-rs/profiling.md`](doc/wren-rs/profiling.md),
+> *The clock*).
 
 ### The three numeric modes
 
@@ -211,14 +230,14 @@ run each:
 
 | | `f64` | `f32` | `nofp` |
 |---|---|---|---|
-| `binary_trees` | 5.678 s | 5.295 s | **5.034 s** |
-| `fib` ×5 | 9.605 s | 8.721 s | **7.480 s** |
-| `list_build` | 0.420 s | 0.384 s | **0.248 s** |
-| `method_call` | 1.601 s | 1.538 s | **1.440 s** |
-| `binary_trees` peak | 115,168 B | 88,144 B | 92,080 B |
-| `list_build` peak | 132,292 B | **66,656 B** | 66,636 B |
+| `binary_trees` | 2.539 s | 2.354 s | **2.239 s** |
+| `fib` ×5 | 4.119 s | 3.777 s | **3.218 s** |
+| `list_build` | 0.175 s | 0.160 s | **0.095 s** |
+| `method_call` | 0.660 s | 0.633 s | **0.590 s** |
+| `binary_trees` peak | 115,168 B | 86,100 B | 92,080 B |
+| `list_build` peak | 132,284 B | **66,652 B** | 66,636 B |
 | VM resident | 23,176 B | 22,888 B | **21,316 B** |
-| image | 472,928 B | 457,264 B | **400,512 B** |
+| image | 476,736 B | 460,176 B | **402,624 B** |
 
 Both narrower modes are faster *and* smaller, because `riscv32imac` has neither
 the `F` nor the `D` extension — every width is software and the narrow ones are
@@ -272,8 +291,8 @@ classes, method tables and names *at image build time* and compile them in as
 | heap once the VM is built | **4,008 B** | 23,176 B resident |
 | heap at the run's peak | **8,528 B** | — |
 | `wren` in flash | **54,696 B** | 85,972 B |
-| whole image | **171,728 B** | 472,928 B |
-| `fib(24)` ×5 | 11.78 s | 9.605 s |
+| whole image | **173,168 B** | 476,736 B |
+| `fib(24)` ×5 | 5.49 s | 4.119 s |
 
 **Nothing of the core is in the heap.** Twenty-one classes, their flattened
 method tables and their names all live in `.rodata`; what the heap holds is the
@@ -338,17 +357,17 @@ range on the same board:
 
 | ceiling | `binary_trees` (1,023 live) | its peak | `method_call` (109 live) |
 |---|---|---|---|
-| ratio, 1.5× *(default)* | 9.106 s | 117,376 B | 2.5185 s |
-| 32 KB | 8.970 s | 121,480 B | 2.5185 s |
-| 16 KB | 10.148 s | 109,004 B | 2.5185 s |
-| 8 KB | 12.211 s | 109,004 B | 2.5185 s |
-| 4 KB | 16.545 s | 109,000 B | 2.5185 s |
-| **1 KB** | 37.916 s | **83,148 B** | **2.5185 s** |
+| ratio, 1.5× *(default)* | 2.539 s | 115,168 B | 0.6601 s |
+| 32 KB | 2.475 s | 119,264 B | 0.6600 s |
+| 16 KB | 3.046 s | 106,784 B | 0.6600 s |
+| 8 KB | 3.700 s | **80,928 B** | 0.6600 s |
+| 4 KB | 5.474 s | **80,928 B** | 0.6601 s |
+| **1 KB** | 18.995 s | 105,764 B | **0.6606 s** |
 
-**Read the last column.** `method_call` holds about a hundred objects and does
-not move — not to five decimal places — from the loosest setting to the
-tightest. `binary_trees` holds a thousand-node tree and pays four times over
-for the same ceiling.
+**Read the last column.** `method_call` holds about a hundred objects and moves
+by less than a tenth of a per cent from the loosest setting to the
+tightest. `binary_trees` holds a thousand-node tree and pays seven and a half
+times over for the same ceiling.
 
 That is not a coincidence, it is what tracing costs: **a collection is
 proportional to the live set.** So the parts that most need a tight bound — a
@@ -357,10 +376,11 @@ CH32V006 with 8 KB, where a program holds tens of objects rather than thousands
 ratio so the published numbers remain comparable with the C port; a firmware
 that knows its live set should not keep it.
 
-Two more things the curve says. Between 16 KB and 4 KB the peak barely moves
-while the time doubles — below 16 KB it is no longer floating garbage that sets
-the peak but the live set, the field chunks and the tables' high-water mark, so
-there is nothing left to squeeze. And 32 KB is *looser* than 1.5× of this live
+Two more things the curve says. Between 8 KB and 4 KB the peak does not move
+while the time rises by half — below 8 KB it is no longer floating garbage that
+sets the peak but the live set, the field chunks and the tables' high-water
+mark, so there is nothing left to squeeze. (At 1 KB the peak comes back up, to
+105,764 B, which this sweep does not explain.) And 32 KB is *looser* than 1.5× of this live
 set, which is why it is both slightly faster and slightly larger.
 
 ## Layout
@@ -399,7 +419,7 @@ one has to provide.
 | **the Rust VM** | **the language is complete** |
 | — upstream's test suite | **829 of 829** |
 | — conformance probes | **96 of 96** |
-| — this crate's own tests | 193 |
+| — this crate's own tests | 247 |
 | **shipping bytecode** | **measured** |
 | — the suite, run from `.wrenc` | **829 of 829** |
 | — the suite in an `f32` build | 798 of 829 — *not Wren, and off by default* |
@@ -432,14 +452,14 @@ the published comparison is unaffected; a different benchmark might not be.
 
 ### What the measurements changed
 
-Four findings, each of which overturned something this repository had written
+Five findings, each of which overturned something this repository had written
 down. They are the reason the two documents below are worth reading rather than
 skimming.
 
 **The design note's central estimate was wrong by an order of magnitude.** It
 put the cost of reaching objects by a bounds-checked index rather than a
 pointer at "single-digit to low-double-digit percent". The first run on
-hardware said **four to eight times**. The note had reasoned about one bounds
+hardware said **two to four times**. The note had reasoned about one bounds
 check per field access; a single method call traversed *ten* heap lookups, and
 six of them were asking for the same two objects over and over.
 → [`design.md`](doc/wren-rs/design.md)
@@ -462,6 +482,15 @@ and every replacement costs work proportional to what the program *does*.
 **The biggest thing on the heap was not the objects.** It was the method
 tables, then the allocator's own per-object headers. Neither had been suspected;
 both were found by counting. → [`memory.md`](doc/wren-rs/memory.md)
+
+**The board had been running at half speed.** esp-hal's default configuration
+runs an ESP32-C6 at 80 MHz; ESP-IDF, and so the C port and MicroPython, run it
+at 160. Every wren-rs time published before 2026-09-29 was taken at half the
+clock of the numbers beside it, and the interpreter's "two to three cycles per
+instruction, fetch-bound" came from dividing by a clock the board was not at:
+the chip's own counter reads 1.3. Asking for the full clock halved every time
+to within 0.2%, with the instructions retired identical.
+→ [`profiling.md`](doc/wren-rs/profiling.md)
 
 The full tables — every benchmark at both optimisation levels, against C Wren
 and MicroPython, with the method and caveats — are in
@@ -486,10 +515,12 @@ wants.
 measured, and what each instrument lies about. Why a workstation called every
 real optimisation noise; a sampling profiler built out of `gdb` because there
 is no `perf`, and the three things it gets wrong; the board being exact to the
-microsecond while **3 to 4% of a benchmark is where the code landed**; and the
+microsecond while **1.5% of a benchmark is where the code landed** (3 to 4% at
+80 MHz); and the
 chip's performance counter, whose event numbers are in no header here and were
-found by experiment — which then said the interpreter spends two cycles in
-three retiring nothing.
+found by experiment — and whose own cycle count, 1.3 per instruction, retired
+the reading that the interpreter spends two cycles in three retiring nothing:
+that was wall time divided by a clock the board was not running at.
 
 ### Shipping bytecode, measured
 
@@ -519,7 +550,7 @@ matters before any number: the two paths produce the same program.
 It barely moves with the number width — 34,480 B against 34,544 — because a
 lexer and a parser do not care how wide a double is.
 
-Loading a program takes 756–1,924 µs where compiling it takes 25–35 ms. That is
+Loading a program takes 378–962 µs where compiling it takes 13–18 ms. That is
 6.5× and it barely matters against a program that then runs for seconds — and
 it is the dominant number on the duty cycle these parts are bought for, where a
 node wakes, samples and sleeps.
