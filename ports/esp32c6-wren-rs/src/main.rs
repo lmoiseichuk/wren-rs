@@ -130,12 +130,20 @@ const REPEAT_OVERRIDE: Option<u32> = match option_env!("WREN_REPEATS") {
 
 #[main]
 fn main() -> ! {
-    let _peripherals = esp_hal::init(esp_hal::Config::default());
+    // **The clock has to be asked for.** esp-hal's `Config::default()` runs an
+    // ESP32-C6 at 80 MHz -- `CpuClock`'s `#[default]` variant -- where ESP-IDF,
+    // and so the C port and MicroPython, run it at 160. Every time this port
+    // published before this line was taken at half the clock the C numbers
+    // beside it were. Instructions retired do not move with the clock; seconds
+    // do, nearly in proportion.
+    let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max());
+    let _peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(size: HEAP_BYTES);
 
     println!();
     println!("wren-rs on ESP32-C6");
     println!("profile      : {}", if cfg!(debug_assertions) { "debug" } else { "release" });
+    println!("cpu clock    : {} MHz", esp_hal::clock::CpuClock::max() as u32);
     println!("heap         : {HEAP_BYTES} B");
     match fresh_vm().heap.slot_block() {
         Some(slots) => println!("slot block   : {slots} slots"),

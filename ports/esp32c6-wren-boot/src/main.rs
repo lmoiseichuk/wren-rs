@@ -52,7 +52,10 @@ type Prepared = wren::ObjectId;
 
 #[main]
 fn main() -> ! {
-    let _peripherals = esp_hal::init(esp_hal::Config::default());
+    // At the chip's full clock, as ESP-IDF runs it: esp-hal's default is 80 MHz,
+    // half of it. See the note in `esp32c6-wren-rs/src/main.rs`.
+    let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max());
+    let _peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(size: HEAP_BYTES);
 
     // As near to reset as this code can observe. It misses the second-stage

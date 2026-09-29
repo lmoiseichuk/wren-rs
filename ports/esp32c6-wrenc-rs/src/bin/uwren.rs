@@ -229,7 +229,10 @@ fn breakdown(vm: &Vm, baseline: usize) {
 
 #[main]
 fn main() -> ! {
-    let _peripherals = esp_hal::init(esp_hal::Config::default());
+    // At the chip's full clock, as ESP-IDF runs it: esp-hal's default is 80 MHz,
+    // half of it. See the note in `esp32c6-wren-rs/src/main.rs`.
+    let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max());
+    let _peripherals = esp_hal::init(config);
 
     println!();
     println!("uwren -- integers only, no compiler, uheap");
