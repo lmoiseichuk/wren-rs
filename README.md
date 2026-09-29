@@ -56,7 +56,7 @@ its code can call and every variable it can reach, so a VM can be built with
 only those -- and a build step can freeze the resulting classes, method tables
 and names into the image rather than constructing them in RAM at start-up. On
 `fib` that leaves nothing of the core in the heap at all, and a run peaking at
-8,528 B against a CH32V006's 8,192 -- and 54,696 B of `wren` in flash against
+8,528 B against a CH32V006's 8,192 -- and 56,230 B of `wren` in flash against
 its 63,488. See
 **[`doc/wren_native.md`](doc/wren_native.md)** and
 **[`doc/wren-rs/memory.md`](doc/wren-rs/memory.md)**.
@@ -165,22 +165,34 @@ identical constants on every implementation. Method and caveats:
 
 ### Against C and MicroPython
 
-| benchmark | wren-rs | C Wren `-O2` | MicroPython |
-|---|---|---|---|
-| `binary_trees` depth 9 | 2.539 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 4.119 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.175 s | **0.130 s** | 0.154 s |
-| `method_call` | 0.660 s | **0.350 s** | 1.748 s |
-| **VM resident** | **23,176 B** | 83,036 B | — |
+| benchmark | wren-rs | wren-rs threaded | C Wren `-O2` | MicroPython |
+|---|---|---|---|---|
+| `binary_trees` depth 9 | 2.530 s | 2.254 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 4.068 s | 3.350 s | **3.250 s** | 7.109 s |
+| `list_build` 10,000 | 0.171 s | 0.172 s | **0.130 s** | 0.154 s |
+| `method_call` | 0.649 s | 0.538 s | **0.350 s** | 1.748 s |
+| **VM resident** | **23,176 B** | **23,176 B** | 83,036 B | — |
 
 **Between 1.2 and 1.9 times slower than C, and 72%
 smaller resident.** Against MicroPython it is *faster* on three of the four and
-slower on `list_build`; `--features nofp` overtakes it there too, at 0.095 s
+slower on `list_build`; `--features nofp` overtakes it there too, at 0.094 s
 against 0.154. The speed is
 the honest cost of reaching objects by a bounds-checked index rather than a
 pointer, which is what keeps `unsafe` out of the object model; the memory is
 what
 compiling no core library at start-up buys.
+
+**The threaded build is within 5% of C on `fib` and `binary_trees`**, and
+faster there than C built `-Os`. `--features tail-calls` turns the
+interpreter's one `match` into one function per opcode, each ending in a
+guaranteed tail call to the next -- the nearest Rust has to upstream's computed
+`goto`, with a register allocation per opcode instead of one for the whole
+loop. Against MicroPython that is 2.1 times faster on those two, where C is
+2.2, and 3.2 times on `method_call`. `list_build` gains nothing: its loop
+is `List.add`, a primitive the fast call path does not take, and `iterate`,
+whose soft-float keeps a register frame. It needs nightly Rust
+(`explicit_tail_calls`), costs 5,248 B of flash and no RAM, and is off by
+default; the suite passes 829 of 829 through it as well.
 
 **Judged by work, not only by time.** The chip's performance counter reports
 instructions retired, which does not move when the code moves — so a change
@@ -203,12 +215,22 @@ first. Together: **9.9% less work and 11-18% less time on every benchmark**, at
 the same clock. That pass also added a rule: when instructions retired and
 time disagree, time decides -- if it holds at several code placements.
 
+Two more changes have been measured the same way since. **The threaded build**
+above: 3.3% less work than the `match` loop, and 7-12% less time on three of
+the four. And **one opcode split in two**, LM's suggestion: a call used to ask
+at run time whether its method was `+`, and a plain method call paid for that
+question every time. The compiler knows from the signature, so it now emits
+`Call` for a method and `CallOperator` for an operator, and neither pays the
+other's tests -- **6.2% less work and 4-8% less time on all four** in the
+threaded build, 1.2% less work in the default one.
+
 **Read the seconds to about two percent.** The board is exact -- the same image gives
 the same time to the microsecond, three flashes running -- but *where the
 instructions land* is worth more than that: padding every branch target to four
-bytes, with the source untouched, takes `fib` from 4.180 s to 4.119 and
-`binary_trees` from 2.577 s to 2.539, 1.5% on each, for identical instructions
-retired. (At the 80 MHz the board first ran at, the same padding was worth 3
+bytes, with the source untouched, takes `binary_trees` from 2.550 s to 2.530
+and `fib` the *other* way, from 4.051 s to 4.068 -- 0.8% and 0.4%, for
+identical instructions retired. (Before the operator opcode the same padding
+moved both the same way, by 1.5%; at the 80 MHz the board first ran at, by 3
 to 4%.) So a small difference between two builds is a fact about placement
 until it has been measured at several placements, and consistency across all
 four benchmarks is not the check it looks like. The experiment, the mirror one showing that moving
@@ -230,19 +252,29 @@ run each:
 
 | | `f64` | `f32` | `nofp` |
 |---|---|---|---|
-| `binary_trees` | 2.539 s | 2.354 s | **2.239 s** |
-| `fib` ×5 | 4.119 s | 3.777 s | **3.218 s** |
-| `list_build` | 0.175 s | 0.160 s | **0.095 s** |
-| `method_call` | 0.660 s | 0.633 s | **0.590 s** |
+| `binary_trees` | 2.530 s | 2.373 s | **2.260 s** |
+| `fib` ×5 | 4.068 s | 3.743 s | **3.194 s** |
+| `list_build` | 0.171 s | 0.159 s | **0.094 s** |
+| `method_call` | 0.649 s | 0.632 s | **0.589 s** |
+| threaded `binary_trees` | 2.254 s | 2.077 s | **1.943 s** |
+| threaded `fib` ×5 | 3.350 s | 3.041 s | **2.335 s** |
+| threaded `list_build` | 0.172 s | 0.154 s | **0.085 s** |
+| threaded `method_call` | 0.538 s | 0.510 s | **0.465 s** |
 | `binary_trees` peak | 115,168 B | 86,100 B | 92,080 B |
-| `list_build` peak | 132,284 B | **66,652 B** | 66,636 B |
+| `list_build` peak | 132,292 B | 66,644 B | **66,636 B** |
 | VM resident | 23,176 B | 22,888 B | **21,316 B** |
-| image | 476,736 B | 460,176 B | **402,624 B** |
+| image | 476,368 B | 460,736 B | **402,736 B** |
+| threaded image | 481,616 B | 463,904 B | **406,880 B** |
 
 Both narrower modes are faster *and* smaller, because `riscv32imac` has neither
 the `F` nor the `D` extension — every width is software and the narrow ones are
 less work. A `Value` halves to four bytes, which is why `list_build`, whose
 whole memory is a list of numbers, halves with it.
+
+The threaded `nofp` build runs three of the four faster than C Wren does in
+`f64` -- not like for like, since C is paying for soft-float doubles, but it is
+what a part with no FPU would actually run. `method_call` is the exception, at
+0.465 s against 0.350.
 
 **Neither is Wren, and the cost is exact rather than vague.** An `f32` is exact
 on integers only to 2^24, so `list_build` — which sums to 49,995,000 — prints
@@ -290,17 +322,18 @@ classes, method tables and names *at image build time* and compile them in as
 | the core's classes, tables and names in RAM | **0 B** | — |
 | heap once the VM is built | **4,008 B** | 23,176 B resident |
 | heap at the run's peak | **8,528 B** | — |
-| `wren` in flash | **54,696 B** | 85,972 B |
-| whole image | **173,168 B** | 476,736 B |
-| `fib(24)` ×5 | 5.49 s | 4.119 s |
+| `wren` in flash | **56,230 B** | 87,884 B |
+| whole image | **173,872 B** | 476,368 B |
+| `fib(24)` ×5 | 5.15 s | 4.068 s |
 
 **Nothing of the core is in the heap.** Twenty-one classes, their flattened
 method tables and their names all live in `.rodata`; what the heap holds is the
 slots that address them, the VM's own vectors, and whatever the program
 computes — 930 B of objects at peak.
 
-**54,696 B fits a CH32V006's 63,488 B of flash**, which no build of this VM
-managed before, and the 8,528 B heap peak is just over its 8,192 B of RAM —
+**56,230 B fits a CH32V006's 63,488 B of flash**, which no build of this VM
+managed before -- 54,696 B when first measured; the speed work since has added
+1.5 KB -- and the 8,528 B heap peak is just over its 8,192 B of RAM —
 with the `Vm` struct and the call stack still outside that figure.
 
 The one row that goes the wrong way is the clock, and it is not the VM's doing:
@@ -357,12 +390,12 @@ range on the same board:
 
 | ceiling | `binary_trees` (1,023 live) | its peak | `method_call` (109 live) |
 |---|---|---|---|
-| ratio, 1.5× *(default)* | 2.539 s | 115,168 B | 0.6601 s |
-| 32 KB | 2.475 s | 119,264 B | 0.6600 s |
-| 16 KB | 3.046 s | 106,784 B | 0.6600 s |
-| 8 KB | 3.700 s | **80,928 B** | 0.6600 s |
-| 4 KB | 5.474 s | **80,928 B** | 0.6601 s |
-| **1 KB** | 18.995 s | 105,764 B | **0.6606 s** |
+| ratio, 1.5× *(default)* | 2.530 s | 115,168 B | 0.6485 s |
+| 32 KB | 2.466 s | 119,264 B | 0.6485 s |
+| 16 KB | 3.037 s | 106,784 B | 0.6485 s |
+| 8 KB | 3.686 s | **80,928 B** | 0.6485 s |
+| 4 KB | 5.462 s | **80,920 B** | 0.6486 s |
+| **1 KB** | 19.025 s | 105,764 B | **0.6491 s** |
 
 **Read the last column.** `method_call` holds about a hundred objects and moves
 by less than a tenth of a per cent from the loosest setting to the
@@ -419,7 +452,7 @@ one has to provide.
 | **the Rust VM** | **the language is complete** |
 | — upstream's test suite | **829 of 829** |
 | — conformance probes | **96 of 96** |
-| — this crate's own tests | 247 |
+| — this crate's own tests | 248 |
 | **shipping bytecode** | **measured** |
 | — the suite, run from `.wrenc` | **829 of 829** |
 | — the suite in an `f32` build | 798 of 829 — *not Wren, and off by default* |

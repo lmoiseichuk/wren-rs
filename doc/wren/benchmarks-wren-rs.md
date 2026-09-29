@@ -12,15 +12,21 @@ because the first one is what the second is owed to.
 
 ## Now, at 160 MHz (2026-09-29)
 
-The default build -- `speed` profile, `f64` -- on the same clock as the C port
-and MicroPython:
+The default build -- `speed` profile, `f64` -- and the threaded one
+(`--features tail-calls`, which needs nightly Rust), on the same clock as the C
+port and MicroPython. Measured at the commit that split `Call` from
+`CallOperator`:
 
-| benchmark | wren-rs `speed` | C Wren `-O2` | C Wren `-Os` | MicroPython | wren-rs vs C `-O2` | wren-rs vs MicroPython |
-|---|---|---|---|---|---|---|
-| `binary_trees` | **2.539 s** | 2.160 s | 2.440 s | 4.729 s | 1.2x slower | 1.9x faster |
-| `fib` | **4.119 s** | 3.250 s | 3.710 s | 7.109 s | 1.3x slower | 1.7x faster |
-| `list_build` | **0.175 s** | 0.130 s | 0.150 s | 0.154 s | 1.3x slower | 1.1x slower |
-| `method_call` | **0.660 s** | 0.350 s | 0.420 s | 1.748 s | 1.9x slower | 2.6x faster |
+| benchmark | wren-rs `speed` | threaded | C Wren `-O2` | C Wren `-Os` | MicroPython | wren-rs vs C `-O2` | threaded vs C `-O2` | wren-rs vs MicroPython |
+|---|---|---|---|---|---|---|---|---|
+| `binary_trees` | **2.530 s** | **2.254 s** | 2.160 s | 2.440 s | 4.729 s | 1.2x slower | 1.04x slower | 1.9x faster |
+| `fib` | **4.068 s** | **3.350 s** | 3.250 s | 3.710 s | 7.109 s | 1.3x slower | 1.03x slower | 1.7x faster |
+| `list_build` | **0.171 s** | **0.172 s** | 0.130 s | 0.150 s | 0.154 s | 1.3x slower | 1.3x slower | 1.1x slower |
+| `method_call` | **0.649 s** | **0.538 s** | 0.350 s | 0.420 s | 1.748 s | 1.9x slower | 1.5x slower | 2.7x faster |
+
+The threaded build is faster than C built `-Os` on `binary_trees` and `fib`.
+What each change since the first run was worth, and what was refused, is in
+[`doc/wren-rs/profiling.md`](../wren-rs/profiling.md).
 
 Everything below is the history that led here.
 
