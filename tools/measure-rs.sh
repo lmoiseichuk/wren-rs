@@ -91,7 +91,9 @@ fi
 # **A placement override replaces the whole flag list, it does not add to it.**
 # `RUSTFLAGS` wins over `.cargo/config.toml` outright rather than merging, so
 # the linker arguments have to be repeated here or the link fails on the memory
-# map. They are the same two the config carries.
+# map, and so does every code-generation flag the config carries -- dropping
+# `-disable-constant-hoisting` here would compare a placement *and* a codegen
+# change against the committed build.
 if [[ -n "$PAD" ]]; then
     case "$PAD" in
         0) EXPONENT="" ;;
@@ -102,7 +104,7 @@ if [[ -n "$PAD" ]]; then
         32) EXPONENT=5 ;;
         *) echo "--pad takes a power of two from 0 to 32" >&2; exit 2 ;;
     esac
-    FLAGS="-Clink-arg=-Tlinkall.x -Clink-arg=--undefined=esp_app_desc"
+    FLAGS="-Clink-arg=-Tlinkall.x -Clink-arg=--undefined=esp_app_desc -Cllvm-args=-disable-constant-hoisting"
     [[ -n "$EXPONENT" ]] && FLAGS="$FLAGS -Cllvm-args=-align-all-nofallthru-blocks=$EXPONENT"
     export RUSTFLAGS="$FLAGS"
     echo "placement : branch targets padded to ${PAD} B"

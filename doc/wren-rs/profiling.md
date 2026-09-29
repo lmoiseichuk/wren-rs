@@ -1239,7 +1239,7 @@ selection.
 | # | technique | upstream | what it takes here | estimate, all four | where it lands | status |
 |---|---|---|---|---|---|---|
 | U1 | test for collection only when allocating | `wrenReallocate` compares `bytesAllocated` | the per-instruction flag test (`lbu`+`bnez`) moves into the nine arms that allocate | −2.0% read from the disassembly | every opcode | **kept** once U3 was in: −2.73% work, −2.2 to −4.2% time. Refused before it; see below |
-| U2 | no arity check when a method is called | the signature carries the arity | check once, when `MethodInstance` binds it, instead of on every closure call | ~−0.2% | calls | todo |
+| U2 | no arity check when a method is called | the signature carries the arity | check once, when `MethodInstance` binds it, instead of on every closure call | ~−0.2% | calls | **refused for now**: −0.65% work, but `binary_trees` +0.7-1.1% and `method_call` +0.9% time at two placements. To retry as the tree moves |
 | U3 | the frame holds the function by pointer, no reference count | `CallFrame.closure->fn` | `Frame::chunk` becomes a raw pointer rooted by the frame's closure, on the same terms as `code_units`; one `Rc` clone and one drop per call go | ~−1.1% (`fib` −1.3%) | calls | **kept**: +0.27% work but −2.4 to −7.0% time, at three placements -- see below |
 | U4 | local slot and constant indices trusted | `stackStart[READ_BYTE()]` | licensed rather than trusted: `max_stack`'s walk already knows the depth at every instruction, and can refuse a slot at or past it, and a constant past the pool | ~−0.6% | loads | todo |
 | U5 | field operands patched when the method is bound | `wrenBindMethodCode` | removes `field_offset` from the frame, `CallTarget` and the loop's locals. **Conflicts with bytecode kept in flash** -- a µwren chunk in `.rodata` cannot be patched, so a frozen image would patch at build time instead | 0 to −1%, a register freed | field access | todo |
@@ -1270,14 +1270,17 @@ profile found them.
 | X2 | five fused opcode pairs | -- | loads, returns, field stores | none | done before this pass |
 | X3 | branch targets padded to 4 B | -- (time only) | placement | +7 KB flash | done before this pass |
 | X4 | **the CPU at 160 MHz** | **−50% time**, 0 work | everything | none | **done** |
-| X5 | intrinsics: once the lookup has found `Object.==`, `Object.!=` or `Bool.!`, do it inline instead of calling the primitive | ~−1.2% (`binary_trees` ~−2.6%, `method_call` ~−3.8%) | primitive calls | none | todo |
-| X6 | `iterate` and `iteratorValue` of `Range` and `List` inline -- built-in classes cannot be subclassed, so nothing can replace them, as with `Num` | ~−0.75% (`list_build` ~−15%, `method_call` ~−4.2%) | every `for` loop | none | todo |
+| X5 | intrinsics: once the lookup has found `Object.==`, `Object.!=` or `Bool.!`, do it inline instead of calling the primitive | ~−1.2% (`binary_trees` ~−2.6%, `method_call` ~−3.8%) | primitive calls | none | tried with X6, below |
+| X6 | `iterate` and `iteratorValue` of `Range` and `List` inline -- built-in classes cannot be subclassed, so nothing can replace them, as with `Num` | ~−0.75% (`list_build` ~−15%, `method_call` ~−4.2%) | every `for` loop | none | **X5+X6 tried**: `list_build` −10.6%, `method_call` −3.1% time, but `fib` +2.5% -- five register moves joined the `Call` arm's entry. To retry |
 | X7 | `==` and `!=` of two numbers in the fast path | 0 on the four; ~−71 per numeric comparison anywhere else | comparisons | none | todo |
 | X8 | loop inversion: the test at the bottom, one `Loop` fewer per iteration | ~−0.08%, against about +1% for the opcode it needs | loops | none | refused on the estimate |
 | X9 | more fused pairs (`StoreModuleVar`+`Pop`, `StoreLocal`+`Pop`) | ~−0.23%, against about +1% per opcode added | assignments | none | refused on the estimate |
 | X10 | unchecked heap reads for a handle known to be live | ~−2.4% | every object access | none | **LM's call**: it breaks this crate's rule that the object model has no `unsafe` |
 | X11 | stop the dispatch block rebuilding two constants every instruction | up to −2%, read from the disassembly | every opcode | none | **gone with U1**: the dispatch block is seven instructions |
 | X12 | a closure's upvalue slice hoisted like `constants` | 0 on the four | closures | none | todo, low |
+| X13 | a type test on the `Value`'s high word only, in the source | −3.5% estimated from the disassembly | every type test | none | **refused**: −0.14%, because InstCombine widens it back to 64 bits; X14 is the real fix |
+| X14 | **LLVM's constant hoisting off** (`-disable-constant-hoisting`) | -- | every type test | +464 B flash | **kept**: −3.64% work, −1.0 to −2.9% time at two placements |
+| X15 | profile-guided layout: hot blocks together, from counts measured on the host | unknown | the whole loop | none | todo -- LM's suggestion: order by frequency |
 
 ### The clock
 
@@ -1344,6 +1347,45 @@ U3, worse than inline.
 the tree it was measured on.** U1 lost against one shape of the call arm and
 won against the next, by the same mechanism -- what the register allocator
 does in the dispatch block -- pointing the other way.
+
+### X14: a constant the compiler rebuilt on every type test
+
+Reading the `Call` arm for why the intrinsics cost `fib` found this in the
+path every arithmetic call takes, twice -- once per operand:
+
+```
+li   a6,1          ; the low word of QNAN | 1 ...
+seqz a2,a6         ; ... minus one, with the borrow
+addi a6,a6,-1
+sub  s0,s11,a2     ; the high word, borrow taken
+and  a2,a1,s0      ; now the actual test
+and  a3,a0,a6
+lui  a7,0x7ffc0
+xor  a2,a2,a7
+or   a2,a2,a3
+beqz a2,...
+```
+
+That is `(bits & QNAN) != QNAN`, with `QNAN` rebuilt as `(QNAN | 1) - 1`
+across the two halves of a 64-bit register pair. LLVM's constant-hoisting pass
+keeps one 64-bit tag constant live and derives its neighbours from it, which
+is sound and, on a core where a 64-bit constant costs four instructions to
+build and a subtraction with borrow costs four more, a loss.
+
+The obvious source fix was tried first and did nothing: testing only the high
+word (`QNAN`'s low word is zero) is exact, and InstCombine rewrites it straight
+back into the 64-bit form before the pass runs -- −0.14%, `run_frames` the same
+6,835 instructions. Turning the pass off is the fix:
+
+| | `binary_trees` | `fib` | `list_build` | `method_call` | sum |
+|---|---|---|---|---|---|
+| work | −1.82% | −5.01% | −1.73% | −2.26% | **−3.64%** |
+| time, padded to 4 B | −1.04% | −2.89% | −1.08% | −1.27% | |
+| time, padded to 8 B | −1.01% | −2.89% | −1.05% | −1.27% | |
+
+`fib` gains most because it is the most arithmetic. The flag lives in the
+port's `.cargo/config.toml`, and `measure-rs.sh --pad` repeats it, because a
+`RUSTFLAGS` override replaces the config's list rather than adding to it.
 
 ### U3: a clone that cost more cycles than instructions
 

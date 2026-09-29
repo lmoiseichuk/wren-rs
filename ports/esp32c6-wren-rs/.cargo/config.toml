@@ -13,8 +13,9 @@ rustflags = [
     # one. Naming it as an undefined symbol keeps it.
     "-C", "link-arg=--undefined=esp_app_desc",
     # **Pad every branch target to four bytes.** The interpreter's inner loop
-    # is instruction-fetch bound on this part, and this is the cheapest thing
-    # that relieves it: measured on an ESP32-C6FH4 at 160 MHz, `binary_trees`
+    # was read as instruction-fetch bound on this part, and this is the
+    # cheapest thing that relieves it: measured on an ESP32-C6FH4 at 80 MHz
+    # (the clock esp-hal defaulted to; the note once said 160), `binary_trees`
     # 9.007 -> 8.729 s and `fib` 16.774 -> 16.127 at `-O3`, and 17.189 ->
     # 16.587 and 33.367 -> 32.448 at `-Os`. Three to four per cent on every
     # benchmark, for 6,640 B of flash at `-O3` and 2,880 B at `-Os`, and no
@@ -33,6 +34,21 @@ rustflags = [
     # *entries* is worth 0.12%, because what matters is the branch targets
     # inside the loop.
     "-C", "llvm-args=-align-all-nofallthru-blocks=2",
+    # **No constant hoisting.** A `Value` is a `u64`, which on a 32-bit core is
+    # two registers, and LLVM's constant-hoisting pass keeps one 64-bit tag
+    # constant live and rebuilds its neighbours from it -- `QNAN` as
+    # `(QNAN | 1) - 1`, a borrow carried between the halves -- inside every
+    # type test on the hot path: `li`, `seqz`, `addi -1`, `sub` before the
+    # mask, twice per arithmetic call. Without the pass each constant is two
+    # instructions where it is used. At 160 MHz, same source:
+    #
+    #   work  binary_trees -1.82%  fib -5.01%  list_build -1.73%  method_call -2.26%
+    #   time               -1.04%      -2.89%             -1.08%              -1.27%
+    #
+    # identical at branch padding 4 and 8, for 464 B of flash. Writing the
+    # test on the high word in the source does not help: InstCombine widens
+    # it straight back to the 64-bit form.
+    "-C", "llvm-args=-disable-constant-hoisting",
 ]
 
 [env]
