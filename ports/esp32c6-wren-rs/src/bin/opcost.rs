@@ -106,10 +106,14 @@ fn main() -> ! {
     // is what makes a single opcode's cost readable off the table rather than
     // inferred from it: `1` against `i` is Constant against LoadLocal, and
     // `b.bump` against `b.get` is a field store plus an arithmetic call.
-    let bodies: [(&str, &str); 10] = [
+    let bodies: [(&str, &str); 14] = [
         ("", "the empty loop itself"),
         ("i", "LoadLocal, Pop"),
         ("1", "Constant, Pop"),
+        ("true", "True, Pop"),
+        ("!true", "True, Call(Bool.!), Pop -- a primitive call"),
+        ("i == i", "LoadLocalPair, Call(Num.==), Pop -- no fast path"),
+        ("b == null", "LoadLocal, Null, Call(Object.==), Pop"),
         ("module_var", "LoadModuleVar, Pop"),
         ("module_var = i", "LoadLocal, StoreModuleVar, Pop"),
         ("i + i", "LoadLocalPair, Call(Num.+), Pop"),
