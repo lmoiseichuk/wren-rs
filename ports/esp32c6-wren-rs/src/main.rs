@@ -94,14 +94,14 @@ const fn decimal(text: &str) -> usize {
 /// Python versions must match, and every published table was measured at
 /// those values -- so the programs are left exactly as they are and run more
 /// than once instead. What that buys is dilution: `method_call` finishes in
-/// under two seconds, of which compiling it is a fixed slice, and a change
+/// under a second, of which compiling it is a fixed slice, and a change
 /// worth two per cent of dispatch is hard to see underneath that. Running one
 /// *compiled* chunk ten times pays the compile once and the dispatch ten
 /// times. Ten compiles would dilute nothing.
 ///
-/// **Only the two dispatch benchmarks repeat.** `method_call` is under two
-/// seconds and can afford ten; `fib` is thirteen and five of those is already
-/// a minute. Both hold almost nothing -- 7,484 B and 3,476 B -- so running
+/// **Only the two dispatch benchmarks repeat.** `method_call` is under a
+/// second and can afford ten; `fib` is four and five of those is already
+/// twenty seconds. Both hold almost nothing -- 7,484 B and 3,476 B -- so running
 /// them again in the same VM costs nothing but time.
 ///
 /// The two allocation benchmarks stay at one, and not only because they are
@@ -120,9 +120,9 @@ const BENCHMARKS: &[(&str, &str, u32)] = &[
 
 /// Override every repeat count, for a quick iteration.
 ///
-/// The full set at the counts above is minutes per flash, which is right for
-/// a figure that goes in a table and wrong for trying six variants of one
-/// interpreter arm. `WREN_REPEATS=1` gives the short loop back.
+/// The full set at the counts above is half a minute to a minute per flash,
+/// which is right for a figure that goes in a table and wrong for trying six
+/// variants of one interpreter arm. `WREN_REPEATS=1` gives the short loop back.
 const REPEAT_OVERRIDE: Option<u32> = match option_env!("WREN_REPEATS") {
     Some(text) => Some(decimal(text) as u32),
     None => None,
@@ -161,7 +161,7 @@ fn main() -> ! {
     println!();
 
     // **Every build runs every benchmark.** Selecting them at build time was
-    // worth twenty seconds a round and cost a correct comparison: the
+    // worth ten seconds a round and cost a correct comparison: the
     // selection is an `option_env!`, so it changes the binary, and
     // `binary_trees` measured 411,792,094 instructions in a build that ran two
     // benchmarks against 426,918,702 in one that ran three -- same commit,

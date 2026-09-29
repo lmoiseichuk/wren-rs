@@ -151,9 +151,14 @@ It still does not pay:
 
 | | time | `binary_trees` peak |
 |---|---|---|
-| tracing only | 8.169 s | 133,888 B |
-| counting only | 8.980 s | 154,064 B |
-| counting and freeing | 9.630 s | 126,056 B |
+| tracing only | 4.085 s | 133,888 B |
+| counting only | 4.490 s | 154,064 B |
+| counting and freeing | 4.815 s | 126,056 B |
+
+> Times are at 160 MHz. Rust-port times measured before 2026-09-29 were taken
+> at 80 MHz -- esp-hal's default clock -- and are shown halved: the clock fix
+> measured every benchmark at 50.0-50.2% of its 80 MHz time with identical
+> instructions retired ([`profiling.md`](profiling.md), *The clock*).
 
 Eighteen percent of the one allocating benchmark to save six percent of its
 peak, and three to five percent of the others to save nothing.
@@ -195,7 +200,7 @@ Major collections fall by an order of magnitude and the promotion rate
 converges on the 16% the profile predicted.
 
 **On the device it is slower and much larger.** With a 2048-object nursery and
-a 16 KB headroom: 9.105 s against 8.455, and a peak of 176,736 B against
+a 16 KB headroom: 4.553 s against 4.228, and a peak of 176,736 B against
 133,880. Two reasons, and the second is the one that matters:
 
 - A minor collection's fixed costs -- clearing ten mark bitmaps, gathering the
@@ -220,10 +225,10 @@ built and measured against the tracing collector. On an ESP32-C6FH4 at
 
 | | time | peak |
 |---|---|---|
-| **tracing, as it stands** | **8.455 s** | 133,880 B |
-| tracing + 16 KB headroom | 9.240 s | **121,624 B** |
-| reference counting | 9.630 s | 126,056 B |
-| nursery + 16 KB headroom | 9.105 s | 176,736 B |
+| **tracing, as it stands** | **4.228 s** | 133,880 B |
+| tracing + 16 KB headroom | 4.620 s | **121,624 B** |
+| reference counting | 4.815 s | 126,056 B |
+| nursery + 16 KB headroom | 4.553 s | 176,736 B |
 
 **Nothing beats the collector that is already there on time, and the simplest
 thing beats everything on memory.** The profile said why before any of it was
@@ -254,12 +259,12 @@ Measured on an ESP32-C6FH4 at 160 MHz, speed profile:
 
 | ceiling | `binary_trees` | its peak | `method_call` |
 |---|---|---|---|
-| ratio, 1.5x | 9.106 s | 117,376 B | 2.5185 s |
-| 32 KB | 8.970 s | 121,480 B | 2.5185 s |
-| 16 KB | 10.148 s | 109,004 B | 2.5185 s |
-| 8 KB | 12.211 s | 109,004 B | 2.5185 s |
-| 4 KB | 16.545 s | 109,000 B | 2.5185 s |
-| **1 KB** | 37.916 s | **83,148 B** | **2.5185 s** |
+| ratio, 1.5x | 4.553 s | 117,376 B | 1.2593 s |
+| 32 KB | 4.485 s | 121,480 B | 1.2593 s |
+| 16 KB | 5.074 s | 109,004 B | 1.2593 s |
+| 8 KB | 6.106 s | 109,004 B | 1.2593 s |
+| 4 KB | 8.273 s | 109,000 B | 1.2593 s |
+| **1 KB** | 18.958 s | **83,148 B** | **1.2593 s** |
 
 **The last column is the point.** `method_call` holds about a hundred objects
 and its time does not move at all -- not to five decimal places -- from the
@@ -428,7 +433,7 @@ is pure overhead.
 it looked.** 32 was written before any of this was measured and is within 0.3%
 of the peak optimum. 16 wins the default because it is the same number for
 `binary_trees` -- 240 B worse on peak, but the *fastest* and the least work of
-any blocked size, 8.47 s and 521.8M instructions against 8.50 s and 523.6M --
+any blocked size, 4.24 s and 521.8M instructions against 4.25 s and 523.6M --
 and strictly better than 32 on the other three benchmarks.
 
 **Block size was expected to trade only memory, and mostly it does.** `fib`

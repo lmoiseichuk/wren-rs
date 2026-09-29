@@ -34,8 +34,13 @@ exactly the shape a big out-of-order window hides and a small in-order one pays
 for in full.
 
 Measured: the change that removed six of ten heap lookups per call was **inside
-the noise on a workstation** and was `method_call` 2.766 → 2.356 s on the board.
+the noise on a workstation** and was `method_call` 1.383 → 1.178 s on the board.
 A laptop would have said it was not worth making.
+
+> Board times are at 160 MHz. Rust-port times measured before 2026-09-29 were
+> taken at 80 MHz -- esp-hal's default clock -- and are shown halved: the clock
+> fix measured every benchmark at 50.0-50.2% of its 80 MHz time with identical
+> instructions retired (*The clock*, below).
 
 So the host runs `cargo run --release --example bench`, which takes about
 0.18 s, and answers one question: do all four programs produce the right
@@ -123,7 +128,7 @@ is worth: **there is no run-to-run noise.** Three flashes of the same image
 gave `binary_trees`
 
 ```
-9.006731 s   9.006731 s   9.006731 s
+4.503366 s   4.503366 s   4.503366 s
 ```
 
 — identical to the microsecond, not to three decimals. One run is the
@@ -147,12 +152,12 @@ branch target to a 2^N-byte boundary and does nothing else to the program:
 
 | branch targets padded to | `binary_trees` | `fib` | `list_build` | `method_call` | flashed image |
 |---|---|---|---|---|---|
-| nothing | 9.007 s | 16.774 s | 0.5659 s | 2.4788 s | 465,904 B |
-| 2 B | 9.007 s | 16.774 s | 0.5659 s | 2.4788 s | 465,904 B |
-| **4 B** *(the default now)* | 8.729 s | **16.127 s** | 0.5446 s | **2.3820 s** | **472,544 B** |
-| 8 B | 8.737 s | 16.127 s | **0.5445 s** | 2.3820 s | 484,832 B |
-| 16 B | **8.725 s** | 16.137 s | 0.5446 s | 2.3837 s | 511,232 B |
-| 32 B | 8.751 s | 16.174 s | 0.5445 s | 2.3901 s | 559,776 B |
+| nothing | 4.504 s | 8.387 s | 0.2830 s | 1.2394 s | 465,904 B |
+| 2 B | 4.504 s | 8.387 s | 0.2830 s | 1.2394 s | 465,904 B |
+| **4 B** *(the default now)* | 4.365 s | **8.064 s** | 0.2723 s | **1.1910 s** | **472,544 B** |
+| 8 B | 4.369 s | 8.064 s | **0.2723 s** | 1.1910 s | 484,832 B |
+| 16 B | **4.363 s** | 8.069 s | 0.2723 s | 1.1919 s | 511,232 B |
+| 32 B | 4.376 s | 8.087 s | 0.2723 s | 1.1951 s | 559,776 B |
 
 Two bytes is a no-op and the image comes out **byte-identical**, because
 RV32IMAC's compressed instructions already force that alignment — which is a
@@ -204,7 +209,7 @@ for a 64-byte shift — and the answer holds:
 
 | `binary_trees` | shift 0 | shift 64 B |
 |---|---|---|
-| time | 9.006461 s | 9.007241 s |
+| time | 4.503231 s | 4.503621 s |
 
 0.009%, and `fib` 0.0002%. **Data placement does not matter here.** That is
 what the part predicts: instructions are fetched from flash through a cache,
@@ -267,9 +272,10 @@ event 0 without retiring an instruction. And `+branch` takes event 9 from 1 to
 0, which no reading of "event 9 counts something" explains on its own.
 
 **The one worth finding next is an instruction-cache miss.** It is very likely
-among events 4 and 7-12. That would turn the fetch-bound conclusion below from
-an inference into a direct reading, and would say whether shrinking the
-interpreter is the lever or whether something else is.
+among events 4 and 7-12. That would test the fetch-bound reading below --
+withdrawn once the clock was corrected -- directly rather than by inference,
+and would say whether shrinking the interpreter is the lever or whether
+something else is.
 
 ### The proof that it measures work and not placement
 
@@ -277,12 +283,12 @@ Same source, built twice, differing only in branch-target padding:
 
 | `binary_trees` | no padding | 4 B padding | difference |
 |---|---|---|---|
-| time | 9.007332 s | 8.731564 s | **−3.06%** |
+| time | 4.503666 s | 4.365782 s | **−3.06%** |
 | instructions retired | 541,532,864 | 541,532,863 | **1 in 541 million** |
 
 | `fib` | no padding | 4 B padding | difference |
 |---|---|---|---|
-| time | 16.774597 s | 16.127337 s | **−3.86%** |
+| time | 8.387299 s | 8.063669 s | **−3.86%** |
 | instructions retired | 970,748,140 | 970,747,973 | 1 in 5.8 million |
 
 Three per cent of time, and the work identical to a part in a million. It
@@ -290,20 +296,23 @@ cannot be fooled by where the code landed, which is the entire point.
 
 ### What it says about the bottleneck
 
-Cycles per instruction, from the device's own timer around `interpret` and a
-nominal 160 MHz — so approximate, but the comparison between columns is not:
+Cycles per instruction, from the device's own timer around `interpret` and the
+160 MHz the times above are given at — so approximate, but the comparison
+between columns is not:
 
 | | no padding | 4 B padding |
 |---|---|---|
-| `binary_trees` | 2.67 | **2.58** |
-| `fib` | 2.77 | **2.66** |
-| `list_build` | 2.72 | **2.62** |
-| `method_call` | 2.69 | **2.59** |
+| `binary_trees` | 1.34 | **1.29** |
+| `fib` | 1.39 | **1.33** |
+| `list_build` | 1.36 | **1.31** |
+| `method_call` | 1.35 | **1.30** |
 
-**Between two and three cycles per instruction on an in-order core whose common
-instructions take one.** Two of every three cycles retire nothing, and the
-thing that moves the number is where the branch targets sit. That is a
-fetch-bound interpreter.
+**About 1.3 cycles per instruction on an in-order core whose common
+instructions take one**, and the thing that moves the number is where the
+branch targets sit. Read at the wrong clock, as two to three, this table was
+taken for a fetch-bound interpreter -- two cycles in three retiring nothing --
+and the next paragraph was built on that reading; the correction below it says
+what stands.
 
 It explains a result that is otherwise baffling: rewriting the dispatch from
 two jump tables to one is 2.4-3.4% faster on an unpadded build and a 1.1-1.6%
@@ -314,11 +323,12 @@ dispatch — the stable-Rust stand-in for computed `goto`, which re-expands the
 decode at the end of every arm — will lose for the same reason, since its whole
 method is to make the loop bigger.
 
-**Correction, 2026-09-29: the clock was 80 MHz, and this table is wrong by
-exactly two.** The port asked esp-hal for its default configuration, which runs
-an ESP32-C6 at 80 MHz, not the 160 MHz "nominal" figure the division assumed.
-The chip's own cycle counter -- event 0 above, read directly rather than
-derived -- gives **1.29 to 1.33** cycles per instruction in the `opcost` loop
+**Correction, 2026-09-29: the clock was 80 MHz, and this table was wrong by
+exactly two** -- it read 2.58 to 2.77, and is shown halved above. The port
+asked esp-hal for its default configuration, which runs an ESP32-C6 at 80 MHz,
+not the 160 MHz "nominal" figure the division assumed. The chip's own cycle
+counter -- event 0 above, read directly rather than derived -- gives
+**1.29 to 1.33** cycles per instruction in the `opcost` loop
 and 1.31 for `fib` whole. Two cycles in three are *not* idle; the interpreter is
 not fetch-bound in the sense this section argued. Padding branch targets still
 moves time by 3-4%, which is measured and stands. What does not stand is the
@@ -374,21 +384,26 @@ falls out of it:**
 **A hundred and fourteen machine instructions per bytecode instruction**, and
 strikingly constant across three programs of completely different shapes — the
 fourth is higher because it is the one that collects. Upstream C Wren runs
-`method_call` 6.8 times faster, which puts it near seventeen. That ratio is the
-whole gap, stated as work rather than as seconds, and it is the number any
+`method_call` 3.4 times faster, which puts it near thirty-three. That ratio is
+the whole gap, stated as work rather than as seconds, and it is the number any
 future optimisation should be judged against.
 
 *The arithmetic checks out against the clock, which is worth doing before
-believing a derived figure: 1.25 million opcodes at 113.6 instructions and 2.59
-cycles per instruction is 368 million cycles, and `method_call` at 160 MHz
-takes 2.30 s — 368 million cycles.*
+believing a derived figure: 1.25 million opcodes at 113.6 instructions and 1.30
+cycles per instruction is 184 million cycles, and `method_call` at 160 MHz
+takes 1.15 s — 184 million cycles.*
 
-*Correction, 2026-09-29: the check balanced because both sides carried the
-same factor of two.* The board was at 80 MHz, so 2.30 s is 184 million cycles
-and the ratio is 1.30 cycles per instruction. The 6.8x was C at 160 MHz against
-this at 80; at one clock `method_call` is 2.3x slower than upstream, which puts
-C near forty machine instructions per bytecode instruction rather than
-seventeen, if the two cores retire at a similar rate.
+*Correction, 2026-09-29: as first written, at 2.59 cycles per instruction and
+368 million cycles, the check balanced because both sides carried the same
+factor of two.* The board was at 80 MHz and its time had been turned into
+cycles at 160, so a check made from that same time could not catch it; at the
+true clock it is 184 million cycles and 1.30 cycles per instruction, as above.
+The 6.8x first written here was C at 160 MHz against this at 80, and the
+seventeen came from it; at one clock it was 3.4x. At the clock fix, with five
+pairs fused, `method_call` was 2.3x slower than upstream at 96.0 instructions
+per opcode, which puts C near forty per opcode of that tree -- the same
+forty-two million instructions as thirty-three per opcode here, if the two
+cores retire at a similar rate.
 
 `Call` is between a fifth and a third of every profile, and in `fib` it ties
 `LoadLocal` almost exactly — because arithmetic in Wren *is* method calls, so
@@ -495,17 +510,17 @@ stopwatch.
 
 | | time | instructions | heap | what it isolates |
 |---|---|---|---|---|
-| `method_call` | 2.382 s | 147,936,064 | 8,572 B | **dispatch, almost purely.** Barely allocates, so the collector cannot move it; what it measures is method lookup and the call sequence |
-| `fib` | 16.127 s | 970,747,973 | 4,172 B | **calls and arithmetic**, and the longest run of the four, so its clock is the steadiest |
-| `binary_trees` | 8.729 s | 541,532,863 | 117,384 B | **allocation and collection.** The right benchmark for memory work and the wrong one for dispatch work, because a change in either shows up here |
-| `list_build` | 0.545 s | 33,547,740 | 132,844 B | correctness, and peak memory |
+| `method_call` | 1.191 s | 147,936,064 | 8,572 B | **dispatch, almost purely.** Barely allocates, so the collector cannot move it; what it measures is method lookup and the call sequence |
+| `fib` | 8.064 s | 970,747,973 | 4,172 B | **calls and arithmetic**, and the longest run of the four, so its clock is the steadiest |
+| `binary_trees` | 4.365 s | 541,532,863 | 117,384 B | **allocation and collection.** The right benchmark for memory work and the wrong one for dispatch work, because a change in either shows up here |
+| `list_build` | 0.273 s | 33,547,740 | 132,844 B | correctness, and peak memory |
 
-**`list_build` is too short to time.** Half a second means a one per cent
-change is five milliseconds, and placement alone moves it by three per cent, so
-its clock cannot settle anything. Its *instruction count* is still exact — that
-is the point of the counter — so it remains usable for "did this do less work",
-just not for "is this faster". Its real value is peak memory, where it is the
-heaviest of the four.
+**`list_build` is too short to time.** A quarter of a second means a one per
+cent change is under three milliseconds, and placement alone moves it by three
+per cent, so its clock cannot settle anything. Its *instruction count* is still
+exact — that is the point of the counter — so it remains usable for "did this
+do less work", just not for "is this faster". Its real value is peak memory,
+where it is the heaviest of the four.
 
 **`binary_trees` should not be the default target for interpreter work**, which
 it has been by habit because it is the one the profiler has most to say about.
@@ -1005,7 +1020,7 @@ bytecode change, could not do better than that.
 | 64-bit key, two-multiply hash | +4.64% | +6.58% | +3.31% |
 | one-word key, one-multiply hash | +3.54% | +4.97% | +2.53% |
 
-Time moved the same way: `fib` 13.843 s to 14.552 even in the cheaper form.
+Time moved the same way: `fib` 6.922 s to 7.276 even in the cheaper form.
 
 **The reason is that there is no memory hierarchy to defeat.** A method cache
 is worth having on a machine where chasing four pointers means four chances to
@@ -1034,14 +1049,14 @@ After a day of it, `method_call`'s profile is flat: `run_frames` itself is 21
 samples of 50 and nothing else is above 3. `binary_trees` has one peak left,
 `Heap::collect` at 6 of 50, which is the collector rather than the interpreter.
 
-**What is left is fetch, not execute.** Cycles per instruction sit at 2.58,
-and the changes that moved the clock furthest were the ones that made the code
-*smaller* rather than the ones that made it do less:
+**What is left looked like fetch, not execute.** Cycles per instruction sit at
+1.29, and the changes that moved the clock furthest were the ones that made the
+code *smaller* rather than the ones that made it do less:
 
-*(Corrected 2026-09-29: the 2.58 was measured at 80 MHz and divided by 160; the
-counter reads 1.3. The table below is measured and stands; the heading's
-reading of it does not -- see the correction under "What it says about the
-bottleneck".)*
+*(Corrected 2026-09-29: this first read 2.58, measured at 80 MHz and divided by
+160; the counter reads 1.3. The table below is measured and stands; the reading
+of it as fetch-bound does not -- see the correction under "What it says about
+the bottleneck".)*
 
 | change | work | time |
 |---|---|---|
@@ -1082,8 +1097,8 @@ slower, in two independent encodings:
 | two opcodes (`CaptureLocal`, `CaptureUpvalue`) | +0.27% | +0.79% | +0.62% |
 | one opcode, local flagged in the operand's top bit | +0.23% | +0.79% | +0.56% |
 
-Time moved further: `method_call` 1.949 s to 2.005 and 2.012, `fib` 13.454 to
-14.008 and 14.102.
+Time moved further: `method_call` 0.975 s to 1.003 and 1.006, `fib` 6.727 to
+7.004 and 7.051.
 
 **The cost is not in executing the new instructions.** `fib` runs `Closure`
 about twice in a whole benchmark, and its work went up by 6,374,871

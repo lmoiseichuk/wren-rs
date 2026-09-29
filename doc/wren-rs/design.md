@@ -20,7 +20,12 @@ Two facts govern every number below, and both cost a day to learn. They are
 argued in full in [`profiling.md`](profiling.md); the short form is:
 
 **The board is exact.** Three flashes of one image give `binary_trees`
-9.006731 s, 9.006731 s and 9.006731 s. One run is the measurement.
+4.503366 s, 4.503366 s and 4.503366 s. One run is the measurement.
+
+> Times are at 160 MHz. Rust-port times measured before 2026-09-29 were taken
+> at 80 MHz -- esp-hal's default clock -- and are shown halved: the clock fix
+> measured every benchmark at 50.0-50.2% of its 80 MHz time with identical
+> instructions retired ([`profiling.md`](profiling.md), *The clock*).
 
 **Its code placement is not.** Padding every branch target to four bytes --
 same source, same structs, only the instructions moved -- is worth 3 to 4% on
@@ -30,9 +35,13 @@ nothing either*, because that is exactly what placement produces. The chip's
 performance counter is what settles those: instructions retired move by one
 part in 541 million across a placement change worth 3% of the time.
 
-The interpreter is **fetch-bound** — between 2.6 and 2.8 cycles per instruction
-on an in-order core whose common instructions take one. That is the fact behind
-the next section, and behind the padding now being in the build.
+The chip's own cycle counter reads about **1.3 cycles per instruction** — an
+in-order core whose common instructions take one, doing ordinary work rather
+than starving on its instruction fetch. This page used to call the interpreter
+**fetch-bound**, at 2.6 to 2.8; that was wall time divided by a 160 MHz clock
+the board was not running at. The placement effect above is measured and
+stands, and that is the fact behind the next section, and behind the padding
+now being in the build.
 
 ### What it said about the obvious next optimisation
 
@@ -44,15 +53,15 @@ several placements, both variants built from the same commit:
 
 | | `binary_trees` | `fib` | `method_call` | flashed image |
 |---|---|---|---|---|
-| two tables, no padding | 9.007 s | 16.774 s | 2.479 s | 465,904 B |
-| one table, no padding | 8.787 s | 16.273 s | 2.395 s | 465,552 B |
-| two tables, 4 B padding | **8.729 s** | **16.127 s** | **2.382 s** | 472,544 B |
-| one table, 4 B padding | 8.824 s | 16.380 s | 2.422 s | 472,192 B |
+| two tables, no padding | 4.504 s | 8.387 s | 1.240 s | 465,904 B |
+| one table, no padding | 4.394 s | 8.137 s | 1.198 s | 465,552 B |
+| two tables, 4 B padding | **4.365 s** | **8.064 s** | **1.191 s** | 472,544 B |
+| one table, 4 B padding | 4.412 s | 8.190 s | 1.211 s | 472,192 B |
 
 **The two are substitutes, and together they are worse than padding alone.**
 The rewrite is worth 2.4-3.4% on an unpadded build and is a 1.1-1.6%
-*regression* on a padded one. Both treat the same bottleneck, and once it is
-relieved the rewrite only adds code. So it is not in the tree: it would have to
+*regression* on a padded one. Both act on the same cost, and once padding has
+taken it the rewrite only adds code. So it is not in the tree: it would have to
 be re-argued against whatever placement ships, and it costs the exhaustiveness
 `match op` gives for free -- a new opcode with no arm would become a runtime
 "bad opcode" rather than a compile error.
@@ -268,7 +277,7 @@ allocator overhead is real and this will show up.
 **Every access is bounds-checked — and it costs far more than this note used to
 claim.** A pointer dereference becomes an index into a `Vec`. The estimate here
 was "single-digit to low-double-digit percent". The first run on real hardware
-says **four to eight times slower than upstream Wren**, worst on the benchmark
+says **two to four times slower than upstream Wren**, worst on the benchmark
 that is almost pure method dispatch — see
 [`../wren/benchmarks-wren-rs.md`](../wren/benchmarks-wren-rs.md).
 
@@ -290,9 +299,9 @@ read and *every* write. And method lookup walked the superclass chain, where
 upstream copies a parent's methods into the child when the class is created.
 
 What is left after fixing those is four lookups per call where there were ten,
-and the measured result on an ESP32-C6 at 160 MHz was `method_call` 2.766 →
-2.356 s, `fib` 18.176 → 16.601, `binary_trees` 8.616 → 8.268, `list_build`
-0.574 → 0.568.
+and the measured result on an ESP32-C6 at 160 MHz was `method_call` 1.383 →
+1.178 s, `fib` 9.088 → 8.301, `binary_trees` 4.308 → 4.134, `list_build`
+0.287 → 0.284.
 
 *Each table in this document measures one change against the commit before it,
 so the absolute numbers are of that moment rather than of today; the current
@@ -322,10 +331,10 @@ linked, `f64` against `f32`:
 
 | | `-Os` | `-O3` |
 |---|---|---|
-| `binary_trees` | 14.172 → 13.042 s | 7.882 → 7.015 s |
-| `fib` | 32.642 → 29.739 s | 16.737 → 14.638 s |
-| `list_build` | 0.992 → 0.891 s | 0.570 → 0.495 s |
-| `method_call` | 4.183 → 3.914 s | 2.382 → 2.128 s |
+| `binary_trees` | 7.086 → 6.521 s | 3.941 → 3.508 s |
+| `fib` | 16.321 → 14.870 s | 8.369 → 7.319 s |
+| `list_build` | 0.496 → 0.446 s | 0.285 → 0.248 s |
+| `method_call` | 2.092 → 1.957 s | 1.191 → 1.064 s |
 | image | 244,416 → 227,184 B | 360,816 → 341,056 B |
 | `binary_trees` heap | 155,676 → 120,772 B | same |
 | `list_build` heap | 132,096 → 66,508 B | same |
@@ -398,10 +407,10 @@ Measured on an ESP32-C6FH4 at 160 MHz, against the commit before it:
 |---|---|---|
 | `binary_trees` peak heap | 158,124 B | **133,888 B** |
 | VM resident | 24,680 B | **22,920 B** |
-| `binary_trees` | 8.268 s | **8.169 s** |
-| `fib` | 16.601 s | **16.573 s** |
-| `list_build` | 0.568 s | **0.562 s** |
-| `method_call` | 2.356 s | **2.348 s** |
+| `binary_trees` | 4.134 s | **4.085 s** |
+| `fib` | 8.301 s | **8.287 s** |
+| `list_build` | 0.284 s | **0.281 s** |
+| `method_call` | 1.178 s | **1.174 s** |
 
 **It pays twice, which was not the expectation.** The memory was the point;
 the speed came from `class_of`, where seven of ten answers are now the
@@ -458,10 +467,10 @@ ESP32-C6FH4 at 160 MHz, `binary_trees`, speed profile:
 
 | | time | peak |
 |---|---|---|
-| **tracing, as it stands** | **9.104 s** | 117,384 B |
-| tracing + a 16 KB ceiling | 10.148 s | **109,004 B** |
-| deferred reference counting | 9.630 s | 126,056 B |
-| a young generation + that ceiling | 9.105 s | 176,736 B |
+| **tracing, as it stands** | **4.552 s** | 117,384 B |
+| tracing + a 16 KB ceiling | 5.074 s | **109,004 B** |
+| deferred reference counting | 4.815 s | 126,056 B |
+| a young generation + that ceiling | 4.553 s | 176,736 B |
 
 The profile said why in advance: collection is 16.9% of the one benchmark that
 allocates and 0.0-0.6% of the other three, so a replacement can win at most 17%

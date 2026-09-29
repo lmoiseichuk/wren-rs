@@ -10,17 +10,36 @@ the result was not the one the design predicted and that is worth more than a
 flattering number. It has since been worked on; both sets of numbers are below,
 because the first one is what the second is owed to.
 
+## Now, at 160 MHz (2026-09-29)
+
+The default build -- `speed` profile, `f64` -- on the same clock as the C port
+and MicroPython:
+
+| benchmark | wren-rs `speed` | C Wren `-O2` | C Wren `-Os` | MicroPython | wren-rs vs C `-O2` | wren-rs vs MicroPython |
+|---|---|---|---|---|---|---|
+| `binary_trees` | **2.539 s** | 2.160 s | 2.440 s | 4.729 s | 1.2x slower | 1.9x faster |
+| `fib` | **4.119 s** | 3.250 s | 3.710 s | 7.109 s | 1.3x slower | 1.7x faster |
+| `list_build` | **0.175 s** | 0.130 s | 0.150 s | 0.154 s | 1.3x slower | 1.1x slower |
+| `method_call` | **0.660 s** | 0.350 s | 0.420 s | 1.748 s | 1.9x slower | 2.6x faster |
+
+Everything below is the history that led here.
+
 ## Speed
+
+> Times are at 160 MHz. Rust-port times measured before 2026-09-29 were taken
+> at 80 MHz -- esp-hal's default clock -- and are shown halved: the clock fix
+> measured every benchmark at 50.0-50.2% of its 80 MHz time with identical
+> instructions retired (`doc/wren-rs/profiling.md`, *The clock*).
 
 | benchmark | wren-rs `speed` | wren-rs `size` | C Wren `-O2` | C Wren `-Os` | MicroPython | wren-rs vs C `-O2` |
 |---|---|---|---|---|---|---|
-| `binary_trees` | **9.104 s** | 15.371 s | 2.160 s | 2.440 s | 4.729 s | 3.8x slower |
-| `fib` | **16.966 s** | 33.669 s | 3.250 s | 3.710 s | 7.109 s | 5.1x slower |
-| `list_build` | **0.579 s** | 1.028 s | 0.130 s | 0.150 s | 0.154 s | 4.3x slower |
-| `method_call` | **2.519 s** | 4.326 s | 0.350 s | 0.420 s | 1.748 s | 6.7x slower |
+| `binary_trees` | **4.552 s** | 7.686 s | 2.160 s | 2.440 s | 4.729 s | 2.1x slower |
+| `fib` | **8.483 s** | 16.835 s | 3.250 s | 3.710 s | 7.109 s | 2.6x slower |
+| `list_build` | **0.290 s** | 0.514 s | 0.130 s | 0.150 s | 0.154 s | 2.2x slower |
+| `method_call` | **1.260 s** | 2.163 s | 0.350 s | 0.420 s | 1.748 s | 3.6x slower |
 
-**wren-rs is four to seven times slower than upstream Wren on this part**, and
-one and a half to five times slower than MicroPython. `method_call` is the
+**wren-rs was two to four times slower than upstream Wren on this part**, and
+between 1.4x faster and 1.9x slower than MicroPython. `method_call` is the
 worst of the four, which is the tell: it is almost pure dispatch, and dispatch
 is where this implementation's indirections all land. That contradicts what
 `doc/wren-rs/design.md` predicted for the central design decision — reaching
@@ -30,12 +49,12 @@ the design note has been corrected.
 
 ### What the first run said, and what changed
 
-| benchmark | first run | now | |
+| benchmark | first run | tuned | |
 |---|---|---|---|
-| `binary_trees` | 8.616 s | 9.104 s | +5.7% |
-| `fib` | 18.176 s | 16.966 s | −6.7% |
-| `list_build` | 0.574 s | 0.579 s | +0.9% |
-| `method_call` | 2.766 s | 2.519 s | **−8.9%** |
+| `binary_trees` | 4.308 s | 4.552 s | +5.7% |
+| `fib` | 9.088 s | 8.483 s | −6.7% |
+| `list_build` | 0.287 s | 0.290 s | +0.9% |
+| `method_call` | 1.383 s | 1.260 s | **−8.9%** |
 
 The gain is all in the call path, which is why `method_call` moves most and
 `list_build` — a loop over a primitive — barely at all. Entering a call asked
@@ -65,10 +84,10 @@ compiler linked:
 
 | benchmark | `-Os` f64 | `-Os` f32 | `-O3` f64 | `-O3` f32 |
 |---|---|---|---|---|
-| `binary_trees` | 14.172 s | 13.042 s | 7.882 s | **7.015 s** |
-| `fib` | 32.642 s | 29.739 s | 16.737 s | **14.638 s** |
-| `list_build` | 0.992 s | 0.891 s | 0.570 s | **0.495 s** |
-| `method_call` | 4.183 s | 3.914 s | 2.382 s | **2.128 s** |
+| `binary_trees` | 7.086 s | 6.521 s | 3.941 s | **3.508 s** |
+| `fib` | 16.321 s | 14.870 s | 8.369 s | **7.319 s** |
+| `list_build` | 0.496 s | 0.446 s | 0.285 s | **0.248 s** |
+| `method_call` | 2.092 s | 1.957 s | 1.191 s | **1.064 s** |
 | image | 244,416 B | **227,184 B** | 360,816 B | 341,056 B |
 | VM resident | 24,680 B | **23,880 B** | 24,680 B | **23,880 B** |
 | `binary_trees` heap | 155,676 B | **120,772 B** | 155,672 B | **120,772 B** |

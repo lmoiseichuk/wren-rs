@@ -33,13 +33,19 @@ two is the whole argument:
 
 ESP32-C6FH4 at 160 MHz, 320 KB heap, both programs run in one VM.
 
+> Times are at 160 MHz. Rust-port times measured before 2026-09-29 were taken
+> at 80 MHz — esp-hal's default clock — and are shown halved: the clock fix
+> measured every benchmark at 50.0-50.2% of its 80 MHz time with identical
+> instructions retired ([`doc/wren-rs/profiling.md`](../../doc/wren-rs/profiling.md),
+> *The clock*).
+
 | `-Os` | bytecode | compiler |
 |---|---|---|
 | image | **244,960 B** | 279,440 B |
 | programs in image | 8,422 B | 11,815 B |
-| prepare, both files | **9,821 µs** | 64,154 µs |
-| run, both files | 3,196,086 µs | 3,211,906 µs |
-| reset to idle | **3,228,083 µs** | 3,298,642 µs |
+| prepare, both files | **4,911 µs** | 32,077 µs |
+| run, both files | 1,598,043 µs | 1,605,953 µs |
+| reset to idle | **1,614,042 µs** | 1,649,321 µs |
 | heap left | **183,040 B** | 172,552 B |
 | VM resident | 24,680 B | 24,680 B |
 
@@ -68,8 +74,8 @@ half off the heap. It is off by default and it is not Wren — see
 `crates/wren`'s own feature documentation.
 
 **Preparation is 6.5x faster, and it does not matter much here.** Loading both
-files takes 9.8 ms against 64.2 ms to compile them — a real difference, and an
-irrelevant one against programs that then run for three seconds. It is worth
+files takes 4.9 ms against 32.1 ms to compile them — a real difference, and an
+irrelevant one against programs that then run for two seconds. It is worth
 having when start-up latency is the thing being paid for: a node that wakes,
 samples and sleeps pays the prepare cost on every wake and the run cost for a
 few milliseconds. For that duty cycle the ratio inverts and this is the

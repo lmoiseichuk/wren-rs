@@ -119,7 +119,7 @@ IMAGE="target/riscv32imac-unknown-none-elf/$PROFILE/${BIN:-esp32c6-wren-rs}"
 espflash flash --monitor --non-interactive --port "$DEVICE" "$IMAGE" >> "$LOG" 2>&1 &
 FLASH=$!
 
-# The benchmark set is about half a minute at `-O3` and twice that at `-Os`;
+# The benchmark set is about half a minute at `-O3` and fifty seconds at `-Os`;
 # the ceiling is generous because a failed run should report rather than hang.
 for _ in $(seq 1 300); do
     grep -qE "^done|Error:|PANIC" "$LOG" && break
