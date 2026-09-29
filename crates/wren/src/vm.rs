@@ -185,7 +185,6 @@ struct CallTarget {
     /// See [`ObjFn::max_slots`]. Carried here so reserving a frame's room
     /// needs no second walk out to the function.
     max_slots: usize,
-    arity: usize,
     module: usize,
     field_offset: u16,
 }
@@ -1369,21 +1368,40 @@ impl Vm {
     /// variant, which is why the objects themselves carry no class pointer —
     /// see the note on `classObj` in the crate README.
     pub fn class_of(&self, value: Value) -> Option<ObjectId> {
+        // **Objects first, and instances and classes before the rest.** This
+        // is the dispatch path, and what reaches it is mostly a method call
+        // on an instance, or a static one on a class: arithmetic on numbers
+        // is answered before any lookup, and `!` on a bool too. Asking about
+        // numbers, booleans and null first cost an instance eighteen
+        // instructions before the question that applied to it -- the boolean
+        // test alone is a range check across both halves of a `u64`.
+        // Upstream's `wrenGetClassInline` asks `IS_NUM` and then `IS_OBJ`,
+        // and reads the class out of the object's header in one load.
+        if let Some(id) = value.as_object() {
+            return match self.heap.kind_of(id)? {
+                ObjectType::Instance => Some(self.heap.instance(id)?.class),
+                ObjectType::Class => Some(self.heap.class(id)?.metaclass.unwrap_or(self.class_class)),
+                other => self.class_of_other(id, other),
+            };
+        }
         if value.is_num() {
             return Some(self.num_class);
-        }
-        if value.is_bool() {
-            return Some(self.bool_class);
         }
         if value.is_null() {
             return Some(self.null_class);
         }
-        let id = value.as_object()?;
+        if value.is_bool() {
+            return Some(self.bool_class);
+        }
+        None
+    }
+
+    /// The class of an object that is neither an instance nor a class.
+    fn class_of_other(&self, id: ObjectId, kind: ObjectType) -> Option<ObjectId> {
         // **Seven of these ten answers do not need the object at all.** A
         // `List` is a `List` whatever is in it, so once the type is in the
-        // handle this whole path is a shift and a table lookup -- and this is
-        // the dispatch path, reached on every method call.
-        match self.heap.kind_of(id)? {
+        // handle this whole path is a shift and a table lookup.
+        match kind {
             ObjectType::String => Some(self.string_class),
             ObjectType::List => Some(self.list_class),
             ObjectType::Map => Some(self.map_class),
@@ -1895,7 +1913,6 @@ impl Vm {
         Ok(CallTarget {
             chunk: ChunkRef::from(&*function.chunk),
             max_slots: function.max_slots,
-            arity: function.arity,
             module: function.module,
             field_offset: function.field_offset as u16,
         })
@@ -3091,14 +3108,11 @@ impl Vm {
                             // code and module all come from the same `ObjFn`,
                             // and asking for them separately was the bulk of
                             // what a call cost.
+                            // **No arity check.** The method was found by a
+                            // signature, which carries its arity, and
+                            // `bind_method` refused a body that disagreed
+                            // with its signature.
                             let target = self.call_target(closure)?;
-                            if target.arity != arity {
-                                return Err(Self::wrong_arity(
-                                    target.arity,
-                                    arity,
-                                    chunk_of(chunk).line_at(offset_of!(at)),
-                                ));
-                            }
                             if self.frames.len() >= MAX_FRAMES {
                                 return Err(Self::stack_overflow(chunk_of(chunk).line_at(offset_of!(at))));
                             }
@@ -3816,6 +3830,27 @@ impl Vm {
             None => 0,
         };
         self.set_field_offset(closure, inherited, superclass, class_id);
+
+        // **The arity is checked here, once, so that a call need not check
+        // it every time.** A signature carries its arity -- one `_` per
+        // argument, `name(_,_)`, `[_]=(_)`, `-` -- and every call through this
+        // table is a call *by signature*, so a body that agrees with its
+        // signature when it is bound agrees with every call that can reach
+        // it. Upstream checks at neither point: its compiler guarantees the
+        // agreement. Bytecode here can come from a file, so the guarantee is
+        // checked where it costs one comparison per method rather than one
+        // per call.
+        let expected = match self.method_names.name(symbol) {
+            Some(signature) => signature.bytes().filter(|byte| *byte == b'_').count(),
+            None => return Err(RuntimeError::new("Method symbol out of range.")),
+        };
+        let got = match self.function_of(closure) {
+            Some(function) => function.arity,
+            None => return Err(RuntimeError::new("Method body has no function.")),
+        };
+        if got != expected {
+            return Err(Self::wrong_arity(expected, got, 0));
+        }
 
         if let Some(class) = self.heap.class_mut(target) {
             class.define(symbol, crate::object::closure_entry(closure));
