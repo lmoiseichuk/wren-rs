@@ -123,13 +123,13 @@ const _: () = ();
 /// lookups. Resuming a caller needs its chunk and the module its variables
 /// resolve against; both are reachable from `closure`, but only by going
 /// closure -> function -> chunk through the heap table, twice, on every single
-/// return. Storing them costs two words per frame and a refcount bump per
-/// call, and removes that walk from the hot path entirely.
+/// return. Storing them costs two words per frame, and removes that walk from
+/// the hot path entirely.
 ///
 /// It used to be `Copy`, so the interpreter could lift a frame out of the
-/// stack without borrowing `self`. An `Rc` makes that impossible, so the
-/// handful of sites that did it read the fields they need through a borrow
-/// that ends in the same statement instead.
+/// stack without borrowing `self`. An `Rc` made that impossible while the
+/// chunk was held by one, so the handful of sites that did it read the fields
+/// they need through a borrow that ends in the same statement instead.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub closure: ObjectId,
@@ -144,16 +144,15 @@ pub struct Frame {
     /// **The same rule as `ip` above, for the same reason.** While a frame
     /// runs, the interpreter keeps its chunk in a local; the field is filled in
     /// when the frame stops being the running one, and emptied when it starts
-    /// again. That makes a call and its return move one `Rc` along the frame
-    /// stack rather than clone it twice and drop it twice -- and a refcount is
-    /// a load, an add and a store on a hot path that does nothing else with
-    /// that memory.
+    /// again. A `ChunkRef` rather than an `Rc`, which is what took the
+    /// reference count off every call and return; its safety note says why
+    /// the frame is what keeps it valid.
     ///
     /// `None` on a frame that is not running means nobody stored it: a
     /// primitive that re-enters the interpreter cannot, not knowing its
     /// caller's chunk. [`Vm::resume_chunk`] derives it in that case, which is
     /// a heap walk on a path that is already leaving the interpreter.
-    pub chunk: Option<Rc<Chunk>>,
+    pub chunk: Option<ChunkRef>,
     /// The module this frame's code resolves its variables against.
     pub module: usize,
     /// How deep the stack was when this frame started running.
@@ -182,7 +181,7 @@ pub struct Frame {
 ///
 /// See [`Vm::call_target`], which fills it in with a single walk of the heap.
 struct CallTarget {
-    chunk: Rc<Chunk>,
+    chunk: ChunkRef,
     /// See [`ObjFn::max_slots`]. Carried here so reserving a frame's room
     /// needs no second walk out to the function.
     max_slots: usize,
@@ -521,7 +520,42 @@ const NUM_GT: u8 = 7;
 const NUM_LE: u8 = 8;
 const NUM_GE: u8 = 9;
 
-/// A chunk's code, as a slice whose lifetime is not tied to the `Rc`.
+/// A chunk, reached by pointer rather than through its `Rc`.
+///
+/// **Upstream's frame holds its function by pointer; this one held an `Rc`,
+/// and paid for it on every call.** Entering a closure cloned the callee's
+/// `Rc<Chunk>` -- a load, an add, a store and an overflow test -- and the return
+/// dropped it again, about 1.2 million times a run across the four benchmarks.
+/// The count was never what kept the chunk alive; the frame was, as below.
+///
+/// # Safety
+///
+/// Every `ChunkRef` the interpreter holds -- in a local of `run_frames`, or
+/// parked in a [`Frame`] -- points into the `Rc<Chunk>` owned by the `ObjFn`
+/// behind that frame's closure. Three things keep it valid for as long as the
+/// frame exists:
+///
+/// 1. **A frame roots its closure.** `Vm::roots` pushes every running frame's,
+///    and `ObjFiber::trace` every parked one's; a closure traces its function,
+///    and a function owns its `Rc<Chunk>`.
+/// 2. **A function's chunk is never replaced.** `ObjFn::chunk` is written when
+///    the function is built and assigned nowhere afterwards.
+/// 3. **A chunk never changes.** It is behind an `Rc`, and there is no
+///    `Rc::get_mut`, no `make_mut` and no interior mutability in the crate, so
+///    neither the `Chunk` nor the code and constants it owns can move.
+///
+/// That is the guarantee the `Rc` gave, reached without touching a count.
+pub(crate) type ChunkRef = ::core::ptr::NonNull<Chunk>;
+
+/// The chunk behind a [`ChunkRef`].
+#[allow(unsafe_code)]
+#[inline(always)]
+fn chunk_of<'a>(chunk: ChunkRef) -> &'a Chunk {
+    // SAFETY: see `ChunkRef`.
+    unsafe { chunk.as_ref() }
+}
+
+/// A chunk's code, as a slice whose lifetime is not tied to a borrow.
 ///
 /// **This only pays together with the unchecked fetch below**, and that is
 /// worth recording because each half measured as a regression on its own:
@@ -531,22 +565,15 @@ const NUM_GE: u8 = 9;
 ///
 /// # Safety
 ///
-/// The returned slice must not outlive the `Rc` passed in, and the caller
-/// must hold a strong reference while it reads. In `run_frames` that is
-/// `chunk`, and `follow_chunk!` keeps the two in step -- it points the slice
-/// at the new chunk *before* moving it in, so releasing the old one can never
-/// leave the slice dangling.
-///
-/// A `Chunk` cannot move or change underneath: it lives behind an `Rc`, and
-/// `code` is only written by `bytecode.rs` through `&mut self` during
-/// compilation, which finishes before any of it executes. There is no
-/// `Rc::get_mut`, no `make_mut` and no interior mutability in the crate, so a
-/// `Chunk` reachable through an `Rc` is immutable in fact, not by convention.
-#[allow(unsafe_code)]
+/// The slice lives as long as the frame whose chunk it is, which is the
+/// argument on [`ChunkRef`]; `follow_chunk!` points it at the new chunk
+/// whenever the running frame changes. `code` is only written by
+/// `bytecode.rs` through `&mut self` during compilation, which finishes
+/// before any of it executes.
 #[inline(always)]
-fn code_units<'a>(chunk: &Rc<Chunk>) -> &'a [u16] {
-    // SAFETY: as documented above.
-    unsafe { ::core::slice::from_raw_parts(chunk.code.as_ptr(), chunk.code.len()) }
+fn code_units<'a>(chunk: ChunkRef) -> &'a [u16] {
+    // The lifetime is the one `chunk_of` hands out; see `ChunkRef`.
+    chunk_of(chunk).code.as_slice()
 }
 
 /// The chunk's constants, on the same terms as [`code_units`].
@@ -561,15 +588,11 @@ fn code_units<'a>(chunk: &Rc<Chunk>) -> &'a [u16] {
 ///
 /// Identical to [`code_units`], and for the same reasons: `constants` is
 /// written only by `bytecode.rs` during compilation, through `&mut self`, and
-/// a `Chunk` reachable through an `Rc` is immutable in fact -- there is no
-/// `Rc::get_mut`, no `make_mut` and no interior mutability in the crate. The
-/// caller must hold the `Rc` while it reads, which in `run_frames` is `chunk`,
-/// moved in step by `follow_chunk!`.
-#[allow(unsafe_code)]
+/// the slice lives as long as the frame whose chunk it is -- see
+/// [`ChunkRef`].
 #[inline(always)]
-fn chunk_constants<'a>(chunk: &Rc<Chunk>) -> &'a [Value] {
-    // SAFETY: as documented above.
-    unsafe { ::core::slice::from_raw_parts(chunk.constants.as_ptr(), chunk.constants.len()) }
+fn chunk_constants<'a>(chunk: ChunkRef) -> &'a [Value] {
+    chunk_of(chunk).constants.as_slice()
 }
 
 impl Vm {
@@ -1618,7 +1641,7 @@ impl Vm {
 
     /// Push a frame for a closure whose receiver and arguments are already on
     /// the stack, with the receiver at `base`.
-    fn push_frame(&mut self, closure: ObjectId, base: usize) -> Result<Rc<Chunk>, RuntimeError> {
+    fn push_frame(&mut self, closure: ObjectId, base: usize) -> Result<ChunkRef, RuntimeError> {
         if self.frames.len() >= MAX_FRAMES {
             return Err(RuntimeError::new("Stack overflow."));
         }
@@ -1656,13 +1679,15 @@ impl Vm {
     /// fields into the interpreter's hoisted locals, and `target.module` is
     /// much harder to get wrong there than `.2`.
     ///
-    /// **Why the chunk is an `Rc` clone and not a reference.** A `&Chunk`
+    /// **Why the chunk is a pointer and not a reference.** A `&Chunk`
     /// borrowed out of the heap would be a live immutable borrow of `self` for
     /// as long as the call runs -- and the very next instruction pushes onto
     /// `self.stack`. The choices were an `Rc` clone once per call, `unsafe` to
-    /// sever the borrow, or copying the whole chunk per call. A refcount bump
-    /// per *call* -- not per instruction -- is the cheapest of the three by a
-    /// wide margin.
+    /// sever the borrow, or copying the whole chunk per call. It was the `Rc`
+    /// until the clone and its matching drop were measured: 5.5% of `fib`'s
+    /// time and 7% of `method_call`'s, in read-modify-writes of one word that
+    /// an in-order core waits on. [`ChunkRef`] carries the argument that the
+    /// frame, not the count, is what keeps the chunk alive.
     fn call_target(&self, closure: ObjectId) -> Result<CallTarget, RuntimeError> {
         let Some(closure) = self.heap.closure(closure) else {
             return Err(RuntimeError::new("Not a closure."));
@@ -1671,7 +1696,7 @@ impl Vm {
             return Err(RuntimeError::new("Closure has no function."));
         };
         Ok(CallTarget {
-            chunk: function.chunk.clone(),
+            chunk: ChunkRef::from(&*function.chunk),
             max_slots: function.max_slots,
             arity: function.arity,
             module: function.module,
@@ -1992,7 +2017,7 @@ impl Vm {
     }
 
     /// Make the running fiber's stack and frames its own again.
-    fn park_current(&mut self, ip: usize, chunk: Rc<Chunk>) {
+    fn park_current(&mut self, ip: usize, chunk: ChunkRef) {
         if let Some(frame) = self.frames.last_mut() {
             frame.ip = ip;
             // It stops being the running frame here, so this is where its
@@ -2014,7 +2039,7 @@ impl Vm {
     /// the only way to resume one. When the field is empty the chunk is found
     /// the long way, through the frame's closure -- see the note on
     /// [`Frame::chunk`] for when that happens.
-    fn resume_chunk(&mut self) -> Result<Rc<Chunk>, RuntimeError> {
+    fn resume_chunk(&mut self) -> Result<ChunkRef, RuntimeError> {
         let Some(frame) = self.frames.last_mut() else {
             return Err(RuntimeError::new("No frame to resume."));
         };
@@ -2084,7 +2109,7 @@ impl Vm {
         &mut self,
         switch: Switch,
         ip: usize,
-        chunk: Rc<Chunk>,
+        chunk: ChunkRef,
     ) -> Result<(), RuntimeError> {
         let from = self.current_fiber;
         self.park_current(ip, chunk);
@@ -2235,7 +2260,7 @@ impl Vm {
         // anywhere else.
         let function = self.heap.allocate(Object::Fn(Box::new(ObjFn {
             max_slots: chunk.max_slots(),
-            chunk: chunk.clone(),
+            chunk: chunk,
             arity: 0,
             num_upvalues: 0,
             name: "(module)".into(),
@@ -2278,7 +2303,7 @@ impl Vm {
     // **The crate's only `unsafe` lives in this function**, in the fetch and
     // in `code_units`. The audit is `grep -rn unsafe crates/wren/src`.
     #[allow(unsafe_code)]
-    fn run_frames(&mut self, mut chunk: Rc<Chunk>, floor: usize) -> Result<Value, RuntimeError> {
+    fn run_frames(&mut self, mut chunk: ChunkRef, floor: usize) -> Result<Value, RuntimeError> {
         let resume_at = self.frames.last().map_or(0, |frame| frame.ip);
         let mut base = self.frames.last().map_or(0, |frame| frame.base);
         // Cached with `ip` and `base` for the same reason: module variable
@@ -2301,9 +2326,9 @@ impl Vm {
         // The code, in registers rather than re-read every instruction; see
         // `code_units`. Named `units` because `code` is already the module of
         // opcode constants this loop matches on.
-        let mut units: &[u16] = code_units(&chunk);
+        let mut units: &[u16] = code_units(chunk);
         // The constant pool, hoisted on the same terms; see `chunk_constants`.
-        let mut constants: &[Value] = chunk_constants(&chunk);
+        let mut constants: &[Value] = chunk_constants(chunk);
         // **The instruction pointer is a pointer.** As a unit index it cost a
         // shift and an add to turn into an address on every fetch, plus its
         // own increment -- `sll a2, s7, 1`, `add a2, a2, s3`, `add s8, s7, 1`
@@ -2323,8 +2348,8 @@ impl Vm {
         macro_rules! follow_chunk {
             ($next:expr) => {{
                 let next = $next;
-                units = code_units(&next);
-                constants = chunk_constants(&next);
+                units = code_units(next);
+                constants = chunk_constants(next);
                 start = units.as_ptr();
                 chunk = next;
             }};
@@ -2383,8 +2408,8 @@ impl Vm {
             #[cfg(feature = "profile")]
             {
                 self.op_counts[byte as usize] += 1;
-                *self.line_ops.entry((chunk.line_at(offset_of!(at)), byte)).or_insert(0) += 1;
-                let here = Rc::as_ptr(&chunk) as usize;
+                *self.line_ops.entry((chunk_of(chunk).line_at(offset_of!(at)), byte)).or_insert(0) += 1;
+                let here = chunk.as_ptr() as usize;
                 let depth = self.frames.len();
                 if self.previous_op != u16::MAX
                     && self.previous_end == offset_of!(at)
@@ -2721,7 +2746,7 @@ impl Vm {
                             .or_insert(0) += 1;
                         let site = self
                             .call_sites
-                            .entry((Rc::as_ptr(&chunk) as usize, offset_of!(at)))
+                            .entry((chunk.as_ptr() as usize, offset_of!(at)))
                             .or_insert_with(|| (alloc::vec::Vec::new(), 0));
                         site.1 += 1;
                         if !site.0.contains(&start_from.raw()) {
@@ -2730,8 +2755,8 @@ impl Vm {
                     }
                     let found = self.find_method(start_from, symbol);
                     let Some(method) = found else {
-                        let error = self.no_such_method(receiver_at, symbol, chunk.line_at(offset_of!(at)));
-                        match self.deliver_error(error, offset_of!(ip), chunk.clone())? {
+                        let error = self.no_such_method(receiver_at, symbol, chunk_of(chunk).line_at(offset_of!(at)));
+                        match self.deliver_error(error, offset_of!(ip), chunk)? {
                             Some((next_chunk, next_ip, next_base)) => {
                                 follow_chunk!(next_chunk);
                                 // SAFETY: an offset into the chunk just switched to.
@@ -2749,14 +2774,14 @@ impl Vm {
                         Method::Primitive(function) => {
                             let outcome = function(self, receiver_at).map_err(|mut error| {
                                 if error.line == 0 {
-                                    error.line = chunk.line_at(offset_of!(at));
+                                    error.line = chunk_of(chunk).line_at(offset_of!(at));
                                 }
                                 error
                             });
 
                             let value = match outcome {
                                 Ok(value) => value,
-                                Err(error) => match self.deliver_error(error, offset_of!(ip), chunk.clone())? {
+                                Err(error) => match self.deliver_error(error, offset_of!(ip), chunk)? {
                                     Some((next_chunk, next_ip, next_base)) => {
                                         follow_chunk!(next_chunk);
                                         // SAFETY: an offset into the chunk just switched to.
@@ -2781,7 +2806,7 @@ impl Vm {
                             }
                             if let Some(switch) = self.pending_switch.take() {
                                 let failing = switch.as_error.then_some(switch.value);
-                                self.perform_switch(switch, offset_of!(ip), chunk.clone())?;
+                                self.perform_switch(switch, offset_of!(ip), chunk)?;
                                 if let Some(value) = failing {
                                     // The target fails the moment it resumes,
                                     // which is what makes `transferError`
@@ -2789,9 +2814,9 @@ impl Vm {
                                     let message = self.to_string(value);
                                     let error = RuntimeError {
                                         message,
-                                        line: chunk.line_at(offset_of!(at)),
+                                        line: chunk_of(chunk).line_at(offset_of!(at)),
                                     };
-                                    match self.deliver_error(error, 0, chunk.clone())? {
+                                    match self.deliver_error(error, 0, chunk)? {
                                         Some((next_chunk, next_ip, next_base)) => {
                                             follow_chunk!(next_chunk);
                                             // SAFETY: an offset into the chunk just switched to.
@@ -2828,17 +2853,16 @@ impl Vm {
                                 return Err(Self::wrong_arity(
                                     target.arity,
                                     arity,
-                                    chunk.line_at(offset_of!(at)),
+                                    chunk_of(chunk).line_at(offset_of!(at)),
                                 ));
                             }
                             if self.frames.len() >= MAX_FRAMES {
-                                return Err(Self::stack_overflow(chunk.line_at(offset_of!(at))));
+                                return Err(Self::stack_overflow(chunk_of(chunk).line_at(offset_of!(at))));
                             }
                             // **The caller's chunk moves into its frame and
-                            // the callee's into the local.** One `Rc` changes
-                            // hands and none is cloned or dropped: the caller
-                            // stops running exactly here, which is already
-                            // where its `ip` is written back.
+                            // the callee's into the local**: the caller stops
+                            // running exactly here, which is already where
+                            // its `ip` is written back.
                             // **Taken before the switch.** `offset_of!` is
                             // relative to `start`, and `start` is about to
                             // become the callee's chunk -- so the caller's
@@ -2846,21 +2870,21 @@ impl Vm {
                             // it says.
                             let caller_ip = offset_of!(ip);
                             let caller_chunk = {
-                                // Same order as `follow_chunk!`. `replace`
-                                // hands the old chunk back rather than
-                                // dropping it, so nothing is released here.
+                                // Same order as `follow_chunk!`, with
+                                // `replace` handing the caller's chunk back
+                                // to be parked.
                                 let next = target.chunk;
-                                units = code_units(&next);
+                                units = code_units(next);
                                 // **Every slice hoisted out of the chunk has
                                 // to move here too.** This is a hand-inlined
                                 // `follow_chunk!` -- it cannot use the macro,
-                                // which drops the old chunk where this one
+                                // which discards the old chunk where this one
                                 // hands it back to be parked -- and adding
                                 // `constants` to the macro without adding it
                                 // here read the *callee's* constants against
                                 // the caller's pool, which showed up as
                                 // `fib` calling `+` with a non-number.
-                                constants = chunk_constants(&next);
+                                constants = chunk_constants(next);
                                 start = units.as_ptr();
                                 ::core::mem::replace(&mut chunk, next)
                             };
@@ -2937,7 +2961,7 @@ impl Vm {
                             field_offset = self.current_field_offset();
                             continue;
                         }
-                        Err(error) => match self.deliver_error(error, offset_of!(ip), chunk.clone())? {
+                        Err(error) => match self.deliver_error(error, offset_of!(ip), chunk)? {
                             Some((next_chunk, next_ip, next_base)) => {
                                 follow_chunk!(next_chunk);
                                 // SAFETY: an offset into the chunk just switched to.
@@ -2963,7 +2987,7 @@ impl Vm {
                     let module_name = resolve_module(&self.modules[module].name, &module_name);
                     let variable = self.to_string(constants[variable_name]);
 
-                    let value = self.imported_variable(&module_name, &variable, chunk.line_at(offset_of!(at)))?;
+                    let value = self.imported_variable(&module_name, &variable, chunk_of(chunk).line_at(offset_of!(at)))?;
                     self.stack.push(value);
                 }
                 code::RETURN | code::END | code::LOAD_LOCAL_RETURN | code::LOAD_FIELD_THIS_RETURN => {
@@ -3022,7 +3046,7 @@ impl Vm {
                                     as_error: false,
                                 },
                                 offset_of!(ip),
-                                chunk.clone(),
+                                chunk,
                             )?;
                             // Taking the chunk back is the move that pairs with the one
                             // the call made, and it empties the field so the frame counts
@@ -3113,7 +3137,7 @@ impl Vm {
                 // than failing to compile. `bytecode::code` carries the
                 // note about adding one, and the exhaustive `byte_of` in
                 // its test module is what makes the omission visible.
-                _ => return Err(Self::bad_opcode(byte, chunk.line_at(offset_of!(at)))),
+                _ => return Err(Self::bad_opcode(byte, chunk_of(chunk).line_at(offset_of!(at)))),
             }
 
 
@@ -3189,11 +3213,9 @@ impl Vm {
         error: RuntimeError,
         ip: usize,
         // The running frame's chunk, so that parking it can put the chunk
-        // back where a later resume will look for it. This path is leaving
-        // the interpreter either way, so the clone its callers pay costs
-        // nothing that matters.
-        chunk: Rc<Chunk>,
-    ) -> Result<Option<(Rc<Chunk>, usize, usize)>, RuntimeError> {
+        // back where a later resume will look for it.
+        chunk: ChunkRef,
+    ) -> Result<Option<(ChunkRef, usize, usize)>, RuntimeError> {
         let Some(catcher) = self.catcher() else {
             return Err(error);
         };
