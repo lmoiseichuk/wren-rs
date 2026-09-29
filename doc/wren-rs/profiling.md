@@ -1171,6 +1171,161 @@ it as a veto rather than a signal -- was wrong and is withdrawn.
 
 ---
 
+## Upstream's speed, technique by technique
+
+Upstream C Wren is 1.3 to 2.3 times faster than this VM on the same board
+at the same clock (the clock was not the same until 2026-09-29; see *The
+clock* below). This section reads `vendor/wren/src/vm` for every technique
+that buys that speed, sets each one against what this VM already does, and
+prices the ones it does not do -- in instructions retired and in bytes -- before
+any of them is built. The status column is kept current as they are tried.
+
+### The numbers the estimates are made from
+
+Per single run, speed profile, 160 MHz, from `op-profile` on the host (counts
+are a property of the bytecode) and the board's counter:
+
+| | bytecode ops | instructions retired | per op | closure calls | primitive calls | fast-path arithmetic |
+|---|---|---|---|---|---|---|
+| `binary_trees` | 2,801,180 | 348,973,103 | 124.6 | 300,090 | 102,123 | 348,108 |
+| `fib` | 6,377,165 | 588,383,290 | 92.3 | 750,240 | 28 | 1,875,606 |
+| `list_build` | 250,046 | 26,295,074 | 105.2 | 0 | 50,011 | 10,001 |
+| `method_call` | 1,000,123 | 96,027,765 | 96.0 | 130,006 | 80,013 | 60,001 |
+| **all four** | 10,428,514 | **1,059,679,232** | 101.6 | 1,180,336 | 232,175 | 2,293,716 |
+
+And what one construct costs, from `tools/measure-rs.sh speed --bin opcost`
+(instructions per loop iteration, over the empty loop):
+
+| body | instructions | reading |
+|---|---|---|
+| `true` | 43 | a push and a pop |
+| `i` | 47 | the same, from a local |
+| `!true` | 181 | **a primitive call is ~138** |
+| `i + i` | 162 | a fast-path `+`, soft-float included, is ~115 |
+| `i == i` | 233 | `Num.==` has no fast path: ~71 more than `+` |
+| `b == null` | 247 | `Object.==`, lookup through an instance |
+| `b.get` | 402 | **a closure call and its return is ~355** |
+
+An estimate below is *(machine instructions saved per occurrence) x
+(occurrences per run) / (instructions retired per run)*, summed over the four
+the way the significance rule above judges a change. Where the saving is read
+from the disassembly it says so; where it is inferred from the price list it is
+an estimate and is marked `~`.
+
+### Already the same as upstream
+
+Nothing to do; listed so the table is the whole of upstream and not a
+selection.
+
+| upstream | where | here |
+|---|---|---|
+| NaN tagging, 8-byte `Value` | `wren_value.h` | the same constants, safe Rust |
+| one global method symbol per signature, a flat table per class | `wrenSymbolTableEnsure`, `MethodBuffer` | the same; entries packed to 4 B |
+| a subclass copies its parent's methods at creation | `bindSuperclass` | `inherit_methods` |
+| `ip`, `stackStart`, `fn` held in locals, written back on call and return | `LOAD_FRAME`/`STORE_FRAME` | `ip`, `base`, `units`, `constants`, `module`, `field_offset` |
+| `maxSlots` computed at compile time, the stack grown once per call | `wrenEnsureStack` | `max_slots`, `push_reserved` -- and upstream still tests every push, this does not |
+| `LOAD_LOCAL_0`-`8` and `CALL_0`-`16`: the operand in the opcode | `wren_opcodes.h` | subsumed: the operand rides in the same 16-bit unit as the opcode, so one load fetches both |
+| `LOAD_FIELD_THIS` / `STORE_FIELD_THIS`, no receiver pop | `field()` | the same, and fused with `Pop` and `Return` |
+| `and` / `or` leave the operand instead of pop-and-push | `CODE_AND`, `CODE_OR` | the same |
+| module variables by index, resolved at compile time | `LOAD_MODULE_VAR` | the same |
+| a constant pool with duplicates folded | `addConstant` | numbers folded; two equal string literals are two objects (memory only) |
+| a string's hash cached in the string | `ObjString.hash` | the same |
+| maps: open addressing, power-of-two capacity | `wren_value.c` | the same |
+
+### Upstream techniques this VM does not have
+
+**Zero memory cost:**
+
+| # | technique | upstream | what it takes here | estimate, all four | where it lands | status |
+|---|---|---|---|---|---|---|
+| U1 | test for collection only when allocating | `wrenReallocate` compares `bytesAllocated` | the per-instruction flag test (`lbu`+`bnez`) moves into the nine arms that allocate | −2.0% read from the disassembly | every opcode | **refused**: +0.56% and +0.67% measured, see below |
+| U2 | no arity check when a method is called | the signature carries the arity | check once, when `MethodInstance` binds it, instead of on every closure call | ~−0.2% | calls | todo |
+| U3 | the frame holds the function by pointer, no reference count | `CallFrame.closure->fn` | `Frame::chunk` becomes a raw pointer rooted by the frame's closure, on the same terms as `code_units`; one `Rc` clone and one drop per call go | ~−1.1% (`fib` −1.3%) | calls | todo |
+| U4 | local slot and constant indices trusted | `stackStart[READ_BYTE()]` | licensed rather than trusted: `max_stack`'s walk already knows the depth at every instruction, and can refuse a slot at or past it, and a constant past the pool | ~−0.6% | loads | todo |
+| U5 | field operands patched when the method is bound | `wrenBindMethodCode` | removes `field_offset` from the frame, `CallTarget` and the loop's locals. **Conflicts with bytecode kept in flash** -- a µwren chunk in `.rodata` cannot be patched, so a frozen image would patch at build time instead | 0 to −1%, a register freed | field access | todo |
+| U6 | a `super` call's class bound into a constant | `SUPER_n`, patched at bind | two heap walks per `super` call go; needs U5's mutable chunk | ~−0.02% | `super` | with U5 |
+| U7 | a primitive answers `bool`, its result already in the receiver's slot; re-entering primitives are a different method type | `METHOD_PRIMITIVE` vs `METHOD_FUNCTION_CALL` | a sentinel `Value` for "something unusual happened" -- an error, a fiber switch, halting -- tested once, where there are now a `Result`, `halting` and `pending_switch`. Every primitive's signature changes | ~−0.2%; `list_build` ~−1.9% | primitive calls | todo. Result placement alone was refused twice; the separation is what makes it free |
+| U8 | threaded dispatch, `goto *dispatchTable[...]` | `WREN_COMPUTED_GOTO` | stable Rust has no computed `goto`. The equivalent is one function per opcode chained by guaranteed tail calls (`become`, nightly only), which also gives each handler its own register allocation | −5 to −15%, the least certain figure here | every opcode | later; needs nightly, so a feature |
+
+**A memory cost here** -- upstream reaches everything by pointer, and a
+pointer this VM does not keep is a word it would have to add:
+
+| # | technique | upstream | cost here | estimate, all four | µwren | status |
+|---|---|---|---|---|---|---|
+| M1 | every object points at its class | `Obj.classObj` | none needed: the class of nine types is the handle's four type bits, and an instance's slot already holds its class | 0 | -- | nothing to do |
+| M2 | instance fields in the object's own allocation | `ObjInstance.fields[]` | a field pointer in the instance slot, **+4 B per instance** (12 → 16), fixed up by compaction | ~−0.4% (`method_call` ~−1.4%) | off | todo |
+| M3 | a closure points at its function | `ObjClosure.fn` | **+4 B per closure** (16 → 20); one table walk per call goes | ~−0.7% (`fib` ~−0.8%) | off | todo |
+| M4 | a method entry holds the function pointer | `Method {type, as}`, 8 B | **+4 B per method table entry**, ~10 KB of RAM for the full core; nothing for a frozen core, whose tables are in flash | ~−0.07% | -- | refused on the estimate |
+| M5 | a lazy collector | first collection at 10 MB, +50% after | exists as a knob: `growth`, `Heap::set_headroom`. Collection is about 17% of `binary_trees` | up to −17% of `binary_trees`, paid in peak heap | off | a setting, not a change |
+| M6 | a 12-byte call frame | `CallFrame` | the other way round: a `Frame` here is 24 B because it caches more. U3 and U5 shrink it | -- | -- | follows U3, U5 |
+
+### Beyond upstream
+
+Upstream does none of these. They are here because the same reading of the
+profile found them.
+
+| # | technique | estimate, all four | where it lands | memory | status |
+|---|---|---|---|---|---|
+| X1 | arithmetic fast path for `Num` operators | -- | arithmetic | none | done before this pass |
+| X2 | five fused opcode pairs | -- | loads, returns, field stores | none | done before this pass |
+| X3 | branch targets padded to 4 B | -- (time only) | placement | +7 KB flash | done before this pass |
+| X4 | **the CPU at 160 MHz** | **−50% time**, 0 work | everything | none | **done** |
+| X5 | intrinsics: once the lookup has found `Object.==`, `Object.!=` or `Bool.!`, do it inline instead of calling the primitive | ~−1.2% (`binary_trees` ~−2.6%, `method_call` ~−3.8%) | primitive calls | none | todo |
+| X6 | `iterate` and `iteratorValue` of `Range` and `List` inline -- built-in classes cannot be subclassed, so nothing can replace them, as with `Num` | ~−0.75% (`list_build` ~−15%, `method_call` ~−4.2%) | every `for` loop | none | todo |
+| X7 | `==` and `!=` of two numbers in the fast path | 0 on the four; ~−71 per numeric comparison anywhere else | comparisons | none | todo |
+| X8 | loop inversion: the test at the bottom, one `Loop` fewer per iteration | ~−0.08%, against about +1% for the opcode it needs | loops | none | refused on the estimate |
+| X9 | more fused pairs (`StoreModuleVar`+`Pop`, `StoreLocal`+`Pop`) | ~−0.23%, against about +1% per opcode added | assignments | none | refused on the estimate |
+| X10 | unchecked heap reads for a handle known to be live | ~−2.4% | every object access | none | **LM's call**: it breaks this crate's rule that the object model has no `unsafe` |
+| X11 | stop the dispatch block rebuilding two constants every instruction | up to −2%, read from the disassembly | every opcode | none | no mechanism yet; U8 would remove it |
+| X12 | a closure's upvalue slice hoisted like `constants` | 0 on the four | closures | none | todo, low |
+
+### The clock
+
+`esp_hal::Config::default()` runs an ESP32-C6 at **80 MHz**; ESP-IDF, and so
+the C reference and MicroPython, run it at 160. Every time this repository had
+published for the Rust VM was taken at half the clock of the numbers it was set
+beside. At 160 MHz the four benchmarks take 49.8-50.0% less time for the same
+instructions retired, to the instruction.
+
+It also retires a conclusion. *"Two to three cycles per instruction, a
+fetch-bound interpreter"* was wall time divided by an assumed 160 MHz. The
+chip's own cycle counter reads **1.3** -- in the price list above and in the
+benchmarks alike -- which is an in-order core doing ordinary work, not one
+starved by its instruction fetch. Padding branch targets still moves time by
+3-4%; that measurement stands. What goes is the reading of it as the dominant
+cost, and with it the prediction that replicated dispatch must lose because it
+makes the loop bigger. That prediction was never measured.
+
+### U1: testing for collection only when allocating, refused
+
+Upstream never asks between instructions whether to collect: the question is
+inside `wrenReallocate`, so it costs nothing unless something was allocated.
+This VM asks after every instruction -- a `lbu` and a `bnez` at the loop's tail,
+two instructions on every dispatch, which read as 2% of all work. The same
+economy is available without collecting inside the allocator: the flag can only
+become true when something allocates, so only an arm that can allocate needs to
+read it.
+
+| | `binary_trees` | `fib` | `list_build` | `method_call` | sum |
+|---|---|---|---|---|---|
+| the test in each allocating arm | +0.76% | +0.26% | +2.32% | +1.24% | **+0.56%** |
+| ...calling the collector out of line | +0.91% | +0.38% | +2.28% | +1.17% | **+0.67%** |
+
+Time fell 1-2%, which is inside what placement moves; work rose. The
+disassembly says why: the two instructions left the tail and **three register
+moves joined every dispatch** in the first form, and in the second the jump
+table's address stopped living in a register and was rebuilt every dispatch
+(`lui`+`addi`). The dispatch block is where the register allocator settles
+every arm's disagreements, and removing a test from the tail changed what it
+had to settle.
+
+That also showed something that is in the shipped build already: **the
+dispatch block rebuilds two constants on every instruction** --
+`lui s0,0x7ffc0` (the NaN-tagging mask) and `li s1,1` -- because no arm leaves
+them where it found them. That is X11 above.
+
+---
+
 ## The protocol, as it now stands
 
 | the change is… | measure it by |
