@@ -1281,7 +1281,8 @@ profile found them.
 | X12 | a closure's upvalue slice hoisted like `constants` | 0 on the four | closures | none | todo, low |
 | X13 | a type test on the `Value`'s high word only, in the source | −3.5% estimated from the disassembly | every type test | none | **refused**: −0.14%, because InstCombine widens it back to 64 bits; X14 is the real fix |
 | X14 | **LLVM's constant hoisting off** (`-disable-constant-hoisting`) | -- | every type test | +464 B flash | **kept**: −3.64% work, −1.0 to −2.9% time at two placements |
-| X15 | profile-guided layout: hot blocks together, from counts measured on the host | unknown | the whole loop | none | todo -- LM's suggestion: order by frequency |
+| X15 | profile-guided layout: hot blocks together, from counts measured on the host | unknown | the whole loop | none | **refused**: +4.72% work, +3.4 to +7.9% time, +52 KB flash. The x86 profile matched every interpreter function and drove inlining that piled code into the hot paths -- LM's suggestion: order by frequency |
+| X16 | `call_target` forced inline, so its result stops round-tripping through the stack | ~−1% read from the disassembly | calls | none | **refused**: +0.93% work, +1.7 to +2.4% time. Old experiment 16 found it already inlined; it no longer was, and inlining it now costs more in the arms around it |
 
 ### The clock
 
