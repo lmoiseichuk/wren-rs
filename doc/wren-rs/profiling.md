@@ -1261,7 +1261,7 @@ selection.
 | U6 | a `super` call's class bound into a constant | `SUPER_n`, patched at bind | two heap walks per `super` call go; needs U5's mutable chunk | ~−0.02% | `super` | with U5 |
 | U7 | a primitive answers `bool`, its result already in the receiver's slot; re-entering primitives are a different method type | `METHOD_PRIMITIVE` vs `METHOD_FUNCTION_CALL` | a sentinel `Value` for "something unusual happened" -- an error, a fiber switch, halting -- tested once, where there are now a `Result`, `halting` and `pending_switch`. Every primitive's signature changes | ~−0.2%; `list_build` ~−1.9% | primitive calls | todo. Result placement alone was refused twice; the separation is what makes it free |
 | U9 | the class of a value found inline, numbers then objects, one load | `wrenGetClassInline` -- "critical that this be inlined" | `class_of` asked about numbers, booleans (a 64-bit range test) and null before objects, behind a call: eighteen instructions before an instance's own question. Objects first, instances and classes before the jump table | -- | calls | **kept**: −2.63% work, −0.4 to −2.9% time. First recorded as −1.92%, which was U9 and U2 together; see U2. Forcing it inline as well: a further −0.59% for 1.6 KB, refused |
-| U8 | threaded dispatch, `goto *dispatchTable[...]` | `WREN_COMPUTED_GOTO` | stable Rust has no computed `goto`. The equivalent is one function per opcode chained by guaranteed tail calls (`become`, nightly only), which also gives each handler its own register allocation | −5 to −15%, the least certain figure here | every opcode | later; needs nightly, so a feature |
+| U8 | threaded dispatch, `goto *dispatchTable[...]` | `WREN_COMPUTED_GOTO` | stable Rust has no computed `goto`. The equivalent is one function per opcode chained by guaranteed tail calls (`become`, nightly only), which also gives each handler its own register allocation | −5 to −15%, the least certain figure here | every opcode | **kept behind `tail-calls`** (nightly): f64 −3.3% work, −7 to −12% time except `list_build` +3%; `nofp` −10.4% work, −3 to −21% time. See *U8* below |
 
 **A memory cost here** -- upstream reaches everything by pointer, and a
 pointer this VM does not keep is a word it would have to add:
@@ -1297,6 +1297,7 @@ profile found them.
 | X13 | a type test on the `Value`'s high word only, in the source | −3.5% estimated from the disassembly | every type test | none | **refused**: −0.14%, because InstCombine widens it back to 64 bits; X14 is the real fix |
 | X14 | **LLVM's constant hoisting off** (`-disable-constant-hoisting`) | -- | every type test | +464 B flash | **kept**: −3.64% work, −1.0 to −2.9% time at two placements |
 | X15 | profile-guided layout: hot blocks together, from counts measured on the host | unknown | the whole loop | none | **refused**: +4.72% work, +3.4 to +7.9% time, +52 KB flash. The x86 profile matched every interpreter function and drove inlining that piled code into the hot paths -- LM's suggestion: order by frequency |
+| X17 | `<`, `>`, `<=`, `>=` on two doubles as integer tests on their bit patterns, instead of soft-float calls | about a third of `fib`'s arithmetic loses a call | comparisons | none | todo -- found by the U8 design pass; helps the `match` loop too |
 | X16 | `call_target` forced inline, so its result stops round-tripping through the stack | ~−1% read from the disassembly | calls | none | **refused**: +0.93% work, +1.7 to +2.4% time. Old experiment 16 found it already inlined; it no longer was, and inlining it now costs more in the arms around it |
 
 ### The clock
@@ -1424,6 +1425,75 @@ work because time moves with placement -- and at 160 MHz, three placements
 agree to 0.2%. So the rule gains a clause: **when work and time disagree, time
 decides, if it holds across placements.** Seconds are what the program costs;
 instructions were only ever the placement-proof stand-in for them.
+
+### U8: threaded dispatch, step by step
+
+One function per opcode, each ending by `become`-ing the next -- nightly Rust's
+guaranteed tail call, the nearest thing to upstream's computed `goto`. It lives
+in `crates/wren/src/vm/threaded.rs` behind the `tail-calls` feature; without
+the feature the crate compiles from the same tokens as before. Every row below
+is measured against **the same source built by the same nightly** with the
+feature off -- nightly's LLVM alone moved work by −0.72%, and would otherwise
+be credited to the change.
+
+| step | what changed | f64 work | f64 time | `nofp` work | `nofp` time |
+|---|---|---|---|---|---|
+| 1 | nightly, feature off (the control) | −0.72% | `fib` −1.4%, two others +0.5-0.7% | | |
+| 2 | every arm ported as it stood, five arguments per handler | **+14.3%** | +3.5 to +6.4% | | |
+| 3 | four arguments; hot handlers kept free of calls | +7.5% | −1.9 to +1.3% | +11.1% | −2.2 to +2.5% |
+| 4 | the cold continuations `#[inline(never)]` | +8.2% | +0.6 to +5.3% | +2.3% | `fib` −8.5% |
+| 5 | **the common closure call a leaf** | **−3.1%** | −7 to −11.5%, `list_build` +3.9% | **−10.0%** | −10 to −21%, `list_build` +1.6% |
+| 6a | intrinsics inlined into their handler | −0.19% on 5 | −0.4 to −0.95% | −0.53% on 5 | `list_build` −4.9% |
+| 6 | 6a, plus every object's class and primitives in handlers of their own | +0.99% on 5 | `fib` +1.4% | −0.20% on 5 | `list_build` −7.9% |
+| 6c | 6 with the closure case tested first | −0.25% on 6 | | −0.33% on 6 | |
+
+What shipped is 5 and 6a. Against the control, identical at branch padding 4
+and 8:
+
+| | f64 work | f64 time | `nofp` work | `nofp` time |
+|---|---|---|---|---|
+| `binary_trees` | −1.88% | −7.40% | −5.22% | −11.28% |
+| `fib` | −4.58% | −10.49% | −14.91% | −21.00% |
+| `list_build` | +6.69% | +3.15% | +1.95% | −3.43% |
+| `method_call` | −3.57% | −12.31% | −8.02% | −17.89% |
+| sum | **−3.31%** | | **−10.44%** | |
+
+for about 10.7 KB of flash in either build and no RAM. Time gains exceed the
+work gains throughout: the handlers stall less than the `match` loop's arms,
+as U3 did.
+
+**What each step taught.**
+
+- **Step 2: a handler that calls anything pays for it every time it runs.**
+  RISC-V's calling convention makes a function save every value it keeps
+  past a call, and restore it before it returns -- or before it `become`s the
+  next handler. The `match` loop is one function and does that once per
+  invocation. The ported `call` handler saved `ra` and twelve registers on
+  every call, the arithmetic fast path included. LLVM's `preserve_none`,
+  CPython's answer to exactly this, is accepted for this target and generates
+  identical code: the RISC-V backend treats it as the C convention.
+- **Step 4: LLVM inlines the target of a direct `become`.** `call` ended in
+  `become call_slow(..)`, and the whole slow path -- allocation, `line_at`,
+  `memcpy` -- was inlined back into `call`: 637 instructions and a
+  ten-register frame on the hot path. Every cold continuation is now
+  `#[inline(never)]`; `call` is 88 instructions.
+- **Step 5: the growing push is a hidden call.** `Vec::reserve` and
+  `Vec::push` each carry a call to the allocator for when there is no room,
+  and a call that can return is enough to put a frame on every execution. The
+  leaf call tests for room first, sends the rare case to `call_general` with
+  nothing changed, and pushes the frame with `push_within_capacity`. That one
+  change turned +8.2% into −3.1%, and was worth far more than the design pass
+  predicted -- it modelled the call path as necessarily framed.
+- **Step 6: a bigger handler costs the paths it does not change.** Widening the
+  leaf to every object's class and giving primitives a handler of their own
+  cost f64 `fib` 1.4%, though `fib` reaches neither; testing the closure case
+  first recovered a third of it. Only the intrinsic inlining (6a) was kept.
+
+**What is left.** `list_build` is the one benchmark that is slower in f64: its
+`iterate` and `iteratorValue` intrinsics do soft-float arithmetic, so their
+handler keeps a frame, and `List.add` is a primitive, which the leaf does not
+take. In `nofp` it is 3.4% faster. X17 -- comparisons on the bit pattern --
+would take a call off some of f64's arithmetic in both interpreters.
 
 ---
 
