@@ -182,6 +182,23 @@ pub enum Op {
     StoreFieldThisPop = 32,
     /// `LoadFieldThis` then `Return`. Operands: `u8` field, a dead byte.
     LoadFieldThisReturn = 25,
+
+    /// Invoke an operator or an intrinsic: a [`Op::Call`] whose signature is
+    /// one of the few the interpreter can answer without the method. Operands:
+    /// the [`operator`] inline where a call has its arity, then symbol `u16`.
+    ///
+    /// **The compiler decides, so the interpreter does not have to.** Every
+    /// call used to ask at run time whether its symbol named `+` or
+    /// `iterate(_)` -- an arity test, a symbol load and a table lookup -- and
+    /// a plain method call paid all of it to learn "no". The signature is a
+    /// string the compiler already holds, so it answers once: a `Call` is
+    /// now always a method, and this is always an operator.
+    ///
+    /// **The symbol stays.** A receiver the fast path does not cover -- a
+    /// string on the left of `+`, a user class defining `==` -- is called
+    /// exactly as a `Call` would call it, and needs the symbol for that. The
+    /// arity is implied by the operation; see [`operator::arity`].
+    CallOperator = 40,
 }
 
 /// The opcodes as plain bytes, for matching the instruction stream directly.
@@ -203,7 +220,7 @@ pub mod code {
     /// loaded file whole and rejects an unknown opcode before it can run.
     /// `the_bound_on_opcodes_is_tight` keeps this honest when an `Op` is
     /// added.
-    pub const HIGHEST: u8 = Op::Closure as u8;
+    pub const HIGHEST: u8 = Op::CallOperator as u8;
 
     pub const CONSTANT: u8 = Op::Constant as u8;
     pub const NULL: u8 = Op::Null as u8;
@@ -245,6 +262,72 @@ pub mod code {
     pub const LOAD_LOCAL_RETURN: u8 = Op::LoadLocalReturn as u8;
     pub const STORE_FIELD_THIS_POP: u8 = Op::StoreFieldThisPop as u8;
     pub const LOAD_FIELD_THIS_RETURN: u8 = Op::LoadFieldThisReturn as u8;
+    pub const CALL_OPERATOR: u8 = Op::CallOperator as u8;
+}
+
+/// What a [`Op::CallOperator`] does when its receiver allows, carried in the
+/// instruction's inline operand.
+///
+/// **Part of the bytecode, not of the interpreter.** A `.wrenc` stores these
+/// numbers, so they are fixed the way opcode numbers are: a new one is added,
+/// an old one is never renumbered.
+pub mod operator {
+    /// The numeric operators: pure arithmetic on two numbers. `==` and `!=`
+    /// are not among them -- they are defined on `Object` and answer for any
+    /// pair of values, so they are intrinsics below.
+    pub const ADD: u8 = 1;
+    pub const SUB: u8 = 2;
+    pub const MUL: u8 = 3;
+    pub const DIV: u8 = 4;
+    pub const MOD: u8 = 5;
+    pub const LT: u8 = 6;
+    pub const GT: u8 = 7;
+    pub const LE: u8 = 8;
+    pub const GE: u8 = 9;
+    /// The intrinsics: built-in methods answered in place when the receiver
+    /// is a built-in that really has them. See `INTRINSIC_ITERATE` in `vm`.
+    pub const ITERATE: u8 = 16;
+    pub const ITERATOR_VALUE: u8 = 17;
+    pub const EQ: u8 = 18;
+    pub const NE: u8 = 19;
+    pub const NOT: u8 = 20;
+
+    /// The operation a method signature names, if it names one.
+    pub fn of(signature: &str) -> Option<u8> {
+        let operation = match signature {
+            "+(_)" => ADD,
+            "-(_)" => SUB,
+            "*(_)" => MUL,
+            "/(_)" => DIV,
+            "%(_)" => MOD,
+            "<(_)" => LT,
+            ">(_)" => GT,
+            "<=(_)" => LE,
+            ">=(_)" => GE,
+            "iterate(_)" => ITERATE,
+            "iteratorValue(_)" => ITERATOR_VALUE,
+            "==(_)" => EQ,
+            "!=(_)" => NE,
+            "!" => NOT,
+            _ => return None,
+        };
+        Some(operation)
+    }
+
+    /// Whether a byte is one of the operations above -- what a loaded file
+    /// is checked against, since the compiler writes nothing else.
+    pub fn is_known(operation: u8) -> bool {
+        matches!(operation, ADD..=GE | ITERATE..=NOT)
+    }
+
+    /// How many arguments the operation's method takes: `!` none, every
+    /// other one.
+    pub fn arity(operation: u8) -> usize {
+        match operation {
+            NOT => 0,
+            _ => 1,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +382,7 @@ mod opcode_bytes {
             Op::LoadLocalReturn => code::LOAD_LOCAL_RETURN,
             Op::StoreFieldThisPop => code::STORE_FIELD_THIS_POP,
             Op::LoadFieldThisReturn => code::LOAD_FIELD_THIS_RETURN,
+            Op::CallOperator => code::CALL_OPERATOR,
         }
     }
 
@@ -390,6 +474,7 @@ impl Op {
             37 => Op::ImportVariable,
             38 => Op::LoadLocalConstant,
             39 => Op::Closure,
+            40 => Op::CallOperator,
             _ => return None,
         };
         Some(op)
@@ -414,7 +499,7 @@ pub const MAX_JUMP: usize = u16::MAX as usize / 2;
 
 /// Which bits of an instruction's first unit hold what. See [`Chunk::code`].
 ///
-/// Six bits of opcode is 64, against the 40 there are; two bits of length
+/// Six bits of opcode is 64, against the 41 there are; two bits of length
 /// cover one, two and three units, and the fourth value is the escape for the
 /// one instruction whose length is not fixed.
 pub const OPCODE_MASK: u16 = 0x3f;
@@ -744,6 +829,7 @@ impl Chunk {
             Op::Pop | Op::CloseUpvalue | Op::StoreFieldThisPop => (1, 0),
             // Takes the receiver and its arguments, leaves the result.
             Op::Call | Op::Super => (Chunk::inline_operand(unit) as i32 + 1, 1),
+            Op::CallOperator => (operator::arity(Chunk::inline_operand(unit)) as i32 + 1, 1),
             Op::LoadField => (1, 1),
             Op::StoreField => (2, 1),
             Op::Class => (2, 1),
@@ -1099,6 +1185,14 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                 let _ = write!(
                     operand,
                     " arity {} symbol {}",
+                    Chunk::inline_operand(chunk.code[at]),
+                    chunk.code[offset]
+                );
+            }
+            Op::CallOperator => {
+                let _ = write!(
+                    operand,
+                    " operation {} symbol {}",
                     Chunk::inline_operand(chunk.code[at]),
                     chunk.code[offset]
                 );

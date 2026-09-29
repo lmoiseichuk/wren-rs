@@ -54,10 +54,10 @@
 
 use super::{
     chunk_constants, chunk_of, code_units, ChunkRef, Frame, RuntimeError, Switch, Vm,
-    INTRINSIC_ITERATE, MAX_FRAMES, NUM_ADD, NUM_DIV, NUM_GE, NUM_GT, NUM_LE, NUM_LT,
-    NUM_MOD, NUM_MUL, NUM_OP_NONE, NUM_SUB, NURSERY, NURSERY_OBJECTS,
+    MAX_FRAMES, NUM_ADD, NUM_DIV, NUM_GE, NUM_GT, NUM_LE, NUM_LT, NUM_MOD, NUM_MUL,
+    NUM_SUB, NURSERY, NURSERY_OBJECTS,
 };
-use crate::bytecode::{code, Chunk};
+use crate::bytecode::{code, operator, Chunk, OPERAND_SHIFT};
 use crate::object::{Method, ObjClosure, Object};
 use crate::value::Value;
 
@@ -364,7 +364,9 @@ static TABLE: Table = Table({
     table[code::LOAD_FIELD as usize] = load_field;
     table[code::STORE_FIELD as usize] = store_field;
     table[code::CONSTRUCT as usize] = construct;
-    table[code::CALL as usize] = call;
+    // A `Call` is always a method, so the handler is the method call itself.
+    table[code::CALL as usize] = call_method;
+    table[code::CALL_OPERATOR as usize] = call_operator;
     table[code::SUPER as usize] = super_call;
     table[code::LOAD_STATIC_FIELD as usize] = load_static_field;
     table[code::STORE_STATIC_FIELD as usize] = store_static_field;
@@ -560,57 +562,59 @@ fn or(vm: &mut Vm, ip: *const u16, _unit: u32, table: &'static Table) -> Exit {
 }
 
 // ---------------------------------------------------------------------------
-// Calls. `call` keeps only the arithmetic fast path, the one place a hot
-// handler calls out (to soft-float); everything else leaves for
-// `call_intrinsic`, `call_method` or `call_general`.
+// Calls. `Call` goes straight to `call_method`. `call_operator` keeps only the
+// arithmetic fast path, the one place a hot handler calls out (to soft-float);
+// everything else leaves for `call_intrinsic`, `call_method` or
+// `call_general`.
 // ---------------------------------------------------------------------------
 
+/// The unit a `Call` of `arity` would have had, for handing an operator the
+/// fast path declined to the ordinary call handlers -- which read the arity
+/// where an operator keeps its operation.
+#[inline(always)]
+fn as_call(unit: u32, arity: usize) -> u32 {
+    (unit & 0xff) | ((arity as u32) << OPERAND_SHIFT)
+}
+
 #[allow(unsafe_code)]
-fn call(vm: &mut Vm, ip: *const u16, unit: u32, table: &'static Table) -> Exit {
-    let arity = Chunk::inline_operand(unit as u16) as usize;
-    let symbol = unsafe { *ip } as usize;
-    if arity <= 1 {
-        let operation = match vm.num_ops.get(symbol) {
-            Some(operation) => *operation,
-            None => NUM_OP_NONE,
-        };
-        if operation != NUM_OP_NONE && operation <= NUM_GE {
-            let top = vm.stack.len();
-            let left = vm.stack[top - 2];
-            let right = vm.stack[top - 1];
-            if left.is_num() && right.is_num() {
-                let (a, b) = (left.num_unchecked(), right.num_unchecked());
-                #[allow(clippy::float_cmp)]
-                let value = match operation {
-                    NUM_DIV | NUM_MOD
-                        if cfg!(feature = "nofp") && b == (0 as crate::value::Num) =>
-                    {
-                        None
-                    }
-                    NUM_ADD => Some(Value::num(a + b)),
-                    NUM_SUB => Some(Value::num(a - b)),
-                    NUM_MUL => Some(Value::num(a * b)),
-                    NUM_DIV => Some(Value::num(a / b)),
-                    NUM_MOD => Some(Value::num(a % b)),
-                    NUM_LT => Some(Value::bool(a < b)),
-                    NUM_GT => Some(Value::bool(a > b)),
-                    NUM_LE => Some(Value::bool(a <= b)),
-                    _ => Some(Value::bool(a >= b)),
-                };
-                if let Some(value) = value {
-                    // The receiver's slot is free again, and the stack held
-                    // two values a moment ago: room by the same argument as a
-                    // return's result.
-                    vm.stack.truncate(top - 2);
-                    vm.push_reserved(value);
-                    dispatch!(vm, unsafe { ip.add(1) }, table);
+fn call_operator(vm: &mut Vm, ip: *const u16, unit: u32, table: &'static Table) -> Exit {
+    let operation = Chunk::inline_operand(unit as u16);
+    if operation <= NUM_GE {
+        let top = vm.stack.len();
+        let left = vm.stack[top - 2];
+        let right = vm.stack[top - 1];
+        if left.is_num() && right.is_num() {
+            let (a, b) = (left.num_unchecked(), right.num_unchecked());
+            #[allow(clippy::float_cmp)]
+            let value = match operation {
+                NUM_DIV | NUM_MOD
+                    if cfg!(feature = "nofp") && b == (0 as crate::value::Num) =>
+                {
+                    None
                 }
+                NUM_ADD => Some(Value::num(a + b)),
+                NUM_SUB => Some(Value::num(a - b)),
+                NUM_MUL => Some(Value::num(a * b)),
+                NUM_DIV => Some(Value::num(a / b)),
+                NUM_MOD => Some(Value::num(a % b)),
+                NUM_LT => Some(Value::bool(a < b)),
+                NUM_GT => Some(Value::bool(a > b)),
+                NUM_LE => Some(Value::bool(a <= b)),
+                _ => Some(Value::bool(a >= b)),
+            };
+            if let Some(value) = value {
+                // The receiver's slot is free again, and the stack held
+                // two values a moment ago: room by the same argument as a
+                // return's result.
+                vm.stack.truncate(top - 2);
+                vm.push_reserved(value);
+                dispatch!(vm, unsafe { ip.add(1) }, table);
             }
-        } else if operation >= INTRINSIC_ITERATE {
-            become call_intrinsic(vm, ip, unit, table);
         }
+        // Every numeric operator takes one argument.
+        become call_method(vm, ip, as_call(unit, 1), table);
     }
-    become call_method(vm, ip, unit, table)
+    become call_intrinsic(vm, ip, unit, table)
 }
 
 /// A call whose symbol names an intrinsic: answered here if the receiver
@@ -623,19 +627,16 @@ fn call(vm: &mut Vm, ip: *const u16, unit: u32, table: &'static Table) -> Exit {
 #[inline(never)]
 #[allow(unsafe_code)]
 fn call_intrinsic(vm: &mut Vm, ip: *const u16, unit: u32, table: &'static Table) -> Exit {
-    let arity = Chunk::inline_operand(unit as u16) as usize;
+    let operation = Chunk::inline_operand(unit as u16);
+    let arity = operator::arity(operation);
     let symbol = unsafe { *ip } as usize;
-    let operation = match vm.num_ops.get(symbol) {
-        Some(operation) => *operation,
-        None => NUM_OP_NONE,
-    };
     let receiver_at = vm.stack.len() - arity - 1;
     if let Some(value) = vm.intrinsic(operation, receiver_at, symbol) {
         vm.stack.truncate(receiver_at);
         vm.push_reserved(value);
         dispatch!(vm, unsafe { ip.add(1) }, table);
     }
-    become call_general(vm, ip, unit, table)
+    become call_general(vm, ip, as_call(unit, arity), table)
 }
 
 /// The common call, kept a leaf: an instance or a class receiving a method

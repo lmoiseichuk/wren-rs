@@ -1934,6 +1934,55 @@ fn a_vm_built_from_a_manifest_runs_that_program_and_nothing_else() {
     }
 }
 
+/// An operator a manifest leaves out is missing, however the code got here.
+///
+/// **The fast path must not answer for a method that is not there.** `1 - 2`
+/// is compiled to an operator call only when `Num` really has `-(_)`; a VM
+/// built without it has to report the method missing, exactly as dispatch
+/// would. Two routes reach the interpreter and both are checked: source
+/// compiled by the tailored VM itself, and a `.wrenc` compiled by a full one,
+/// whose compiler did see `-(_)` and chose the operator.
+#[test]
+fn an_operator_a_manifest_leaves_out_is_reported_missing() {
+    let without_minus: Vec<String> = ["print(_)", "+(_)"].iter().map(|name| name.to_string()).collect();
+    // The two routes fail with different error types, so each hands over
+    // its message.
+    let missing = |result: Result<(), String>, route: &str| match result {
+        Ok(()) => panic!("{route}: `-` ran without `Num.-(_)` installed"),
+        Err(message) => assert!(
+            message.contains("does not implement '-(_)'"),
+            "{route}: expected `-(_)` missing, got {message:?}"
+        ),
+    };
+
+    // Compiled here: the operator the VM has works, the one it lacks is missing.
+    let mut here = Vm::with_core_methods(&without_minus);
+    here.interpret("System.print(1 + 2)").expect("`+` is installed");
+    assert_eq!(here.output_str(), "3\n");
+    missing(
+        here.interpret("System.print(3 - 1)").map_err(|error| error.message().to_string()),
+        "compiled by the tailored VM",
+    );
+
+    // Compiled elsewhere, by a VM that had `-(_)`.
+    let source = "System.print(3 - 1)";
+    let mut host = Vm::new();
+    let chunk = wren::compiler::compile(&mut host, source).expect("compiles");
+    let bytes = wren::wrenc::write(&host, &chunk, source.as_bytes()).expect("writes");
+    let mut tailored = Vm::with_core_methods(&without_minus);
+    let loaded = wren::wrenc::load(&mut tailored, &bytes).expect("loads");
+    missing(
+        tailored.run_closure(loaded.closure).map_err(|error| error.message),
+        "loaded from a .wrenc",
+    );
+
+    // And the same file on a VM that has it runs.
+    let mut full = Vm::new();
+    let loaded = wren::wrenc::load(&mut full, &bytes).expect("loads");
+    full.run_closure(loaded.closure).expect("runs");
+    assert_eq!(full.output_str(), "2\n");
+}
+
 /// A manifest that never names `List` must still let a program declare a class.
 ///
 /// **The regression this guards.** A class a manifest rules out keeps

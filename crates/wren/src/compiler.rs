@@ -2426,8 +2426,19 @@ impl<'a> Compiler<'a> {
         if symbol > u16::MAX as usize {
             return Err(self.error_at(self.previous, "Too many method names."));
         }
-        self.chunk_mut().emit_op(Op::Call, line);
-        self.chunk_mut().emit_byte(arity as u8, line);
+        // **An operator is told apart here, once, rather than on every call.**
+        // See `Op::CallOperator`: the interpreter then never asks whether a
+        // plain call might have been `+`.
+        match self.vm.operator_for(signature) {
+            Some(operation) => {
+                self.chunk_mut().emit_op(Op::CallOperator, line);
+                self.chunk_mut().emit_byte(operation, line);
+            }
+            None => {
+                self.chunk_mut().emit_op(Op::Call, line);
+                self.chunk_mut().emit_byte(arity as u8, line);
+            }
+        }
         self.chunk_mut().emit_short(symbol as u16, line);
         Ok(())
     }

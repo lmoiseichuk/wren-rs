@@ -60,7 +60,12 @@ const MAGIC: [u8; 6] = *b"WRENC\0";
 /// A file from a different version is refused rather than guessed at: the
 /// failure of loading the wrong bytecode is an interpreter running nonsense,
 /// which is far harder to diagnose than a message at load time.
-pub const VERSION: u16 = 3;
+///
+/// 4: operators and intrinsics are `CallOperator`. A version-3 file would
+/// still run, every operator taking the slow path as a plain method call --
+/// and a program that silently runs at a fraction of its speed is exactly
+/// what this number exists to prevent.
+pub const VERSION: u16 = 4;
 
 /// What went wrong reading a `.wrenc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +126,16 @@ fn table_operands(code: &[u16]) -> Result<Vec<(Table, usize)>, LoadError> {
             // the one after the opcode's. `Call` puts its arity inline, so its
             // symbol is in the same place as the others'.
             Op::Call | Op::Super | Op::MethodInstance | Op::MethodStatic => {
+                found.push((Table::Symbol, at + 1))
+            }
+            // An operator's symbol is where a call's is. Its inline operand is
+            // an operation, and one the compiler never writes is refused here:
+            // the interpreter treats every number below the intrinsics as a
+            // numeric operator.
+            Op::CallOperator => {
+                if !crate::bytecode::operator::is_known(Chunk::inline_operand(code[at])) {
+                    return Err(LoadError::Malformed("unknown operator"));
+                }
                 found.push((Table::Symbol, at + 1))
             }
             Op::LoadModuleVar | Op::StoreModuleVar => found.push((Table::Variable, at + 1)),
@@ -657,6 +672,7 @@ fn read_function(
     }
 
     remap(&mut code, symbols, variables)?;
+    settle_operators(vm, &mut code);
 
     let chunk = Chunk::from_parts(code, constants, lines);
     let max_slots = chunk.max_slots();
@@ -731,6 +747,50 @@ fn read_constant(
             Ok(Value::object(vm.heap.new_instance(class, &fields)))
         }
         _ => Err(LoadError::Malformed("unknown constant tag")),
+    }
+}
+
+/// Decide each operator call again, against the VM that will run it.
+///
+/// **The file was compiled by a different VM.** Its compiler made a call a
+/// `CallOperator` because *its* `Num` had that method; a VM built from a
+/// manifest that leaves `-(_)` out does not, and there `1 - 2` must report the
+/// method missing, as dispatch would. So each one is asked the same question
+/// the compiler asks -- [`Vm::operator_for`] on its signature -- and becomes a
+/// plain `Call` if the answer is no.
+///
+/// **The operation is taken from the signature, not from the file.** A file
+/// that paired `-(_)` with the code for `+` would add numbers and subtract
+/// everything else; settled here it cannot. Only the arity survives from the
+/// file, and a rewrite keeps it, so the stack depths `max_slots` measures
+/// after this are the ones the compiler measured.
+fn settle_operators(vm: &Vm, code: &mut [u16]) {
+    let mut at = 0;
+    while at < code.len() {
+        let unit = code[at];
+        if Chunk::opcode_of(unit) == Op::CallOperator as u8 {
+            let arity = crate::bytecode::operator::arity(Chunk::inline_operand(unit));
+            let symbol = code[at + 1] as usize;
+            let operation = match vm.method_names.name(symbol) {
+                Some(signature) => vm.operator_for(signature),
+                None => None,
+            };
+            // Only the opcode and the inline operand change; the length bits
+            // between them stay, because the instruction does not move.
+            let length = unit & !(crate::bytecode::OPCODE_MASK | (0xff << crate::bytecode::OPERAND_SHIFT));
+            code[at] = match operation {
+                Some(operation) if crate::bytecode::operator::arity(operation) == arity => {
+                    Op::CallOperator as u16 | length | (u16::from(operation) << crate::bytecode::OPERAND_SHIFT)
+                }
+                _ => Op::Call as u16 | length | ((arity as u16) << crate::bytecode::OPERAND_SHIFT),
+            };
+        }
+        // The walk in `remap` has already refused a stream that does not
+        // decode, so every length here is present.
+        match Chunk::instruction_units(code, at) {
+            Some(length) => at += length,
+            None => return,
+        }
     }
 }
 

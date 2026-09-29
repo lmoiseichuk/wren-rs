@@ -20,6 +20,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::bytecode::Chunk;
+use crate::bytecode::operator;
 // The `match` loop's opcode constants; the threaded interpreter names its own.
 #[cfg(not(feature = "tail-calls"))]
 use crate::bytecode::code;
@@ -279,21 +280,8 @@ pub struct Vm {
     pub primitives: Vec<crate::object::Primitive>,
     /// Method signatures, interned. `Op::Call` carries an index into this.
     pub method_names: SymbolTable,
-    /// Which numeric operation a method symbol names, or `NUM_OP_NONE`.
-    ///
-    /// **The arithmetic fast path's whole lookup.** `Num.+` and its siblings
-    /// are the most-called methods in every benchmark here -- 71% of `fib`'s
-    /// dispatches and 22% of `method_call`'s -- and each one resolves a class,
-    /// indexes a method table, decodes an entry and calls a primitive, to add
-    /// two doubles. This turns the question "is this symbol one of them?" into
-    /// one bounds check and one byte load.
-    ///
-    /// Indexed by method symbol. 256 entries because the widest symbol any of
-    /// the benchmarks reaches is 162 and the core interns about 160; a program
-    /// with more than 256 distinct method signatures simply takes the slow
-    /// path for the ones past the end, which is what it does today anyway.
-    num_ops: [u8; 256],
-    /// Which receivers the intrinsics in `num_ops` may answer for; see
+    /// Which receivers the operators a `CallOperator` names may answer for;
+    /// see
     /// [`INTRINSIC_ITERATE`].
     intrinsics: Intrinsics,
     /// The threaded interpreter's view of the running frame; see
@@ -521,27 +509,28 @@ pub struct Vm {
     previous_depth: usize,
 }
 
-/// No numeric fast path for this method symbol.
-const NUM_OP_NONE: u8 = 0;
-/// The numeric operations the `Call` arm handles without dispatching.
+/// The numeric operations the `CallOperator` arm handles without dispatching,
+/// under the names the interpreter has always used for them. The numbers are
+/// the bytecode's; see [`operator`].
 ///
 /// **Only the ones whose primitive is pure arithmetic on two doubles.** `==`
 /// and `!=` are deliberately absent: they are defined on `Object` and answer
 /// for every pair of values, so a number-only fast path for them would be a
 /// second implementation of equality rather than a shortcut through one.
 /// `..` and `...` allocate a range, which is a different kind of work.
-const NUM_ADD: u8 = 1;
-const NUM_SUB: u8 = 2;
-const NUM_MUL: u8 = 3;
-const NUM_DIV: u8 = 4;
-const NUM_MOD: u8 = 5;
-const NUM_LT: u8 = 6;
-const NUM_GT: u8 = 7;
-const NUM_LE: u8 = 8;
-const NUM_GE: u8 = 9;
+const NUM_ADD: u8 = operator::ADD;
+const NUM_SUB: u8 = operator::SUB;
+const NUM_MUL: u8 = operator::MUL;
+const NUM_DIV: u8 = operator::DIV;
+const NUM_MOD: u8 = operator::MOD;
+const NUM_LT: u8 = operator::LT;
+const NUM_GT: u8 = operator::GT;
+const NUM_LE: u8 = operator::LE;
+const NUM_GE: u8 = operator::GE;
 
-/// **Built-in methods the `Call` arm answers without calling them.** The same
-/// table as the numeric operators, and the same argument for why it is safe:
+/// **Built-in methods the `CallOperator` arm answers without calling them.**
+/// The same opcode as the numeric operators, and the same argument for why it
+/// is safe:
 /// a built-in class cannot be subclassed or reopened, so once the receiver's
 /// type is known, so is the method a lookup would find. Where the receiver is
 /// an instance -- `tree == null` -- its class *can* override the method, so
@@ -553,11 +542,11 @@ const NUM_GE: u8 = 9;
 /// other. Each answer comes from the same function the primitive uses -- see
 /// `core::range_iterate` -- and anything unusual falls through to the real
 /// call, so an intrinsic can only skip work, never change an answer.
-const INTRINSIC_ITERATE: u8 = 16;
-const INTRINSIC_ITERATOR_VALUE: u8 = 17;
-const INTRINSIC_EQ: u8 = 18;
-const INTRINSIC_NE: u8 = 19;
-const INTRINSIC_NOT: u8 = 20;
+const INTRINSIC_ITERATE: u8 = operator::ITERATE;
+const INTRINSIC_ITERATOR_VALUE: u8 = operator::ITERATOR_VALUE;
+const INTRINSIC_EQ: u8 = operator::EQ;
+const INTRINSIC_NE: u8 = operator::NE;
+const INTRINSIC_NOT: u8 = operator::NOT;
 
 /// Which receivers each intrinsic may answer for, learned once the core is
 /// installed and flattened.
@@ -568,6 +557,11 @@ const INTRINSIC_NOT: u8 = 20;
 /// instance's class holds -- equal means not overridden.
 #[derive(Clone, Copy)]
 struct Intrinsics {
+    /// Which numeric operators `Num` really has, one bit per [`operator`]
+    /// number. **Read by the compiler, not the interpreter**: an operator
+    /// `Num` lacks is compiled as a plain `Call`, so it fails as dispatch
+    /// would, and the fast path needs no test of its own.
+    numeric: u16,
     range_iterate: bool,
     range_iterator_value: bool,
     list_iterate: bool,
@@ -583,6 +577,7 @@ struct Intrinsics {
 
 impl Intrinsics {
     const NONE: Intrinsics = Intrinsics {
+        numeric: 0,
         range_iterate: false,
         range_iterator_value: false,
         list_iterate: false,
@@ -673,32 +668,6 @@ fn chunk_constants<'a>(chunk: ChunkRef) -> &'a [Value] {
 }
 
 impl Vm {
-    /// Record which method symbols name arithmetic on two numbers.
-    ///
-    /// Run once, after the core library has interned its signatures. A symbol
-    /// the core did not define is simply absent, so a build without `Num` --
-    /// there is none today, but the lookup does not assume it -- gets an empty
-    /// table and the slow path.
-    fn learn_numeric_operators(&mut self) {
-        for (signature, operation) in [
-            ("+(_)", NUM_ADD),
-            ("-(_)", NUM_SUB),
-            ("*(_)", NUM_MUL),
-            ("/(_)", NUM_DIV),
-            ("%(_)", NUM_MOD),
-            ("<(_)", NUM_LT),
-            (">(_)", NUM_GT),
-            ("<=(_)", NUM_LE),
-            (">=(_)", NUM_GE),
-        ] {
-            if let Some(symbol) = self.method_names.find(signature) {
-                if symbol < self.num_ops.len() {
-                    self.num_ops[symbol] = operation;
-                }
-            }
-        }
-    }
-
     pub fn new() -> Vm {
         Vm::with_heap(Heap::new())
     }
@@ -946,7 +915,6 @@ impl Vm {
             heap,
             stack: Vec::new(),
             method_names: SymbolTable::new(),
-            num_ops: [NUM_OP_NONE; 256],
             intrinsics: Intrinsics::NONE,
             #[cfg(feature = "tail-calls")]
             threaded: threaded::State::new(),
@@ -1025,7 +993,6 @@ impl Vm {
         vm.core_filter = core_filter;
         core::install(&mut vm);
         vm.core_filter = None;
-        vm.learn_numeric_operators();
         // **Only now.** The classes above were created empty and populated by
         // `install`, so flattening any earlier would have copied nothing.
         vm.flatten_class_hierarchy();
@@ -1484,6 +1451,8 @@ impl Vm {
             vm.built(class) && entry_of(vm, class, symbol) != crate::object::NO_METHOD
         };
         self.intrinsics = Intrinsics {
+            // Filled in below, one operator at a time.
+            numeric: 0,
             range_iterate: answers(self, self.range_class, iterate),
             range_iterator_value: answers(self, self.range_class, iterator_value),
             list_iterate: answers(self, self.list_class, iterate),
@@ -1496,19 +1465,30 @@ impl Vm {
             object_ne: entry_of(self, self.object_class, ne),
             object_not: entry_of(self, self.object_class, not),
         };
-        for (symbol, operation) in [
-            (iterate, INTRINSIC_ITERATE),
-            (iterator_value, INTRINSIC_ITERATOR_VALUE),
-            (eq, INTRINSIC_EQ),
-            (ne, INTRINSIC_NE),
-            (not, INTRINSIC_NOT),
-        ] {
-            if let Some(symbol) = symbol {
-                if symbol < self.num_ops.len() {
-                    self.num_ops[symbol] = operation;
+        for signature in ["+(_)", "-(_)", "*(_)", "/(_)", "%(_)", "<(_)", ">(_)", "<=(_)", ">=(_)"] {
+            let symbol = symbol_of(self, signature);
+            if let Some(operation) = operator::of(signature) {
+                if answers(self, self.num_class, symbol) {
+                    self.intrinsics.numeric |= 1 << operation;
                 }
             }
         }
+    }
+
+    /// The operation a call to `signature` should be compiled to, or `None`
+    /// for a plain `Call`.
+    ///
+    /// **A numeric operator `Num` does not have is a plain call.** A manifest
+    /// can leave `-(_)` out, and then `1 - 2` must report the method missing,
+    /// as dispatch would; compiling it as a `Call` is what makes it do that,
+    /// with no test in the interpreter. The intrinsics need no such care --
+    /// they already ask, per receiver, whether the class answers.
+    pub(crate) fn operator_for(&self, signature: &str) -> Option<u8> {
+        let operation = operator::of(signature)?;
+        if operation <= NUM_GE && self.intrinsics.numeric & (1 << operation) == 0 {
+            return None;
+        }
+        Some(operation)
     }
 
     /// Answer a built-in method without calling it, or say it cannot.
@@ -2920,9 +2900,15 @@ impl Vm {
                     self.stack[base] = instance;
                     collect_if_due!();
                 }
-                code::CALL | code::SUPER => 'call: {
-                    // The arity rides inline; the symbol is the unit after.
-                    let arity = Chunk::inline_operand(unit) as usize;
+                code::CALL | code::SUPER | code::CALL_OPERATOR => 'call: {
+                    // The arity rides inline -- or, for an operator, the
+                    // operation, which implies it. The symbol is the unit
+                    // after.
+                    let operand = Chunk::inline_operand(unit);
+                    let arity = match byte {
+                        code::CALL_OPERATOR => operator::arity(operand),
+                        _ => operand as usize,
+                    };
                     let symbol = unsafe { *ip } as usize;
                     ip = unsafe { ip.add(1) };
 
@@ -2943,21 +2929,15 @@ impl Vm {
                     // one. The fast path can only *skip* work, never change an
                     // answer, which is what makes it safe to take before
                     // knowing the receiver's class.
-                    // **One bounds test, not a compare and then an index.**
-                    // `get` is the range check and the load together; the
-                    // separate `symbol < len` was the same test written twice.
-                    // `arity <= 1` rather than `== 1` for `!`, the one
-                    // intrinsic with no argument. Every numeric operator and
-                    // every other intrinsic takes exactly one.
-                    if byte == code::CALL && arity <= 1 {
-                        let operation = match self.num_ops.get(symbol) {
-                            Some(operation) => *operation,
-                            None => NUM_OP_NONE,
-                        };
-                        // **The numeric codes only.** `==` shares this table
-                        // as an intrinsic, and `1 == 1` reaching the match
-                        // below would be answered by its last arm, `>=`.
-                        if operation != NUM_OP_NONE && operation <= NUM_GE {
+                    // **The compiler already said which calls these are.** A
+                    // `CallOperator` names its operation; a `Call` is never
+                    // one. See `Op::CallOperator`.
+                    if byte == code::CALL_OPERATOR {
+                        let operation = operand;
+                        // **The numeric codes only.** `==` is an intrinsic,
+                        // and `1 == 1` reaching the match below would be
+                        // answered by its last arm, `>=`.
+                        if operation <= NUM_GE {
                             let top = self.stack.len();
                             // Receiver and argument, in the order the caller
                             // pushed them.
@@ -2993,8 +2973,9 @@ impl Vm {
                                     NUM_LT => Some(Value::bool(a < b)),
                                     NUM_GT => Some(Value::bool(a > b)),
                                     NUM_LE => Some(Value::bool(a <= b)),
-                                    // `learn_numeric_operators` writes nothing
-                                    // else, so this is `>=`.
+                                    // The compiler writes nothing else below
+                                    // the intrinsics, and a loaded file is
+                                    // checked for it, so this is `>=`.
                                     _ => Some(Value::bool(a >= b)),
                                 };
                                 if let Some(value) = value {
@@ -3003,7 +2984,7 @@ impl Vm {
                                     break 'call;
                                 }
                             }
-                        } else if operation > NUM_GE {
+                        } else {
                             // A built-in method answered without calling it;
                             // see `INTRINSIC_ITERATE`. `None` is the ordinary
                             // call below, which is always right.
