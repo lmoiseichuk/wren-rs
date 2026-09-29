@@ -28,11 +28,15 @@ mod appdesc;
 // Generated from the same `.wrenc` this program runs:
 //
 //     cargo run --example freeze -- benchmarks/wrenc/fib.wrenc \
-//         > ports/esp32c6-wrenc-rs/src/bin/fib_core.rs
+//         > ports/esp32c6-wrenc-rs/src/core/fib_core.rs
 //
 // Together with the bytecode below, that puts the whole program -- classes,
 // method tables, names and code -- in flash, leaving RAM for what it computes.
-#[path = "fib_core.rs"]
+//
+// **In `src/core`, not beside this file.** Cargo takes every file in `src/bin`
+// for a binary of its own, and a module with no `main` there broke a plain
+// `cargo build` of this port.
+#[path = "../core/fib_core.rs"]
 mod fib_core;
 
 /// The whole heap this program gets -- there is no other allocator, so this is

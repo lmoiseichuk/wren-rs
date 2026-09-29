@@ -119,12 +119,14 @@ if [[ "$WANT" == "all" || "$WANT" == "esp32c6" ]]; then
         printf '  %-24s ' "$name"
         dir="$OUT/esp32c6/$name"
         mkdir -p "$dir"
-        core="$PORT/src/bin/generated_core.rs"
+        # The core goes in `src/core`, where Cargo does not look for binaries;
+        # the copy of `uwren.rs` has to be in `src/bin`, because it is one.
+        core="$PORT/src/core/generated_core.rs"
         gen="$PORT/src/bin/generated_uwren.rs"
         if ! "$FREEZE" "$ROOT/benchmarks/wrenc/$program.wrenc" >"$core" 2>"$dir/build.log"; then
             echo "FAILED to freeze -- $dir/build.log"; FAILED+=("$name"); rm -f "$core"; continue
         fi
-        sed -e 's/"fib_core\.rs"/"generated_core.rs"/'             -e 's/\bfib_core\b/generated_core/g'             -e "s#/fib\.wrenc#/$program.wrenc#"             "$PORT/src/bin/uwren.rs" >"$gen"
+        sed -e 's/fib_core\.rs/generated_core.rs/'             -e 's/\bfib_core\b/generated_core/g'             -e "s#/fib\.wrenc#/$program.wrenc#"             "$PORT/src/bin/uwren.rs" >"$gen"
         if ( cd "$PORT" && cargo build --profile size --bin generated_uwren                 --no-default-features --features census ) >>"$dir/build.log" 2>&1; then
             elf="$PORT/target/riscv32imac-unknown-none-elf/size/generated_uwren"
             cp "$elf" "$dir/$program"

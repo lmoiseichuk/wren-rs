@@ -734,7 +734,7 @@ the firmware includes instead of running `install`.
 manifest implies and writes the finished state out as Rust: every class, its
 method table already flattened, and every method symbol. The firmware compiles
 that in and adopts it. `crates/wren/tests/generated/fib_core.rs` is the result
-for `fib`, and `ports/esp32c6-wrenc-rs/src/bin/fib_core.rs` is the same thing
+for `fib`, and `ports/esp32c6-wrenc-rs/src/core/fib_core.rs` is the same thing
 for the firmware's feature set.
 
 Why a generator rather than a `const fn`: a method table is indexed by symbol,
