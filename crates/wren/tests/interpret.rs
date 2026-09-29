@@ -1997,3 +1997,113 @@ fn a_fused_local_pair_sees_the_value_it_just_pushed() {
         Err(error) => panic!("a chain of local copies failed: {error:?}"),
     }
 }
+
+// **The intrinsics may skip a call, never change an answer.** The `Call` arm
+// answers `iterate(_)`, `iteratorValue(_)`, `==(_)`, `!=(_)` and `!` itself when
+// the receiver's class is known to hold the built-in method. Each test below
+// is a case where it must *not* answer, or must answer exactly as the
+// primitive would; each fails if the intrinsic ignores the condition it names.
+
+#[test]
+fn an_overridden_equality_is_called_not_skipped() {
+    let source = "
+        class Always {
+          construct new() {}
+          ==(other) { true }
+          !=(other) { true }
+          ! { \"not\" }
+        }
+        var a = Always.new()
+        System.print(a == null)
+        System.print(a != a)
+        System.print(!a)
+    ";
+    assert_eq!(run(source), "true\ntrue\nnot\n");
+}
+
+#[test]
+fn an_inherited_override_is_called_too() {
+    let source = "
+        class Base {
+          construct new() {}
+          ==(other) { true }
+        }
+        class Derived is Base {
+          construct new() {}
+        }
+        System.print(Derived.new() == 1)
+    ";
+    assert_eq!(run(source), "true\n");
+}
+
+#[test]
+fn equality_without_an_override_is_identity() {
+    let source = "
+        class Plain {
+          construct new() {}
+        }
+        var a = Plain.new()
+        System.print(a == a)
+        System.print(a == Plain.new())
+        System.print(a != null)
+        System.print(null == null)
+        System.print(null != false)
+        System.print(true == true)
+        System.print(!a)
+        System.print(!null)
+        System.print(!false)
+    ";
+    assert_eq!(run(source), "true\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\ntrue\ntrue\n");
+}
+
+/// `==` shares the numeric fast path's table, and reaching that path's match
+/// would answer it with the last arm, `>=`.
+#[test]
+fn numbers_compare_equal_by_value_not_by_order() {
+    assert_eq!(run("System.print(2 == 1)"), "false\n");
+    assert_eq!(run("System.print(1 == 1)"), "true\n");
+    assert_eq!(run("System.print(1 != 2)"), "true\n");
+    assert_eq!(run("System.print(\"a\" == \"a\")"), "true\n");
+}
+
+#[test]
+fn ranges_iterate_both_ways_and_stop_short_when_exclusive() {
+    let source = "
+        var out = []
+        for (i in 1..3) out.add(i)
+        for (i in 3..1) out.add(i)
+        for (i in 1...3) out.add(i)
+        for (i in 2...2) out.add(i)
+        System.print(out)
+    ";
+    assert_eq!(run(source), "[1, 2, 3, 3, 2, 1, 1, 2]\n");
+}
+
+#[test]
+fn a_bad_iterator_still_reaches_the_primitive_and_its_error() {
+    assert_eq!(error("(1..3).iterate(\"x\")"), "Iterator must be a number.");
+    assert_eq!(error("[1, 2].iteratorValue(5)"), "Index out of bounds.");
+}
+
+/// A fraction steps a range from where it is, and is refused by a list --
+/// both in upstream's words. Not in an integer build, which has no fractions.
+#[test]
+#[cfg(not(feature = "nofp"))]
+fn a_fractional_iterator_steps_a_range_and_fails_a_list() {
+    assert_eq!(run("System.print((1..3).iterate(1.5))"), "2.5\n");
+    assert_eq!(error("[1, 2].iterate(1.5)"), "Iterator must be an integer.");
+}
+
+#[test]
+fn lists_iterate_and_index_from_either_end() {
+    let source = "
+        var out = []
+        for (x in [10, 20, 30]) out.add(x)
+        for (x in []) out.add(x)
+        System.print(out)
+        System.print([10, 20, 30].iteratorValue(-1))
+        System.print([10, 20].iterate(-1))
+        System.print([].iterate(\"anything\"))
+    ";
+    assert_eq!(run(source), "[10, 20, 30]\n30\nfalse\nfalse\n");
+}

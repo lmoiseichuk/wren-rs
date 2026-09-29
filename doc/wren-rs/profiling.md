@@ -1270,8 +1270,8 @@ profile found them.
 | X2 | five fused opcode pairs | -- | loads, returns, field stores | none | done before this pass |
 | X3 | branch targets padded to 4 B | -- (time only) | placement | +7 KB flash | done before this pass |
 | X4 | **the CPU at 160 MHz** | **−50% time**, 0 work | everything | none | **done** |
-| X5 | intrinsics: once the lookup has found `Object.==`, `Object.!=` or `Bool.!`, do it inline instead of calling the primitive | ~−1.2% (`binary_trees` ~−2.6%, `method_call` ~−3.8%) | primitive calls | none | tried with X6, below |
-| X6 | `iterate` and `iteratorValue` of `Range` and `List` inline -- built-in classes cannot be subclassed, so nothing can replace them, as with `Num` | ~−0.75% (`list_build` ~−15%, `method_call` ~−4.2%) | every `for` loop | none | **X5+X6 tried**: `list_build` −10.6%, `method_call` −3.1% time, but `fib` +2.5% -- five register moves joined the `Call` arm's entry. To retry |
+| X5 | intrinsics: once the lookup has found `Object.==`, `Object.!=` or `Bool.!`, do it inline instead of calling the primitive | ~−1.2% (`binary_trees` ~−2.6%, `method_call` ~−3.8%) | primitive calls | none | **kept, with X6** |
+| X6 | `iterate` and `iteratorValue` of `Range` and `List` inline -- built-in classes cannot be subclassed, so nothing can replace them, as with `Num` | ~−0.75% (`list_build` ~−15%, `method_call` ~−4.2%) | every `for` loop | none | **kept, with X5**: −2.25% work; time `list_build` −12.3%, `method_call` −4.8%, `binary_trees` −1.7%, `fib` −0.2%. Lost `fib` 2.5% before X14 |
 | X7 | `==` and `!=` of two numbers in the fast path | 0 on the four; ~−71 per numeric comparison anywhere else | comparisons | none | todo |
 | X8 | loop inversion: the test at the bottom, one `Loop` fewer per iteration | ~−0.08%, against about +1% for the opcode it needs | loops | none | refused on the estimate |
 | X9 | more fused pairs (`StoreModuleVar`+`Pop`, `StoreLocal`+`Pop`) | ~−0.23%, against about +1% per opcode added | assignments | none | refused on the estimate |

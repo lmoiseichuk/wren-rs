@@ -2015,18 +2015,12 @@ fn install_list(vm: &mut Vm) {
     // iterator object and nothing to allocate per loop.
     define(vm, class, "iterate(_)", |vm, at| {
         let length = list_length(vm, receiver(vm, at));
-        if length == 0 {
-            return Ok(Value::FALSE);
+        match list_iterate(length, argument(vm, at, 1)) {
+            Some(next) => Ok(next),
+            // Neither null nor a whole number. `integer_argument` says which,
+            // in upstream's words; it cannot succeed here.
+            None => integer_argument(vm, at, 1, "Iterator").map(|_| Value::FALSE),
         }
-        let current = argument(vm, at, 1);
-        if current.is_null() {
-            return Ok(Value::num(ZERO));
-        }
-        let index = integer_argument(vm, at, 1, "Iterator")?;
-        if index < ZERO || index >= (length - 1) as Num {
-            return Ok(Value::FALSE);
-        }
-        Ok(Value::num(index + ONE))
     });
 
     define(vm, class, "iteratorValue(_)", |vm, at| {
@@ -2329,6 +2323,74 @@ fn resolve_index(index: Num, length: usize) -> Result<usize, RuntimeError> {
         return Err(RuntimeError::new("Index out of bounds."));
     }
     Ok(resolved as usize)
+}
+
+// **The iteration protocol's rules, once each, for two callers.** A `for`
+// loop calls `iterate(_)` and `iteratorValue(_)` on every pass, and on a
+// `Range` or a `List` the interpreter answers them itself -- see
+// `Vm::intrinsic` -- rather than calling the primitives below. Both go through
+// these functions, so the two cannot come to disagree. Each returns `None`
+// exactly where the primitive raises, and leaves the raising to the primitive.
+
+/// `Range.iterate(_)`: upstream's, verbatim in behaviour.
+///
+/// **A fractional iterator is allowed**, and simply steps from where it is:
+/// `for (i in 1..3)` always passes integers, but a program may call `iterate`
+/// directly with anything, and upstream answers rather than refusing. `None`
+/// for an iterator that is neither null nor a number.
+pub(crate) fn range_iterate(range: &ObjRange, current: Value) -> Option<Value> {
+    if range.from == range.to && !range.is_inclusive {
+        return Some(Value::FALSE);
+    }
+    if current.is_null() {
+        return Some(Value::num(range.from));
+    }
+    let mut iterator = current.as_num()?;
+    if range.from < range.to {
+        iterator += ONE;
+        if iterator > range.to {
+            return Some(Value::FALSE);
+        }
+    } else {
+        iterator -= ONE;
+        if iterator < range.to {
+            return Some(Value::FALSE);
+        }
+    }
+    if !range.is_inclusive && iterator == range.to {
+        return Some(Value::FALSE);
+    }
+    Some(Value::num(iterator))
+}
+
+/// `List.iterate(_)` over a list of `length` elements.
+///
+/// An empty list ends the loop whatever the iterator is -- upstream tests the
+/// length first. `None` for an iterator that is neither null nor a whole
+/// number.
+pub(crate) fn list_iterate(length: usize, current: Value) -> Option<Value> {
+    if length == 0 {
+        return Some(Value::FALSE);
+    }
+    if current.is_null() {
+        return Some(Value::num(ZERO));
+    }
+    let index = current.as_num()?;
+    if index != math::trunc(index) {
+        return None;
+    }
+    if index < ZERO || index >= (length - 1) as Num {
+        return Some(Value::FALSE);
+    }
+    Some(Value::num(index + ONE))
+}
+
+/// `List.iteratorValue(_)` for an iterator it accepts: the element, counting a
+/// negative index from the end as every list index does. `None` wherever the
+/// primitive raises.
+pub(crate) fn list_iterator_value(elements: &[Value], iterator: Value) -> Option<Value> {
+    let index = resolve_index(iterator.as_num()?, elements.len()).ok()?;
+    elements.get(index).copied()
 }
 
 /// `Map`, and the `MapEntry` its iteration yields.
@@ -2837,40 +2899,8 @@ fn install_range(vm: &mut Vm) {
         let Some(range) = range_of(vm, receiver(vm, at)) else {
             return Err(RuntimeError::new("Receiver must be a range."));
         };
-
-        if range.from == range.to && !range.is_inclusive {
-            return Ok(Value::FALSE);
-        }
-
-        let current = argument(vm, at, 1);
-        if current.is_null() {
-            return Ok(Value::num(range.from));
-        }
-        // **A fractional iterator is allowed**, and simply steps from where it
-        // is: `for (i in 1..3)` always passes integers, but a program may call
-        // `iterate` directly with anything, and upstream answers rather than
-        // refusing.
-        let mut iterator = argument(vm, at, 1)
-            .as_num()
-            .ok_or_else(|| RuntimeError::new("Iterator must be a number."))?;
-
-        if range.from < range.to {
-            iterator += ONE;
-            if iterator > range.to {
-                return Ok(Value::FALSE);
-            }
-        } else {
-            iterator -= ONE;
-            if iterator < range.to {
-                return Ok(Value::FALSE);
-            }
-        }
-
-        if !range.is_inclusive && iterator == range.to {
-            return Ok(Value::FALSE);
-        }
-
-        Ok(Value::num(iterator))
+        range_iterate(&range, argument(vm, at, 1))
+            .ok_or_else(|| RuntimeError::new("Iterator must be a number."))
     });
 
     // For a range the iterator *is* the value, which is why iterating one

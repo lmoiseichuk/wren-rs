@@ -283,6 +283,9 @@ pub struct Vm {
     /// with more than 256 distinct method signatures simply takes the slow
     /// path for the ones past the end, which is what it does today anyway.
     num_ops: [u8; 256],
+    /// Which receivers the intrinsics in `num_ops` may answer for; see
+    /// [`INTRINSIC_ITERATE`].
+    intrinsics: Intrinsics,
     /// The core library built into the image, if there is one.
     ///
     /// **Read by the installers, not by the interpreter.** `install_system`
@@ -519,6 +522,63 @@ const NUM_LT: u8 = 6;
 const NUM_GT: u8 = 7;
 const NUM_LE: u8 = 8;
 const NUM_GE: u8 = 9;
+
+/// **Built-in methods the `Call` arm answers without calling them.** The same
+/// table as the numeric operators, and the same argument for why it is safe:
+/// a built-in class cannot be subclassed or reopened, so once the receiver's
+/// type is known, so is the method a lookup would find. Where the receiver is
+/// an instance -- `tree == null` -- its class *can* override the method, so
+/// the lookup happens and the answer is used only if it found `Object`'s.
+///
+/// These are the ones the benchmarks call by the ten thousand: every `for`
+/// loop calls `iterate(_)` and `iteratorValue(_)` once a pass, `x == null` is
+/// how a tree finds its leaves, and `!flag` is a primitive call like any
+/// other. Each answer comes from the same function the primitive uses -- see
+/// `core::range_iterate` -- and anything unusual falls through to the real
+/// call, so an intrinsic can only skip work, never change an answer.
+const INTRINSIC_ITERATE: u8 = 16;
+const INTRINSIC_ITERATOR_VALUE: u8 = 17;
+const INTRINSIC_EQ: u8 = 18;
+const INTRINSIC_NE: u8 = 19;
+const INTRINSIC_NOT: u8 = 20;
+
+/// Which receivers each intrinsic may answer for, learned once the core is
+/// installed and flattened.
+///
+/// **A manifest can leave a method out**, and then a call to it must fail as
+/// it would have. So each flag says the class really answers that signature,
+/// and each entry is `Object`'s packed method, to be compared against what an
+/// instance's class holds -- equal means not overridden.
+#[derive(Clone, Copy)]
+struct Intrinsics {
+    range_iterate: bool,
+    range_iterator_value: bool,
+    list_iterate: bool,
+    list_iterator_value: bool,
+    null_equality: bool,
+    bool_equality: bool,
+    null_not: bool,
+    bool_not: bool,
+    object_eq: u32,
+    object_ne: u32,
+    object_not: u32,
+}
+
+impl Intrinsics {
+    const NONE: Intrinsics = Intrinsics {
+        range_iterate: false,
+        range_iterator_value: false,
+        list_iterate: false,
+        list_iterator_value: false,
+        null_equality: false,
+        bool_equality: false,
+        null_not: false,
+        bool_not: false,
+        object_eq: crate::object::NO_METHOD,
+        object_ne: crate::object::NO_METHOD,
+        object_not: crate::object::NO_METHOD,
+    };
+}
 
 /// A chunk, reached by pointer rather than through its `Rc`.
 ///
@@ -870,6 +930,7 @@ impl Vm {
             stack: Vec::new(),
             method_names: SymbolTable::new(),
             num_ops: [NUM_OP_NONE; 256],
+            intrinsics: Intrinsics::NONE,
             frozen,
             core_filter: None,
             primitives: Vec::new(),
@@ -947,6 +1008,8 @@ impl Vm {
         // **Only now.** The classes above were created empty and populated by
         // `install`, so flattening any earlier would have copied nothing.
         vm.flatten_class_hierarchy();
+        // After flattening, so a class answers what it inherits as well.
+        vm.learn_intrinsics();
         vm.core_variables = vm.modules[0].values.len();
 
         // On a host there is an obvious clock and no reason to make every
@@ -1358,6 +1421,140 @@ impl Vm {
         let index = crate::object::entry_primitive(entry)?;
         let function = self.primitives.get(index)?;
         Some(Method::Primitive(*function))
+    }
+
+    /// Record which built-in methods the `Call` arm may answer itself.
+    ///
+    /// See [`INTRINSIC_ITERATE`]. Run once, after the core is installed and
+    /// flattened: a flag is set only where the class's own table -- with what
+    /// it inherited -- holds the method, so a core cut down by a manifest is
+    /// answered exactly as dispatch would answer it.
+    fn learn_intrinsics(&mut self) {
+        let symbol_of = |vm: &Vm, signature: &str| vm.method_names.find(signature);
+        let entry_of = |vm: &Vm, class: ObjectId, symbol: Option<usize>| match (vm.heap.class(class), symbol) {
+            (Some(class), Some(symbol)) => class.method_entry(symbol),
+            _ => crate::object::NO_METHOD,
+        };
+        let iterate = symbol_of(self, "iterate(_)");
+        let iterator_value = symbol_of(self, "iteratorValue(_)");
+        let eq = symbol_of(self, "==(_)");
+        let ne = symbol_of(self, "!=(_)");
+        let not = symbol_of(self, "!");
+        let answers = |vm: &Vm, class: ObjectId, symbol: Option<usize>| {
+            vm.built(class) && entry_of(vm, class, symbol) != crate::object::NO_METHOD
+        };
+        self.intrinsics = Intrinsics {
+            range_iterate: answers(self, self.range_class, iterate),
+            range_iterator_value: answers(self, self.range_class, iterator_value),
+            list_iterate: answers(self, self.list_class, iterate),
+            list_iterator_value: answers(self, self.list_class, iterator_value),
+            null_equality: answers(self, self.null_class, eq) && answers(self, self.null_class, ne),
+            bool_equality: answers(self, self.bool_class, eq) && answers(self, self.bool_class, ne),
+            null_not: answers(self, self.null_class, not),
+            bool_not: answers(self, self.bool_class, not),
+            object_eq: entry_of(self, self.object_class, eq),
+            object_ne: entry_of(self, self.object_class, ne),
+            object_not: entry_of(self, self.object_class, not),
+        };
+        for (symbol, operation) in [
+            (iterate, INTRINSIC_ITERATE),
+            (iterator_value, INTRINSIC_ITERATOR_VALUE),
+            (eq, INTRINSIC_EQ),
+            (ne, INTRINSIC_NE),
+            (not, INTRINSIC_NOT),
+        ] {
+            if let Some(symbol) = symbol {
+                if symbol < self.num_ops.len() {
+                    self.num_ops[symbol] = operation;
+                }
+            }
+        }
+    }
+
+    /// Answer a built-in method without calling it, or say it cannot.
+    ///
+    /// `None` sends the call down the ordinary path, which is always correct;
+    /// see [`INTRINSIC_ITERATE`] for why a `Some` is. Out of line, because
+    /// `run_frames` pays for every byte of its body on every dispatch, and this
+    /// runs on a small minority of them.
+    #[inline(never)]
+    fn intrinsic(&self, operation: u8, receiver_at: usize, symbol: usize) -> Option<Value> {
+        let receiver = self.stack[receiver_at];
+        let flags = self.intrinsics;
+        match operation {
+            INTRINSIC_ITERATE | INTRINSIC_ITERATOR_VALUE => {
+                let iterator = self.stack[receiver_at + 1];
+                let id = receiver.as_object()?;
+                match (self.heap.kind_of(id)?, operation) {
+                    (ObjectType::Range, INTRINSIC_ITERATE) if flags.range_iterate => {
+                        crate::core::range_iterate(self.heap.range(id)?, iterator)
+                    }
+                    // For a range the iterator *is* the value.
+                    (ObjectType::Range, INTRINSIC_ITERATOR_VALUE) if flags.range_iterator_value => {
+                        Some(iterator)
+                    }
+                    (ObjectType::List, INTRINSIC_ITERATE) if flags.list_iterate => {
+                        crate::core::list_iterate(self.heap.list(id)?.elements.len(), iterator)
+                    }
+                    (ObjectType::List, INTRINSIC_ITERATOR_VALUE) if flags.list_iterator_value => {
+                        crate::core::list_iterator_value(&self.heap.list(id)?.elements, iterator)
+                    }
+                    _ => None,
+                }
+            }
+            INTRINSIC_EQ | INTRINSIC_NE => {
+                let same = receiver.is_same(self.stack[receiver_at + 1]);
+                let answered = if receiver.is_null() {
+                    flags.null_equality
+                } else if receiver.is_bool() {
+                    flags.bool_equality
+                } else {
+                    // An instance: only if its class did not override it.
+                    let wanted = match operation {
+                        INTRINSIC_EQ => flags.object_eq,
+                        _ => flags.object_ne,
+                    };
+                    wanted != crate::object::NO_METHOD && self.instance_method_entry(receiver, symbol) == wanted
+                };
+                match (answered, operation) {
+                    (false, _) => None,
+                    (true, INTRINSIC_EQ) => Some(Value::bool(same)),
+                    (true, _) => Some(Value::bool(!same)),
+                }
+            }
+            INTRINSIC_NOT => {
+                if receiver.is_bool() {
+                    return flags.bool_not.then(|| Value::bool(receiver.is_false()));
+                }
+                if receiver.is_null() {
+                    return flags.null_not.then_some(Value::TRUE);
+                }
+                // `!anything` else is `false`, unless the class says otherwise.
+                let wanted = flags.object_not;
+                (wanted != crate::object::NO_METHOD && self.instance_method_entry(receiver, symbol) == wanted)
+                    .then_some(Value::FALSE)
+            }
+            _ => None,
+        }
+    }
+
+    /// The packed entry an instance's class holds for `symbol`.
+    ///
+    /// `NO_METHOD` for anything that is not an instance, which `intrinsic`
+    /// never mistakes for `Object`'s entry: it has already refused an absent
+    /// one. Strings, ranges and the other built-ins fall through to the real
+    /// call, where their own `==` is.
+    fn instance_method_entry(&self, receiver: Value, symbol: usize) -> u32 {
+        let Some(id) = receiver.as_object() else {
+            return crate::object::NO_METHOD;
+        };
+        let Some(instance) = self.heap.instance(id) else {
+            return crate::object::NO_METHOD;
+        };
+        match self.heap.class(instance.class) {
+            Some(class) => class.method_entry(symbol),
+            None => crate::object::NO_METHOD,
+        }
     }
 
     /// Bind a Rust-implemented method, interning the function pointer.
@@ -2695,12 +2892,18 @@ impl Vm {
                     // **One bounds test, not a compare and then an index.**
                     // `get` is the range check and the load together; the
                     // separate `symbol < len` was the same test written twice.
-                    if byte == code::CALL && arity == 1 {
+                    // `arity <= 1` rather than `== 1` for `!`, the one
+                    // intrinsic with no argument. Every numeric operator and
+                    // every other intrinsic takes exactly one.
+                    if byte == code::CALL && arity <= 1 {
                         let operation = match self.num_ops.get(symbol) {
                             Some(operation) => *operation,
                             None => NUM_OP_NONE,
                         };
-                        if operation != NUM_OP_NONE {
+                        // **The numeric codes only.** `==` shares this table
+                        // as an intrinsic, and `1 == 1` reaching the match
+                        // below would be answered by its last arm, `>=`.
+                        if operation != NUM_OP_NONE && operation <= NUM_GE {
                             let top = self.stack.len();
                             // Receiver and argument, in the order the caller
                             // pushed them.
@@ -2745,6 +2948,16 @@ impl Vm {
                                     self.stack.push(value);
                                     break 'call;
                                 }
+                            }
+                        } else if operation > NUM_GE {
+                            // A built-in method answered without calling it;
+                            // see `INTRINSIC_ITERATE`. `None` is the ordinary
+                            // call below, which is always right.
+                            let receiver_at = self.stack.len() - arity - 1;
+                            if let Some(value) = self.intrinsic(operation, receiver_at, symbol) {
+                                self.stack.truncate(receiver_at);
+                                self.stack.push(value);
+                                break 'call;
                             }
                         }
                     }
