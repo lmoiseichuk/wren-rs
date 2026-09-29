@@ -1299,6 +1299,7 @@ profile found them.
 | X15 | profile-guided layout: hot blocks together, from counts measured on the host | unknown | the whole loop | none | **refused**: +4.72% work, +3.4 to +7.9% time, +52 KB flash. The x86 profile matched every interpreter function and drove inlining that piled code into the hot paths -- LM's suggestion: order by frequency |
 | X17 | `<`, `>`, `<=`, `>=` on two doubles as integer tests on their bit patterns, instead of soft-float calls | about a third of `fib`'s arithmetic loses a call | comparisons | none | todo -- found by the U8 design pass; helps the `match` loop too |
 | X16 | `call_target` forced inline, so its result stops round-tripping through the stack | ~−1% read from the disassembly | calls | none | **refused**: +0.93% work, +1.7 to +2.4% time. Old experiment 16 found it already inlined; it no longer was, and inlining it now costs more in the arms around it |
+| X18 | **a call told from an operator by the compiler**: `Call` always names a method, `CallOperator` carries its operation -- LM's suggestion, one opcode split in two | ~−6.5% threaded, read from the disassembly | every call | none; `.wrenc` becomes version 4 | **kept**: threaded −6.21% work (f64) and −5.71% (`nofp`), time −3.4 to −8.5% on all four; `match` loop −1.16% (f64) and +0.14% (`nofp`); µwren `fib` −2.7% time. See *X18* below |
 
 ### The clock
 
@@ -1446,6 +1447,7 @@ be credited to the change.
 | 6a | intrinsics inlined into their handler | −0.19% on 5 | −0.4 to −0.95% | −0.53% on 5 | `list_build` −4.9% |
 | 6 | 6a, plus every object's class and primitives in handlers of their own | +0.99% on 5 | `fib` +1.4% | −0.20% on 5 | `list_build` −7.9% |
 | 6c | 6 with the closure case tested first | −0.25% on 6 | | −0.33% on 6 | |
+| 7 | the float arithmetic in a handler of its own, so a method call skips its register saves | −0.14% on the shipped U8 | `fib` +2.1%, `method_call` −2.3%, `list_build` −2.0% | 0 | 0 |
 
 What shipped is 5 and 6a. Against the control, identical at branch padding 4
 and 8:
@@ -1488,12 +1490,81 @@ as U3 did.
   leaf to every object's class and giving primitives a handler of their own
   cost f64 `fib` 1.4%, though `fib` reaches neither; testing the closure case
   first recovered a third of it. Only the intrinsic inlining (6a) was kept.
+- **Step 7: a split made at run time moves a cost, it does not remove it.**
+  Taking the soft-float calls out of `call` took its register saves off every
+  method call, and put a second jump and a second prologue on every operator.
+  `fib` makes two and a half operator calls for each method call, and lost.
+  Refused; X18 is the split made where it is free.
 
 **What is left.** `list_build` is the one benchmark that is slower in f64: its
 `iterate` and `iteratorValue` intrinsics do soft-float arithmetic, so their
 handler keeps a frame, and `List.add` is a primitive, which the leaf does not
 take. In `nofp` it is 3.4% faster. X17 -- comparisons on the bit pattern --
 would take a call off some of f64's arithmetic in both interpreters.
+
+### X18: the compiler tells an operator from a method
+
+LM's question after U8: split an opcode in two, so that each half can drop the
+tests only the other needs. The threaded `call` handler's disassembly said
+which one. A plain method call -- `get(n - 1)`, `b.get`, `list.add(x)` -- ran
+31 of its instructions before reaching `call_method`:
+
+| instructions | what for |
+|---|---|
+| 7 + 7 | saving and restoring six registers, needed only because the arithmetic path calls soft-float |
+| 13 | asking whether the symbol is an operator or an intrinsic: the arity test, the symbol load, a bounds test and a byte from `num_ops`, two compares |
+| 2 | the jump to `call_method` |
+
+An operator paid the same 13 to find itself, and 8 more for the jump table
+that tells `+` from `-`.
+
+**Splitting at run time cannot win on both sides**, which is what U8's step 7
+found: whatever comes off the method call goes onto the operator. **The
+compiler can**, because it already holds the answer. `emit_call` has the
+signature as a string, and the fourteen that matter -- nine numeric
+operators, `iterate(_)`, `iteratorValue(_)`, `==(_)`, `!=(_)` and `!` -- are a
+fixed list. So a `Call` now always names a method, and the threaded table
+sends it straight to `call_method`. A `CallOperator` carries its operation
+where a `Call` carries its arity, and keeps the symbol for the receivers the
+fast path declines -- a string on the left of `+`, a class defining `==`. The
+`num_ops` table, 256 bytes of every `Vm`, is gone, and with it
+`learn_numeric_operators`.
+
+| | f64 work | f64 time | `nofp` work | `nofp` time |
+|---|---|---|---|---|
+| threaded `binary_trees` | −3.83% | −4.13% | −2.81% | −3.42% |
+| threaded `fib` | −7.77% | −7.81% | −8.05% | −8.54% |
+| threaded `list_build` | −4.00% | −4.00% | −6.70% | −7.00% |
+| threaded `method_call` | −6.54% | −6.91% | −5.18% | −5.95% |
+| threaded, sum | **−6.21%** | | **−5.71%** | |
+| `match` loop, sum | −1.16% | −2.0 to +0.1% | +0.14% | −0.4 to +1.4% |
+
+Threaded against the shipped U8, the `match` loop against HEAD built by
+stable. µwren's `fib`, which runs the same bytecode from a `.wrenc` on the
+`match` loop, went from 5.34 s to 5.20 s (−2.7%) for 560 bytes of flash and
+no RAM. The other images moved by −80 B (threaded f64), +176 B (threaded
+`nofp`), +96 B and +624 B (`match`).
+
+**The `match` loop gains little, and `nofp` nothing.** Its call arm never
+carried the threaded handler's register saves, so only the lookup comes off,
+and a changed arm moves register allocation across the whole loop. Working out
+the arity after the fast paths rather than before was measured as well: f64
+−0.63%, `nofp` −0.23% -- a different split of the same small amount. The first
+form is kept, because the default build is f64.
+
+**A manifest can still leave an operator out.** Where `Num` lacks `-(_)`,
+`1 - 2` has to report the method missing, as dispatch would. The compiler
+emits `CallOperator` only for an operator `Num` really has; a `.wrenc`
+compiled by a full VM is decided again on load, against the VM that will run
+it. The interpreter needs no test of its own for it.
+`an_operator_a_manifest_leaves_out_is_reported_missing` takes both routes, and
+fails with either check removed. `.wrenc` is version 4: a version-3 file would
+still run, with every operator on the slow path.
+
+**Next: one opcode per operation.** The operator handler still switches on the
+operation -- eight instructions of jump table on every `+` -- and a handler per
+operation drops it: about −4% of `fib` by the same reading. Fourteen opcodes
+take 54 of the 64.
 
 ---
 
