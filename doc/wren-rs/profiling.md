@@ -107,8 +107,9 @@ has not.
    was controlled for — see [`design.md`](design.md).
 3. **It cannot see a stall at all.** A cycle spent waiting for an instruction
    to arrive from flash is attributed to whichever instruction eventually
-   retires. On this part that is two cycles in three, and no amount of sampling
-   will say so.
+   retires. This page used to say that is two cycles in three on this part; the
+   figure was a clock error (see below) and the real share is nearer one in
+   four. No amount of sampling will say which cycles they are.
 
 So: a sampling profile is for **generating candidates**, never for accepting
 one. Everything it suggests is then measured on the board.
@@ -313,6 +314,18 @@ dispatch — the stable-Rust stand-in for computed `goto`, which re-expands the
 decode at the end of every arm — will lose for the same reason, since its whole
 method is to make the loop bigger.
 
+**Correction, 2026-09-29: the clock was 80 MHz, and this table is wrong by
+exactly two.** The port asked esp-hal for its default configuration, which runs
+an ESP32-C6 at 80 MHz, not the 160 MHz "nominal" figure the division assumed.
+The chip's own cycle counter -- event 0 above, read directly rather than
+derived -- gives **1.29 to 1.33** cycles per instruction in the `opcost` loop
+and 1.31 for `fib` whole. Two cycles in three are *not* idle; the interpreter is
+not fetch-bound in the sense this section argued. Padding branch targets still
+moves time by 3-4%, which is measured and stands. What does not stand is the
+inference from it: that the loop's size is the bottleneck, and so that
+replicated dispatch must lose. That was a prediction, never a measurement. See
+*The clock* under *Upstream's speed, technique by technique* below.
+
 ---
 
 ## The heap profiler
@@ -369,6 +382,13 @@ future optimisation should be judged against.
 believing a derived figure: 1.25 million opcodes at 113.6 instructions and 2.59
 cycles per instruction is 368 million cycles, and `method_call` at 160 MHz
 takes 2.30 s — 368 million cycles.*
+
+*Correction, 2026-09-29: the check balanced because both sides carried the
+same factor of two.* The board was at 80 MHz, so 2.30 s is 184 million cycles
+and the ratio is 1.30 cycles per instruction. The 6.8x was C at 160 MHz against
+this at 80; at one clock `method_call` is 2.3x slower than upstream, which puts
+C near forty machine instructions per bytecode instruction rather than
+seventeen, if the two cores retire at a similar rate.
 
 `Call` is between a fifth and a third of every profile, and in `fib` it ties
 `LoadLocal` almost exactly — because arithmetic in Wren *is* method calls, so
@@ -823,6 +843,13 @@ before this pass and the 108 an earlier note miscalculated by dividing by
 single-run counts when the board repeats `fib` five times and `method_call`
 ten.
 
+*Correction, 2026-09-29: the 108 was right and the 23.7 is the miscalculation.*
+The board divides its counter by the repeat count before printing it
+(`counters::stop() / repeats` in the port), so `[work]` is already one run.
+Dividing it by device-wide opcode counts divided by the repeats a second time.
+Per single run, both from the same tree: `fib` 588,383,290 instructions over
+6,377,165 bytecode operations is **92.3**, and the four together 101.6.
+
 So the ranking that decides where to look next is unchanged, and `Call` is
 still the only arm frequent enough that one machine instruction is worth a per
 cent:
@@ -1010,6 +1037,11 @@ samples of 50 and nothing else is above 3. `binary_trees` has one peak left,
 **What is left is fetch, not execute.** Cycles per instruction sit at 2.58,
 and the changes that moved the clock furthest were the ones that made the code
 *smaller* rather than the ones that made it do less:
+
+*(Corrected 2026-09-29: the 2.58 was measured at 80 MHz and divided by 160; the
+counter reads 1.3. The table below is measured and stands; the heading's
+reading of it does not -- see the correction under "What it says about the
+bottleneck".)*
 
 | change | work | time |
 |---|---|---|
