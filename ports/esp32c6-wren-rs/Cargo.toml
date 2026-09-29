@@ -32,6 +32,8 @@ blocked-slots = ["wren/blocked-slots"]
 # f32` builds one.
 f32 = ["wren/f32"]
 nofp = ["wren/nofp"]
+# Threaded dispatch; nightly only -- `tools/measure-rs.sh --toolchain nightly`.
+tail-calls = ["wren/tail-calls"]
 
 [dependencies]
 # This port compiles on the device, so it takes the compiler.

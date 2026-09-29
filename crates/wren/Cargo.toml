@@ -87,6 +87,12 @@ map = []
 # Off by default. On for a program that builds something large and then lets
 # go of it, on a part where the peak is what runs out.
 blocked-slots = []
+# **Threaded dispatch: one function per opcode, chained by guaranteed tail
+# calls** -- the Rust counterpart of upstream's computed `goto`. Nightly only,
+# because it needs `explicit_tail_calls` (`become`), so it is off by default
+# and every stable build keeps the `match` loop. See doc/wren-rs/profiling.md,
+# U8, for what it measured.
+tail-calls = []
 # `std` is for the host: tests, and eventually an ahead-of-time compiler that
 # runs on a workstation and emits bytecode for a part that cannot afford one.
 # Firmware builds turn it off and usually turn `alloc` on instead.

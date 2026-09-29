@@ -9,6 +9,7 @@
 #   tools/measure-rs.sh speed --slot-block 256 # blocked slot tables, this size
 #   tools/measure-rs.sh speed --features f32   # any cargo feature of the port
 #   tools/measure-rs.sh --only method_call     # report one benchmark of the four
+#   tools/measure-rs.sh --toolchain nightly    # build with another toolchain
 #
 # **`--only` filters the report, not the build.** It used to select benchmarks
 # at compile time, which changed the image -- `binary_trees` measured 3.67%
@@ -43,6 +44,7 @@ LOG=""
 FEATURES=""
 SLOT_BLOCK=""
 ONLY=""
+TOOLCHAIN=""
 
 while (( $# )); do
     case "$1" in
@@ -52,6 +54,7 @@ while (( $# )); do
         --features) FEATURES="${2:-}"; shift ;;
         --slot-block) SLOT_BLOCK="${2:-}"; shift ;;
         --only) ONLY="${2:-}"; shift ;;
+        --toolchain) TOOLCHAIN="${2:-}"; shift ;;
         --log) LOG="${2:-}"; shift ;;
         --board) BOARD="${2:-}"; shift ;;
         -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -75,7 +78,10 @@ LOG="${LOG:-$(mktemp -t wren-rs-measure.XXXXXX.log)}"
 
 cd "$PORT_DIR" || exit 1
 
-BUILD=(cargo build --profile "$PROFILE")
+# **The toolchain is part of the measurement.** Nightly carries a newer LLVM,
+# so a nightly-only feature has to be compared against the same source built by
+# the same nightly with the feature off -- never against the stable build.
+BUILD=(cargo ${TOOLCHAIN:++$TOOLCHAIN} build --profile "$PROFILE")
 [[ -n "$BIN" ]] && BUILD+=(--bin "$BIN")
 
 # **A block size implies blocked tables.** Asking for one in a build that has
@@ -110,7 +116,7 @@ if [[ -n "$PAD" ]]; then
     echo "placement : branch targets padded to ${PAD} B"
 fi
 
-echo "profile   : $PROFILE"
+echo "profile   : $PROFILE${TOOLCHAIN:+ ($TOOLCHAIN)}"
 echo "board     : ${BOARD:-<default>}  $MAC"
 "${BUILD[@]}" >/dev/null 2>&1 || { echo "build failed" >&2; exit 1; }
 
