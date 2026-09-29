@@ -2365,6 +2365,29 @@ impl Vm {
             }};
         }
 
+        // **Collect after an instruction that allocated, not after every
+        // instruction.** Upstream never asks between instructions at all: it
+        // tests `bytesAllocated > nextGC` inside `wrenReallocate`, so the
+        // question costs nothing unless something was allocated. Collecting
+        // inside the allocator is what this VM refuses to do -- see
+        // `collect_point` -- but the same economy is available one level up:
+        // the flag can only become true when something allocates, so only an
+        // arm that can allocate needs to read it. `LoadLocal`, `Pop`, `Jump`,
+        // a field read and a return never do, and they are most of what runs.
+        //
+        // **Deferring is safe, and bounded.** An arm that allocates without
+        // asking -- a field store that has to grow its instance, which the
+        // compiler never emits -- only moves the collection to the next arm
+        // that does ask, and every loop that allocates without end goes
+        // through one of those.
+        macro_rules! collect_if_due {
+            () => {{
+                if (NURSERY && self.heap.young() >= NURSERY_OBJECTS) || self.heap.collection_due() {
+                    self.collect_point(offset_of!(ip));
+                }
+            }};
+        }
+
         'interpret: loop {
             // **The offset, not the line.** `line_at` is a lookup into a table
             // as long as the code, and the line is wanted only when something
@@ -2585,6 +2608,7 @@ impl Vm {
                         .heap
                         .allocate(Object::Closure(ObjClosure { function, upvalues }));
                     self.stack.push(Value::object(id));
+                    collect_if_due!();
                 }
                 code::CLASS => {
                     let declared = Chunk::inline_operand(unit) as usize;
@@ -2592,6 +2616,7 @@ impl Vm {
                     let name = self.stack.pop().unwrap_or(Value::NULL);
                     let class = self.make_class(name, superclass, declared)?;
                     self.stack.push(class);
+                    collect_if_due!();
                 }
                 code::METHOD_INSTANCE | code::METHOD_STATIC => {
                     let symbol = unsafe { *ip } as usize;
@@ -2599,6 +2624,7 @@ impl Vm {
                     let class = self.stack.pop().unwrap_or(Value::NULL);
                     let body = self.stack.pop().unwrap_or(Value::NULL);
                     self.bind_method(class, body, symbol, byte == code::METHOD_STATIC)?;
+                    collect_if_due!();
                 }
                 code::LOAD_FIELD_THIS => {
                     let index = Chunk::inline_operand(unit) as usize;
@@ -2641,6 +2667,7 @@ impl Vm {
                     let class = self.stack[base];
                     let instance = self.instantiate(class)?;
                     self.stack[base] = instance;
+                    collect_if_due!();
                 }
                 code::CALL | code::SUPER => 'call: {
                     // The arity rides inline; the symbol is the unit after.
@@ -2842,6 +2869,9 @@ impl Vm {
                                 continue 'interpret;
                             }
                             self.stack.push(value);
+                            // A primitive is where most allocation happens:
+                            // strings, lists, ranges, maps.
+                            collect_if_due!();
                         }
                         Method::Closure(closure) => {
                             // **One walk to the closure, not three.** Arity,
@@ -2921,8 +2951,12 @@ impl Vm {
                     let index = Chunk::inline_operand(unit) as usize;
                     let value = *self.stack.last().unwrap();
                     self.set_static_field(index, value)?;
+                    collect_if_due!();
                 }
-                code::SET_ATTRIBUTES => self.set_attributes(),
+                code::SET_ATTRIBUTES => {
+                    self.set_attributes();
+                    collect_if_due!();
+                }
                 code::IMPORT_MODULE => {
                     let index = unsafe { *ip } as usize;
                     ip = unsafe { ip.add(1) };
@@ -2934,6 +2968,7 @@ impl Vm {
                         Ok((_, None)) => {
                             // Already loaded: its body must not run twice.
                             self.stack.push(Value::NULL);
+                            collect_if_due!();
                         }
                         Ok((_, Some(closure))) => {
                             // Run the module body as an ordinary call. Its
@@ -2989,6 +3024,7 @@ impl Vm {
 
                     let value = self.imported_variable(&module_name, &variable, chunk_of(chunk).line_at(offset_of!(at)))?;
                     self.stack.push(value);
+                    collect_if_due!();
                 }
                 code::RETURN | code::END | code::LOAD_LOCAL_RETURN | code::LOAD_FIELD_THIS_RETURN => {
                     // **The fused returns skip the stack entirely.** Pushing a
@@ -3140,23 +3176,15 @@ impl Vm {
                 _ => return Err(Self::bad_opcode(byte, chunk_of(chunk).line_at(offset_of!(at)))),
             }
 
-
-            // **One boolean per instruction, not four field reads.** The two
-            // tests this used to make read `paused`, `bytes`, `young_bytes`
-            // and `threshold` and do saturating arithmetic on them -- about
-            // ten machine instructions, on opcodes like `Pop` and `Jump` that
-            // cost thirty-nine in total. None of those four can change except
-            // by allocating, so the heap works the answer out when it
-            // allocates and leaves it here to be read.
+            // **No collection test here.** It was one boolean per instruction
+            // -- before that, four field reads and saturating arithmetic --
+            // and it now lives in the arms that can allocate; see
+            // `collect_if_due!`.
             // Where this instruction ended, for the adjacency test above.
             // Known only now: the arm is what consumed the operands.
             #[cfg(feature = "profile")]
             {
                 self.previous_end = offset_of!(ip);
-            }
-
-            if (NURSERY && self.heap.young() >= NURSERY_OBJECTS) || self.heap.collection_due() {
-                self.collect_point(offset_of!(ip));
             }
         }
     }

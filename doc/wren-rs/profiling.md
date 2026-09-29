@@ -1238,9 +1238,9 @@ selection.
 
 | # | technique | upstream | what it takes here | estimate, all four | where it lands | status |
 |---|---|---|---|---|---|---|
-| U1 | test for collection only when allocating | `wrenReallocate` compares `bytesAllocated` | the per-instruction flag test (`lbu`+`bnez`) moves into the nine arms that allocate | −2.0% read from the disassembly | every opcode | **refused**: +0.56% and +0.67% measured, see below |
+| U1 | test for collection only when allocating | `wrenReallocate` compares `bytesAllocated` | the per-instruction flag test (`lbu`+`bnez`) moves into the nine arms that allocate | −2.0% read from the disassembly | every opcode | **kept** once U3 was in: −2.73% work, −2.2 to −4.2% time. Refused before it; see below |
 | U2 | no arity check when a method is called | the signature carries the arity | check once, when `MethodInstance` binds it, instead of on every closure call | ~−0.2% | calls | todo |
-| U3 | the frame holds the function by pointer, no reference count | `CallFrame.closure->fn` | `Frame::chunk` becomes a raw pointer rooted by the frame's closure, on the same terms as `code_units`; one `Rc` clone and one drop per call go | ~−1.1% (`fib` −1.3%) | calls | todo |
+| U3 | the frame holds the function by pointer, no reference count | `CallFrame.closure->fn` | `Frame::chunk` becomes a raw pointer rooted by the frame's closure, on the same terms as `code_units`; one `Rc` clone and one drop per call go | ~−1.1% (`fib` −1.3%) | calls | **kept**: +0.27% work but −2.4 to −7.0% time, at three placements -- see below |
 | U4 | local slot and constant indices trusted | `stackStart[READ_BYTE()]` | licensed rather than trusted: `max_stack`'s walk already knows the depth at every instruction, and can refuse a slot at or past it, and a constant past the pool | ~−0.6% | loads | todo |
 | U5 | field operands patched when the method is bound | `wrenBindMethodCode` | removes `field_offset` from the frame, `CallTarget` and the loop's locals. **Conflicts with bytecode kept in flash** -- a µwren chunk in `.rodata` cannot be patched, so a frozen image would patch at build time instead | 0 to −1%, a register freed | field access | todo |
 | U6 | a `super` call's class bound into a constant | `SUPER_n`, patched at bind | two heap walks per `super` call go; needs U5's mutable chunk | ~−0.02% | `super` | with U5 |
@@ -1276,7 +1276,7 @@ profile found them.
 | X8 | loop inversion: the test at the bottom, one `Loop` fewer per iteration | ~−0.08%, against about +1% for the opcode it needs | loops | none | refused on the estimate |
 | X9 | more fused pairs (`StoreModuleVar`+`Pop`, `StoreLocal`+`Pop`) | ~−0.23%, against about +1% per opcode added | assignments | none | refused on the estimate |
 | X10 | unchecked heap reads for a handle known to be live | ~−2.4% | every object access | none | **LM's call**: it breaks this crate's rule that the object model has no `unsafe` |
-| X11 | stop the dispatch block rebuilding two constants every instruction | up to −2%, read from the disassembly | every opcode | none | no mechanism yet; U8 would remove it |
+| X11 | stop the dispatch block rebuilding two constants every instruction | up to −2%, read from the disassembly | every opcode | none | **gone with U1**: the dispatch block is seven instructions |
 | X12 | a closure's upvalue slice hoisted like `constants` | 0 on the four | closures | none | todo, low |
 
 ### The clock
@@ -1296,7 +1296,7 @@ starved by its instruction fetch. Padding branch targets still moves time by
 cost, and with it the prediction that replicated dispatch must lose because it
 makes the loop bigger. That prediction was never measured.
 
-### U1: testing for collection only when allocating, refused
+### U1: testing for collection only when allocating
 
 Upstream never asks between instructions whether to collect: the question is
 inside `wrenReallocate`, so it costs nothing unless something was allocated.
@@ -1323,6 +1323,48 @@ That also showed something that is in the shipped build already: **the
 dispatch block rebuilds two constants on every instruction** --
 `lui s0,0x7ffc0` (the NaN-tagging mask) and `li s1,1` -- because no arm leaves
 them where it found them. That is X11 above.
+
+**Tried again after U3, and kept.** U3 changed the call arm enough that the
+same edit now lands the other way -- the inline form, with the collection
+expanded in each of the nine arms that can allocate:
+
+| | `binary_trees` | `fib` | `list_build` | `method_call` | sum |
+|---|---|---|---|---|---|
+| work, branch targets padded to 4 B | −2.83% | −2.60% | −1.51% | −3.53% | **−2.73%** |
+| time, padded to 4 B | −3.79% | −3.62% | −2.16% | −4.22% | |
+| time, padded to 8 B | −3.50% | −3.63% | −2.17% | −4.22% | |
+
+The dispatch block is **seven instructions** where it was nine: fetch, mask,
+scale, add, load, advance, jump -- and the two rebuilt constants are gone with
+the test, which is X11 settled without being attempted. The out-of-line form
+measured −0.19% work and 1.5-2.4% time on the same tree: better than before
+U3, worse than inline.
+
+*The lesson is the one this page keeps reaching:* **a refusal is a fact about
+the tree it was measured on.** U1 lost against one shape of the call arm and
+won against the next, by the same mechanism -- what the register allocator
+does in the dispatch block -- pointing the other way.
+
+### U3: a clone that cost more cycles than instructions
+
+U3 is the first change here where the two instruments disagreed and the
+disagreement was the finding:
+
+| | `binary_trees` | `fib` | `list_build` | `method_call` | sum |
+|---|---|---|---|---|---|
+| work | +0.26% | +0.51% | +0.49% | −1.20% | +0.27% |
+| time, padded to 4 B | −3.77% | −5.52% | −2.43% | −7.00% | |
+| time, padded to 8 B | −3.64% | −5.51% | −2.42% | −7.00% | |
+| time, padded to 16 B | −3.54% | −5.51% | −2.42% | −6.80% | |
+
+More instructions, fewer cycles: `fib` went from 1.31 to 1.23 cycles per
+instruction. The reference count was a load, an add and a store to one word,
+on every call and every return, and an in-order core waits on that; a count of
+instructions cannot see a wait. The protocol said to judge small changes by
+work because time moves with placement -- and at 160 MHz, three placements
+agree to 0.2%. So the rule gains a clause: **when work and time disagree, time
+decides, if it holds across placements.** Seconds are what the program costs;
+instructions were only ever the placement-proof stand-in for them.
 
 ---
 
