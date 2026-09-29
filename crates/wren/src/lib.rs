@@ -70,6 +70,15 @@
 //! being measured against upstream Wren and MicroPython on the same board.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// **`become`, for the threaded interpreter behind `tail-calls`.** A stable
+// compiler never sees either line: the feature is off by default, and the
+// module that uses the syntax is not even parsed without it -- which matters,
+// because a feature-gated syntax is refused even inside code a `cfg` removes.
+#![cfg_attr(feature = "tail-calls", feature(explicit_tail_calls))]
+// `Vec::push_within_capacity`, so the threaded call path can push a frame
+// with no hidden call to the allocator in it.
+#![cfg_attr(feature = "tail-calls", feature(vec_push_within_capacity))]
+#![cfg_attr(feature = "tail-calls", allow(incomplete_features))]
 #![deny(unsafe_code)]
 // Kilobytes, not megabytes: anything unused is flash somebody is paying for.
 #![deny(dead_code)]

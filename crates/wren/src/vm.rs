@@ -19,7 +19,10 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::bytecode::{code, Chunk};
+use crate::bytecode::Chunk;
+// The `match` loop's opcode constants; the threaded interpreter names its own.
+#[cfg(not(feature = "tail-calls"))]
+use crate::bytecode::code;
 #[cfg(feature = "compiler")]
 use crate::compiler;
 use crate::core;
@@ -30,6 +33,13 @@ use crate::object::{
 };
 use crate::symbol::SymbolTable;
 use crate::value::Value;
+
+// **The threaded interpreter, a child of this module** so that it can reach
+// the private helpers and fields the `match` loop uses without making thirty
+// of them `pub(crate)`. Not even parsed without the feature: its `become` is
+// nightly syntax, which a stable compiler refuses even inside removed code.
+#[cfg(feature = "tail-calls")]
+mod threaded;
 
 /// A runtime failure, with the line it happened on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +296,13 @@ pub struct Vm {
     /// Which receivers the intrinsics in `num_ops` may answer for; see
     /// [`INTRINSIC_ITERATE`].
     intrinsics: Intrinsics,
+    /// The threaded interpreter's view of the running frame; see
+    /// `threaded::State`.
+    #[cfg(feature = "tail-calls")]
+    threaded: threaded::State,
+    /// The error a threaded chain ended with, for `threaded::run` to return.
+    #[cfg(feature = "tail-calls")]
+    threaded_error: Option<RuntimeError>,
     /// The core library built into the image, if there is one.
     ///
     /// **Read by the installers, not by the interpreter.** `install_system`
@@ -931,6 +948,10 @@ impl Vm {
             method_names: SymbolTable::new(),
             num_ops: [NUM_OP_NONE; 256],
             intrinsics: Intrinsics::NONE,
+            #[cfg(feature = "tail-calls")]
+            threaded: threaded::State::new(),
+            #[cfg(feature = "tail-calls")]
+            threaded_error: None,
             frozen,
             core_filter: None,
             primitives: Vec::new(),
@@ -1496,7 +1517,13 @@ impl Vm {
     /// see [`INTRINSIC_ITERATE`] for why a `Some` is. Out of line, because
     /// `run_frames` pays for every byte of its body on every dispatch, and this
     /// runs on a small minority of them.
-    #[inline(never)]
+    ///
+    /// **Inlined into its own handler in the threaded interpreter**, the
+    /// opposite choice for the opposite reason: there it has a function to
+    /// itself, and a call out of it would put a register-saving frame on every
+    /// execution. See `threaded`'s module notes.
+    #[cfg_attr(not(feature = "tail-calls"), inline(never))]
+    #[cfg_attr(feature = "tail-calls", inline(always))]
     fn intrinsic(&self, operation: u8, receiver_at: usize, symbol: usize) -> Option<Value> {
         let receiver = self.stack[receiver_at];
         let flags = self.intrinsics;
@@ -2509,6 +2536,13 @@ impl Vm {
         Ok(())
     }
 
+    /// Run with threaded dispatch instead of the `match` loop below; see
+    /// `threaded`. Same contract, same callers.
+    #[cfg(feature = "tail-calls")]
+    fn run_frames(&mut self, chunk: ChunkRef, floor: usize) -> Result<Value, RuntimeError> {
+        threaded::run(self, chunk, floor)
+    }
+
     /// The interpreter loop.
     ///
     /// `chunk`, `ip` and `base` are kept in locals rather than read out of the
@@ -2519,6 +2553,7 @@ impl Vm {
     // **The crate's only `unsafe` lives in this function**, in the fetch and
     // in `code_units`. The audit is `grep -rn unsafe crates/wren/src`.
     #[allow(unsafe_code)]
+    #[cfg(not(feature = "tail-calls"))]
     fn run_frames(&mut self, mut chunk: ChunkRef, floor: usize) -> Result<Value, RuntimeError> {
         let resume_at = self.frames.last().map_or(0, |frame| frame.ip);
         let mut base = self.frames.last().map_or(0, |frame| frame.base);
@@ -3691,6 +3726,7 @@ impl Vm {
         Ok(())
     }
 
+    #[cfg(not(feature = "tail-calls"))]
     fn current_field_offset(&self) -> usize {
         self.frames
             .last()
