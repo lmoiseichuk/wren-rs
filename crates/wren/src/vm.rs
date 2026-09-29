@@ -185,6 +185,7 @@ struct CallTarget {
     /// See [`ObjFn::max_slots`]. Carried here so reserving a frame's room
     /// needs no second walk out to the function.
     max_slots: usize,
+    arity: usize,
     module: usize,
     field_offset: u16,
 }
@@ -1913,6 +1914,7 @@ impl Vm {
         Ok(CallTarget {
             chunk: ChunkRef::from(&*function.chunk),
             max_slots: function.max_slots,
+            arity: function.arity,
             module: function.module,
             field_offset: function.field_offset as u16,
         })
@@ -3108,11 +3110,14 @@ impl Vm {
                             // code and module all come from the same `ObjFn`,
                             // and asking for them separately was the bulk of
                             // what a call cost.
-                            // **No arity check.** The method was found by a
-                            // signature, which carries its arity, and
-                            // `bind_method` refused a body that disagreed
-                            // with its signature.
                             let target = self.call_target(closure)?;
+                            if target.arity != arity {
+                                return Err(Self::wrong_arity(
+                                    target.arity,
+                                    arity,
+                                    chunk_of(chunk).line_at(offset_of!(at)),
+                                ));
+                            }
                             if self.frames.len() >= MAX_FRAMES {
                                 return Err(Self::stack_overflow(chunk_of(chunk).line_at(offset_of!(at))));
                             }
@@ -3830,27 +3835,6 @@ impl Vm {
             None => 0,
         };
         self.set_field_offset(closure, inherited, superclass, class_id);
-
-        // **The arity is checked here, once, so that a call need not check
-        // it every time.** A signature carries its arity -- one `_` per
-        // argument, `name(_,_)`, `[_]=(_)`, `-` -- and every call through this
-        // table is a call *by signature*, so a body that agrees with its
-        // signature when it is bound agrees with every call that can reach
-        // it. Upstream checks at neither point: its compiler guarantees the
-        // agreement. Bytecode here can come from a file, so the guarantee is
-        // checked where it costs one comparison per method rather than one
-        // per call.
-        let expected = match self.method_names.name(symbol) {
-            Some(signature) => signature.bytes().filter(|byte| *byte == b'_').count(),
-            None => return Err(RuntimeError::new("Method symbol out of range.")),
-        };
-        let got = match self.function_of(closure) {
-            Some(function) => function.arity,
-            None => return Err(RuntimeError::new("Method body has no function.")),
-        };
-        if got != expected {
-            return Err(Self::wrong_arity(expected, got, 0));
-        }
 
         if let Some(class) = self.heap.class_mut(target) {
             class.define(symbol, crate::object::closure_entry(closure));
