@@ -225,7 +225,7 @@ the program already said.
 
 What *does* transfer to a small part today, because it was built for one:
 
-- **Bytecode, so nothing compiles on the device.** The compiler is 34,480 B at
+- **Bytecode, so nothing compiles on the device.** The compiler is 34,032 B at
   `-Os` and a `.wrenc` carries a SHA-256 of the source it came from.
 - **32-bit numbers**, `--features f32`: 16–18 KB smaller, 3–13% faster, and a
   quarter to a half off the heap. Not Wren — an `f32` is exact on integers only
@@ -663,21 +663,29 @@ compiled, written, re-loaded into a fresh VM and run. That is the claim that
 matters before any number: the two paths produce the same program.
 
 **What the compiler is worth**, from one package built twice with and without
-`wren/compiler`:
+`wren/compiler` -- `ports/esp32c6-wren-boot` at cac0550, with `wren/core_full`
+added on the command line, for the reason its README gives. Image sizes are
+`espflash save-image`'s:
 
 | | `-Os` | `-O3` |
 |---|---|---|
-| `f64` bytecode / with compiler | 244,960 B / 279,440 B | 363,568 B / 444,784 B |
-| `f32` bytecode / with compiler | 227,712 B / 262,256 B | 343,776 B / 425,104 B |
-| **the compiler** | **~34,500 B** | **~81,200 B** |
+| `f64` bytecode / with compiler | 258,208 B / 292,240 B | 399,648 B / 476,768 B |
+| `f32` bytecode / with compiler | 241,776 B / 276,016 B | 382,912 B / 459,984 B |
+| **the compiler** | **~34,100 B** | **~77,100 B** |
 
-It barely moves with the number width — 34,480 B against 34,544 — because a
-lexer and a parser do not care how wide a double is.
+It barely moves with the number width — 34,032 B against 34,240 at `-Os`,
+77,120 B against 77,072 at `-O3` — because a lexer and a parser do not care how
+wide a double is.
 
-Loading a program takes 378–962 µs where compiling it takes 13–18 ms. That is
-6.5× and it barely matters against a program that then runs for seconds — and
-it is the dominant number on the duty cycle these parts are bought for, where a
-node wakes, samples and sleeps.
+Loading the port's two programs takes 4.5 and 4.9 ms where compiling them takes
+27.3 and 32.4 ms, at `-Os` with 64-bit numbers on `c6b`: 9.4 ms against
+59.6 ms, 6.4×. Across the four builds of each kind -- `-Os` and `-O3`, `f64`
+and `f32` -- a program loads in 3.0–4.9 ms and compiles in 23.5–33.3 ms. The
+four benchmarks are smaller, 509–1,673 B of bytecode against 4,458 and 4,587,
+and load in 835–1,768 µs at `-Os` in `ports/esp32c6-wrenc-rs`, which is µwren.
+The difference barely matters against a program that then runs for most of a
+second -- and it is the dominant number on the duty cycle these parts are
+bought for, where a node wakes, samples and sleeps.
 
 **What bytecode costs is everything a compiler would have allowed**: no REPL,
 no `eval`, no program arriving over the air as text.

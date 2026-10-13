@@ -13,10 +13,18 @@ first.
 One package, one `main.rs`, two images. The only difference is a cargo feature:
 
 ```sh
-cargo build --profile size                      # looks for boot.wrenc, main.wrenc
-cargo build --profile size --features compiler  # looks for boot.wren,  main.wren
-cargo build --profile size --features f32       # ...and with 32-bit numbers
+cargo build --profile size --features wren/core_full           # looks for boot.wrenc, main.wrenc
+cargo build --profile size --features wren/core_full,compiler  # looks for boot.wren,  main.wren
+cargo build --profile size --features wren/core_full,f32       # ...and with 32-bit numbers
 ```
+
+**`wren/core_full` has to be asked for.** The manifest takes `wren` with
+`default-features = false` and `alloc` and `libm`, and since d4299bf
+(2026-09-20) the whole core library is the `core_full` feature, which that
+leaves out. Built without it, `boot` runs and `main` stops at line 133 with
+`Map metaclass does not implement 'new()'`, from an image 42-115 KB smaller
+with half the VM resident -- 11,332 B against 23,176. Every figure below is
+built with it.
 
 Separate packages would have let the two drift apart in a dozen small ways that
 each look like nothing and together make the comparison meaningless. Same heap,
@@ -31,63 +39,88 @@ two is the whole argument:
 
 ## What it costs and what it saves
 
-ESP32-C6FH4 at 160 MHz, 320 KB heap, both programs run in one VM.
-
-> Times are at 160 MHz. Rust-port times measured before 2026-09-29 were taken
-> at 80 MHz — esp-hal's default clock — and are shown halved: the clock fix
-> measured every benchmark at 50.0-50.2% of its 80 MHz time with identical
-> instructions retired ([`doc/wren-rs/profiling.md`](../../doc/wren-rs/profiling.md),
-> *The clock*).
+ESP32-C6FH4 at 160 MHz, 320 KB heap, both programs run in one VM. Measured on
+2026-10-13 at cac0550 on `c6b`: each image flashed twice with `espflash flash
+--monitor`, as `tools/measure-rs.sh` does, and run to `done`. The two runs
+agree on prepare and run to 2 µs; reset to idle varies by up to 1 ms, so both
+runs are given. An image's size is `espflash save-image --chip esp32c6`'s,
+which is what espflash reports as the app's size when it flashes.
 
 | `-Os` | bytecode | compiler |
 |---|---|---|
-| image | **244,960 B** | 279,440 B |
-| programs in image | 8,422 B | 11,815 B |
-| prepare, both files | **4,911 µs** | 32,077 µs |
-| run, both files | 1,598,043 µs | 1,605,953 µs |
-| reset to idle | **1,614,042 µs** | 1,649,321 µs |
-| heap left | **183,040 B** | 172,552 B |
-| VM resident | 24,680 B | 24,680 B |
+| image | **258,208 B** | 292,240 B |
+| programs in image | 9,045 B | 11,815 B |
+| prepare, `boot` | **4,512 µs** | 27,273 µs |
+| prepare, `main` | **4,864 µs** | 32,364 µs |
+| prepare, both files | **9,376 µs** | 59,637 µs |
+| run, both files | **914,570 µs** | 963,937 µs |
+| reset to idle | **940,638 and 940,951 µs** | 1,040,280 and 1,040,408 µs |
+| heap left | **195,344 B** | 193,480 B |
+| VM resident | 23,176 B | 23,176 B |
 
-Images for the other three builds, which is the whole of what the two features
-are worth on flash:
+The same for the other three builds:
+
+| | prepare, both files | run, both files | heap left | VM resident |
+|---|---|---|---|---|
+| `-O3` `f64` bytecode | 6,336 µs | 685,421 µs | 195,344 B | 23,176 B |
+| `-O3` `f64` compiler | 53,393 µs | 619,950 µs | 193,480 B | 23,176 B |
+| `-Os` `f32` bytecode | 9,139 µs | 854,272 µs | 218,912 B | 22,888 B |
+| `-Os` `f32` compiler | 62,116 µs | 772,538 µs | 217,264 B | 22,888 B |
+| `-O3` `f32` bytecode | 6,131 µs | 576,850 µs | 218,912 B | 22,888 B |
+| `-O3` `f32` compiler | 56,921 µs | 561,285 µs | 217,264 B | 22,888 B |
+
+> These figures used to be 80 MHz runs halved, as the rest of this
+> repository's pre-2026-09-29 times are. Halving held for running and not for
+> preparing: c8b4b34 at 80 MHz, run again on `c6b`, prepared both files in
+> 9,851 µs and 63,166 µs, and c75f9f5, the commit that set 160 MHz, in 8,395
+> and 60,458 µs, where halving predicted 4,911 and 32,077. The two commits
+> differ in code as well as clock, and why a one-off pass barely speeds up
+> with the clock has not been tested.
+
+Images for all four builds, which is the whole of what the two features are
+worth on flash:
 
 | | `-Os` | `-O3` |
 |---|---|---|
-| `f64` bytecode | 244,960 B | 363,568 B |
-| `f64` + compiler | 279,440 B | 444,784 B |
-| `f32` bytecode | 227,712 B | 343,776 B |
-| `f32` + compiler | 262,256 B | 425,104 B |
+| `f64` bytecode | 258,208 B | 399,648 B |
+| `f64` + compiler | 292,240 B | 476,768 B |
+| `f32` bytecode | 241,776 B | 382,912 B |
+| `f32` + compiler | 276,016 B | 459,984 B |
 
 Read across the rows rather than down the columns:
 
-**The image is where bytecode wins.** 34,480 B at `-Os` and 81,216 B at `-O3`.
-Of the `-Os` saving, 3,393 B is the programs themselves being smaller as
-bytecode than as source; the rest is the lexer and the parser. It barely moves
-with the number width — 34,480 B against 34,544 B — because a lexer does not
-care how wide a double is. That is why the compiler is quoted as a flat cost
-rather than folded into a runtime comparison.
+**The image is where bytecode wins.** 34,032 B at `-Os` and 77,120 B at `-O3`.
+Of the `-Os` saving, 2,770 B is the programs themselves being smaller as
+bytecode than as source; the rest, 31,262 B, is the lexer and the parser. It
+barely moves with the number width — 34,032 B against 34,240 B — because a
+lexer does not care how wide a double is. That is why the compiler is quoted
+as a flat cost rather than folded into a runtime comparison.
 
-**`f32` is worth 17,248 B at `-Os`** on top of whichever of those you pick, and
-it is a runtime saving rather than a static one: it also takes a fifth to a
-half off the heap. It is off by default and it is not Wren — see
-`crates/wren`'s own feature documentation.
+**`f32` is worth 16,432 B at `-Os`** on top of whichever of those you pick, and
+it is a runtime saving rather than a static one: it also leaves 23,568 B more
+heap. It is off by default and it is not Wren — see `crates/wren`'s own feature
+documentation.
 
-**Preparation is 6.5x faster, and it does not matter much here.** Loading both
-files takes 4.9 ms against 32.1 ms to compile them — a real difference, and an
-irrelevant one against programs that then run for two seconds. It is worth
-having when start-up latency is the thing being paid for: a node that wakes,
-samples and sleeps pays the prepare cost on every wake and the run cost for a
-few milliseconds. For that duty cycle the ratio inverts and this is the
-dominant number.
+**Preparation is 6.4x faster, and it does not matter much here.** Loading both
+files takes 9.4 ms against 59.6 ms to compile them — a real difference, and an
+irrelevant one against programs that then run for 0.9 s. It is worth having
+when start-up latency is the thing being paid for: a node that wakes, samples
+and sleeps pays the prepare cost on every wake and the run cost for a few
+milliseconds. For that duty cycle the ratio inverts and this is the dominant
+number.
 
-**Running is a wash, as it should be.** Both builds execute the same bytecode
-through the same interpreter, and the half-percent between them is
-instruction-cache layout. That the two agree is the evidence the comparison is
-sound — a real difference here would mean the two builds were not running the
-same program.
+**Running should be a wash, and is not.** Both builds execute the same program
+through the same interpreter -- `main` reports the same 107 frames from the
+same 2,000 cycles in every build -- yet the compiler build's run is 5.4%
+longer at `-Os` in `f64`, and shorter in the other three: by 9.6% at `-O3` in
+`f64`, 9.6% at `-Os` in `f32` and 2.7% at `-O3` in `f32`. A difference whose
+sign changes with the build is what code placement produces, and padding
+branch targets moved the benchmarks by 1.4-1.7% (see the top-level README);
+but this port has no padding control and no instruction counter, so that it is
+placement here is not shown, and three of the four gaps are larger than any
+placement effect measured elsewhere, 3 to 4% at 80 MHz included.
 
-**10,488 B less heap resident**, because the compiler's working structures are
+**1,864 B less heap resident**, because the compiler's working structures are
 not allocated and the source strings are not interned.
 
 ## The one thing bytecode costs
