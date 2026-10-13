@@ -2993,39 +2993,68 @@ impl Vm {
 
                     // **The fast paths, one arm per operator.** The compiler
                     // already said which calls these are -- see the operators
-                    // in `Op` -- so a `Call` or a `Super` goes straight to the
-                    // last arm, and an operator straight to its own: there is
-                    // no second question about which operation it is. Each
-                    // answers in place if its receiver allows and gives `None`
-                    // if not, and `None` is the ordinary call below, which is
-                    // always right.
+                    // in `Op` -- so an operator goes straight to its own arm:
+                    // there is no second question about which operation it
+                    // is. Each answers in place if its receiver allows and
+                    // gives `None` if not, and `None` is the ordinary call
+                    // below, which is always right.
+                    //
+                    // **A `Call` or a `Super` never enters.** The fourteen
+                    // operators are the opcodes from `CallAdd` to `CallNot`,
+                    // one range, so a single comparison sends the other two
+                    // past all of it. Without the test, a method call went
+                    // through the operators' `match` to its last arm only to
+                    // be told `None` -- and the compiler, which keeps the
+                    // `answer` the arms share in a stack slot, stored that
+                    // `None` on every method call and kept one more register
+                    // through the arm. Read from the disassembly of the speed
+                    // build, from the arm's entry to the call of `class_of`:
+                    // 23 instructions in `f64` with the shared `None`, 17
+                    // with this test, and 20 before the operators had opcodes
+                    // of their own; 20, 17 and 19 in `nofp`.
+                    //
+                    // **Giving each arm its own way out was tried first**, as
+                    // `if let Some(..) = .. { ..; break 'call; }` in every
+                    // arm with nothing shared, and lost: the method call came
+                    // back to 20 in `f64` but went to 22 in `nofp`, and `+`
+                    // got longer in both, because the nine exits kept more
+                    // values alive across the arm than the one did.
                     let receiver_at = self.stack.len() - arity - 1;
-                    let answer = match byte {
-                        code::CALL_ADD => arithmetic::<{ code::CALL_ADD }>(&self.stack),
-                        code::CALL_SUBTRACT => arithmetic::<{ code::CALL_SUBTRACT }>(&self.stack),
-                        code::CALL_MULTIPLY => arithmetic::<{ code::CALL_MULTIPLY }>(&self.stack),
-                        code::CALL_DIVIDE => arithmetic::<{ code::CALL_DIVIDE }>(&self.stack),
-                        code::CALL_MODULO => arithmetic::<{ code::CALL_MODULO }>(&self.stack),
-                        code::CALL_LESS => arithmetic::<{ code::CALL_LESS }>(&self.stack),
-                        code::CALL_GREATER => arithmetic::<{ code::CALL_GREATER }>(&self.stack),
-                        code::CALL_LESS_EQUAL => arithmetic::<{ code::CALL_LESS_EQUAL }>(&self.stack),
-                        code::CALL_GREATER_EQUAL => arithmetic::<{ code::CALL_GREATER_EQUAL }>(&self.stack),
-                        // A built-in method answered without calling it; see
-                        // `INTRINSIC_ITERATE`. One arm for the five, because
-                        // `intrinsic` is out of line here and asks the opcode
-                        // itself.
-                        code::CALL_ITERATE
-                        | code::CALL_ITERATOR_VALUE
-                        | code::CALL_EQUAL
-                        | code::CALL_NOT_EQUAL
-                        | code::CALL_NOT => self.intrinsic(byte, receiver_at, symbol),
-                        // A method, or a `super` call.
-                        _ => None,
-                    };
-                    if let Some(value) = answer {
-                        self.stack.truncate(receiver_at);
-                        self.stack.push(value);
-                        break 'call;
+                    // `RangeInclusive::contains` -- `a..=b` is a value, a
+                    // range, with methods of its own -- compiles to the same
+                    // two comparisons as `byte >= a && byte <= b`, and says
+                    // which opcodes it means by naming the first and last.
+                    if (code::CALL_ADD..=code::CALL_NOT).contains(&byte) {
+                        let answer = match byte {
+                            code::CALL_ADD => arithmetic::<{ code::CALL_ADD }>(&self.stack),
+                            code::CALL_SUBTRACT => arithmetic::<{ code::CALL_SUBTRACT }>(&self.stack),
+                            code::CALL_MULTIPLY => arithmetic::<{ code::CALL_MULTIPLY }>(&self.stack),
+                            code::CALL_DIVIDE => arithmetic::<{ code::CALL_DIVIDE }>(&self.stack),
+                            code::CALL_MODULO => arithmetic::<{ code::CALL_MODULO }>(&self.stack),
+                            code::CALL_LESS => arithmetic::<{ code::CALL_LESS }>(&self.stack),
+                            code::CALL_GREATER => arithmetic::<{ code::CALL_GREATER }>(&self.stack),
+                            code::CALL_LESS_EQUAL => arithmetic::<{ code::CALL_LESS_EQUAL }>(&self.stack),
+                            code::CALL_GREATER_EQUAL => arithmetic::<{ code::CALL_GREATER_EQUAL }>(&self.stack),
+                            // A built-in method answered without calling it; see
+                            // `INTRINSIC_ITERATE`. One arm for the five, because
+                            // `intrinsic` is out of line here and asks the opcode
+                            // itself.
+                            code::CALL_ITERATE
+                            | code::CALL_ITERATOR_VALUE
+                            | code::CALL_EQUAL
+                            | code::CALL_NOT_EQUAL
+                            | code::CALL_NOT => self.intrinsic(byte, receiver_at, symbol),
+                            // Not reached -- the range test admits only the
+                            // fourteen -- but a `match` on a byte must say
+                            // what every other value does, and `None`, the
+                            // ordinary call, is right for any of them.
+                            _ => None,
+                        };
+                        if let Some(value) = answer {
+                            self.stack.truncate(receiver_at);
+                            self.stack.push(value);
+                            break 'call;
+                        }
                     }
 
                     let start_from = if byte == code::SUPER {
