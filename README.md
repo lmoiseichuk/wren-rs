@@ -674,9 +674,8 @@ compiled, written, re-loaded into a fresh VM and run. That is the claim that
 matters before any number: the two paths produce the same program.
 
 **What the compiler is worth**, from one package built twice with and without
-`wren/compiler` -- `ports/esp32c6-wren-boot` at cac0550, with `wren/core_full`
-added on the command line, for the reason its README gives. Image sizes are
-`espflash save-image`'s:
+`wren/compiler` -- `ports/esp32c6-wren-boot`, measured on `c6b` on
+2026-10-13. Image sizes are `espflash save-image`'s:
 
 | | `-Os` | `-O3` |
 |---|---|---|

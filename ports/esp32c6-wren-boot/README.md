@@ -13,18 +13,14 @@ first.
 One package, one `main.rs`, two images. The only difference is a cargo feature:
 
 ```sh
-cargo build --profile size --features wren/core_full           # looks for boot.wrenc, main.wrenc
-cargo build --profile size --features wren/core_full,compiler  # looks for boot.wren,  main.wren
-cargo build --profile size --features wren/core_full,f32       # ...and with 32-bit numbers
+cargo build --profile size                      # looks for boot.wrenc, main.wrenc
+cargo build --profile size --features compiler  # looks for boot.wren,  main.wren
+cargo build --profile size --features f32       # ...and with 32-bit numbers
 ```
 
-**`wren/core_full` has to be asked for.** The manifest takes `wren` with
-`default-features = false` and `alloc` and `libm`, and since d4299bf
-(2026-09-20) the whole core library is the `core_full` feature, which that
-leaves out. Built without it, `boot` runs and `main` stops at line 133 with
-`Map metaclass does not implement 'new()'`, from an image 42-115 KB smaller
-with half the VM resident -- 11,332 B against 23,176. Every figure below is
-built with it.
+The port lost the core library on 2026-09-20, when d4299bf made it the
+`core_full` feature and the manifest did not name it, and got it back on
+2026-10-13; in between, `main` stopped at its first `Map`.
 
 Separate packages would have let the two drift apart in a dozen small ways that
 each look like nothing and together make the comparison meaningless. Same heap,
@@ -40,11 +36,12 @@ two is the whole argument:
 ## What it costs and what it saves
 
 ESP32-C6FH4 at 160 MHz, 320 KB heap, both programs run in one VM. Measured on
-2026-10-13 at cac0550 on `c6b`: each image flashed twice with `espflash flash
---monitor`, as `tools/measure-rs.sh` does, and run to `done`. The two runs
-agree on prepare and run to 2 µs; reset to idle varies by up to 1 ms, so both
-runs are given. An image's size is `espflash save-image --chip esp32c6`'s,
-which is what espflash reports as the app's size when it flashes.
+2026-10-13 on `c6b`, from images byte for byte the ones this manifest builds:
+each image flashed twice with `espflash flash --monitor`, as
+`tools/measure-rs.sh` does, and run to `done`. The two runs agree on prepare
+and run to 2 µs; reset to idle varies by up to 1 ms, so both runs are given.
+An image's size is `espflash save-image --chip esp32c6`'s, which is what
+espflash reports as the app's size when it flashes.
 
 | `-Os` | bytecode | compiler |
 |---|---|---|
