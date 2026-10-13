@@ -2226,6 +2226,83 @@ fn every_operator_answers_in_place_and_declines_to_the_method() {
     }
 }
 
+/// Every operator's fast path is taken where it should be, not only right.
+///
+/// **A lost fast path changes no answer.** If an arm stopped answering `+`,
+/// or answered it with the method call, every program would still print what
+/// it prints now, and only the board's counters would show it -- so the
+/// tests above cannot see it. The `profile` build counts every method lookup
+/// the call arm makes, in `Vm::lookups`, and a fast path that answers makes
+/// none; so each case runs a loop of the operator on receivers the fast path
+/// covers, and the operator's symbol must not appear among the lookups.
+///
+/// **The `match` loop only.** `profile` counts inside `run_frames`, which the
+/// threaded build replaces, and refuses to build with `tail-calls`; the
+/// threaded handlers are each a table entry named by its opcode.
+#[test]
+#[cfg(feature = "profile")]
+fn every_operator_answers_without_a_lookup() {
+    // (the statement run in the loop, the signature it must not look up)
+    let cases = [
+        ("x = a + b", "+(_)"),
+        ("x = a - b", "-(_)"),
+        ("x = a * b", "*(_)"),
+        ("x = a / b", "/(_)"),
+        ("x = a % b", "%(_)"),
+        ("x = a < b", "<(_)"),
+        ("x = a > b", ">(_)"),
+        ("x = a <= b", "<=(_)"),
+        ("x = a >= b", ">=(_)"),
+        // `==`, `!=` and `!` on each receiver the intrinsic answers.
+        ("x = null == null", "==(_)"),
+        ("x = true == false", "==(_)"),
+        ("x = plain == plain", "==(_)"),
+        ("x = null != null", "!=(_)"),
+        ("x = true != false", "!=(_)"),
+        ("x = plain != plain", "!=(_)"),
+        ("x = !true", "!"),
+        ("x = !null", "!"),
+        ("x = !plain", "!"),
+        // A `for` loop over a range and over a list.
+        ("for (i in 1..3) x = i", "iterate(_)"),
+        ("for (i in 1..3) x = i", "iteratorValue(_)"),
+        ("for (i in [1, 2, 3]) x = i", "iterate(_)"),
+        ("for (i in [1, 2, 3]) x = i", "iteratorValue(_)"),
+    ];
+    for (statement, signature) in cases {
+        let source = format!(
+            "class Plain {{\n  construct new() {{}}\n}}\n\
+             var plain = Plain.new()\n\
+             var a = 7\n\
+             var b = 2\n\
+             var x = null\n\
+             for (n in 1..10) {{\n  {statement}\n}}\n"
+        );
+        let mut vm = Vm::new();
+        if let Err(error) = vm.interpret(&source) {
+            panic!("{statement:?}: {}", error.message());
+        }
+        let symbol = vm.method_names.find(signature).expect("a core signature") as u32;
+        // `BTreeMap::keys` gives the `(class, symbol)` pairs looked up.
+        for (class, looked_up) in vm.lookups.keys() {
+            assert_ne!(
+                *looked_up, symbol,
+                "{statement:?} looked up {signature} on class {class}: its fast path was not taken"
+            );
+        }
+    }
+
+    // And the counter does see a call the fast path declines, or the test
+    // above would pass with no fast path at all.
+    let mut vm = Vm::new();
+    vm.interpret("var x = \"a\" + \"b\"").expect("runs");
+    let plus = vm.method_names.find("+(_)").expect("a core signature") as u32;
+    assert!(
+        vm.lookups.keys().any(|(_, symbol)| *symbol == plus),
+        "a string's `+` is a method call, and should have been counted"
+    );
+}
+
 /// An integer build declines to divide by zero, and the primitive raises it.
 ///
 /// A float build has an infinity to answer with; an integer one would panic
