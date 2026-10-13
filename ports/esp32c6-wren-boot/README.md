@@ -36,12 +36,18 @@ two is the whole argument:
 ## What it costs and what it saves
 
 ESP32-C6FH4 at 160 MHz, 320 KB heap, both programs run in one VM. Measured on
-2026-10-13 on `c6b`, from images byte for byte the ones this manifest builds:
-each image flashed twice with `espflash flash --monitor`, as
-`tools/measure-rs.sh` does, and run to `done`. The two runs agree on prepare
+2026-10-13 on `c6b`: each image flashed twice with `espflash flash --monitor`,
+as `tools/measure-rs.sh` does, and run to `done`. The two runs agree on prepare
 and run to 2 µs; reset to idle varies by up to 1 ms, so both runs are given.
 An image's size is `espflash save-image --chip esp32c6`'s, which is what
 espflash reports as the app's size when it flashes.
+
+**The images measured were built from this source, with these features, in
+another directory.** This manifest builds all eight to the same sizes and not
+to the same bytes: a panic message carries its source file's path, so
+`.rodata` changes size -- by 464 B in the `-Os` `f64` bytecode image -- and
+with it where the functions land. The runs have not been repeated on an image
+built from the manifest.
 
 | `-Os` | bytecode | compiler |
 |---|---|---|
