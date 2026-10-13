@@ -30,34 +30,29 @@ Both report the same three numbers per program, and the split between the first
 two is the whole argument:
 
 - **prepare** — compiling the source, or loading the bytecode.
-- **run** — executing it, which should come out the same either way.
+- **run** — executing it: the same program either way, so what moves it
+  between images is where the linker put the code.
 - **heap** — what the program left resident.
 
 ## What it costs and what it saves
 
 ESP32-C6FH4 at 160 MHz, 320 KB heap, both programs run in one VM. Measured on
-2026-10-13 on `c6b`: each image flashed twice with `espflash flash --monitor`,
-as `tools/measure-rs.sh` does, and run to `done`. The two runs agree on prepare
-and run to 2 µs; reset to idle varies by up to 1 ms, so both runs are given.
+2026-10-13 on `c6b`, from images this manifest builds with the commands above:
+each image flashed twice with `espflash flash --monitor`, as
+`tools/measure-rs.sh` does, and run to `done`. The two runs agree on prepare
+and run to 1 µs; reset to idle varies by up to 0.5 ms, so both runs are given.
 An image's size is `espflash save-image --chip esp32c6`'s, which is what
 espflash reports as the app's size when it flashes.
-
-**The images measured were built from this source, with these features, in
-another directory.** This manifest builds all eight to the same sizes and not
-to the same bytes: a panic message carries its source file's path, so
-`.rodata` changes size -- by 464 B in the `-Os` `f64` bytecode image -- and
-with it where the functions land. The runs have not been repeated on an image
-built from the manifest.
 
 | `-Os` | bytecode | compiler |
 |---|---|---|
 | image | **258,208 B** | 292,240 B |
 | programs in image | 9,045 B | 11,815 B |
-| prepare, `boot` | **4,512 µs** | 27,273 µs |
-| prepare, `main` | **4,864 µs** | 32,364 µs |
-| prepare, both files | **9,376 µs** | 59,637 µs |
-| run, both files | **914,570 µs** | 963,937 µs |
-| reset to idle | **940,638 and 940,951 µs** | 1,040,280 and 1,040,408 µs |
+| prepare, `boot` | **4,506 µs** | 29,119 µs |
+| prepare, `main` | **4,875 µs** | 33,389 µs |
+| prepare, both files | **9,381 µs** | 62,508 µs |
+| run, both files | 1,002,238 µs | 911,053 µs |
+| reset to idle | 1,028,717 and 1,028,555 µs | 990,858 and 990,990 µs |
 | heap left | **195,344 B** | 193,480 B |
 | VM resident | 23,176 B | 23,176 B |
 
@@ -65,12 +60,12 @@ The same for the other three builds:
 
 | | prepare, both files | run, both files | heap left | VM resident |
 |---|---|---|---|---|
-| `-O3` `f64` bytecode | 6,336 µs | 685,421 µs | 195,344 B | 23,176 B |
-| `-O3` `f64` compiler | 53,393 µs | 619,950 µs | 193,480 B | 23,176 B |
-| `-Os` `f32` bytecode | 9,139 µs | 854,272 µs | 218,912 B | 22,888 B |
-| `-Os` `f32` compiler | 62,116 µs | 772,538 µs | 217,264 B | 22,888 B |
-| `-O3` `f32` bytecode | 6,131 µs | 576,850 µs | 218,912 B | 22,888 B |
-| `-O3` `f32` compiler | 56,921 µs | 561,285 µs | 217,264 B | 22,888 B |
+| `-O3` `f64` bytecode | 6,400 µs | 645,653 µs | 195,344 B | 23,176 B |
+| `-O3` `f64` compiler | 53,806 µs | 690,744 µs | 193,480 B | 23,176 B |
+| `-Os` `f32` bytecode | 9,145 µs | 854,237 µs | 218,912 B | 22,888 B |
+| `-Os` `f32` compiler | 61,203 µs | 829,581 µs | 217,264 B | 22,888 B |
+| `-O3` `f32` bytecode | 6,152 µs | 576,582 µs | 218,912 B | 22,888 B |
+| `-O3` `f32` compiler | 57,014 µs | 561,245 µs | 217,264 B | 22,888 B |
 
 > These figures used to be 80 MHz runs halved, as the rest of this repository's
 > pre-2026-09-29 times are. Halving held for running -- the clock fix measured
@@ -106,25 +101,33 @@ it is a runtime saving rather than a static one: it also leaves 23,568 B more
 heap. It is off by default and it is not Wren — see `crates/wren`'s own feature
 documentation.
 
-**Preparation is 6.4x faster, and it does not matter much here.** Loading both
-files takes 9.4 ms against 59.6 ms to compile them — a real difference, and an
-irrelevant one against programs that then run for 0.9 s. It is worth having
-when start-up latency is the thing being paid for: a node that wakes, samples
-and sleeps pays the prepare cost on every wake and the run cost for a few
-milliseconds. For that duty cycle the ratio inverts and this is the dominant
+**Preparation is 6.7x faster, and it does not matter much here.** Loading both
+files takes 9.4 ms against 62.5 ms to compile them — a real difference, and an
+irrelevant one against programs that then run for 0.9 to 1.0 s. It is worth
+having when start-up latency is the thing being paid for: a node that wakes,
+samples and sleeps pays the prepare cost on every wake and the run cost for a
+few milliseconds. For that duty cycle the ratio inverts and this is the dominant
 number.
 
-**Running should be a wash, and is not.** Both builds execute the same program
-through the same interpreter -- `main` reports the same frames from the same
-2,000 cycles in both builds of a configuration, 107 in `f64` and 106 in `f32`
--- yet the compiler build's run is 5.4% longer at `-Os` in `f64`, and shorter
-in the other three: by 9.6% at `-O3` in `f64`, 9.6% at `-Os` in `f32` and 2.7%
-at `-O3` in `f32`. A difference whose sign changes with the build is what code
-placement produces, and padding branch targets moved `binary_trees` by 1.7% and
-`fib` by 1.4% (see the top-level README); but this port has no padding control
-and no instruction counter, so that it is placement here is not shown, and
-three of the four gaps are larger than any placement effect measured elsewhere,
-3 to 4% at 80 MHz included.
+**The run gap between two images is code placement, not bytecode against
+compiler.** Both builds execute the same program through the same interpreter
+-- `main` reports the same frames from the same 2,000 cycles in both builds of
+a configuration, 107 in `f64` and 106 in `f32` -- and the same source and
+features, built earlier the same day in another directory and run on `c6b`,
+show what moves the time. Those eight images had the same sizes, heap left and
+VM resident as these, and not the same bytes: a panic message carries its
+source file's path, so `.rodata` changes size -- by 464 B in the `-Os` `f64`
+bytecode image -- and the functions move with it. Prepare here is within 4.8%
+of what those images took and run is up to 11.4% from it, and in `f64` the gap
+between bytecode and compiler changed sign: the compiler image ran 5.4% longer
+than the bytecode one at `-Os` there and runs 9.1% shorter here, and at `-O3`
+ran 9.6% shorter there and runs 7.0% longer here. In `f32` it kept its sign -- 9.6% shorter there and 2.9% here at `-Os`, 2.7% at `-O3` in both.
+A gap whose sign the checkout's path decides says nothing about the images,
+and at up to 9.6% it is larger than any placement effect measured on the
+benchmarks, 3 to 4% at 80 MHz included (see the top-level README). **Only
+prepare -- loading against compiling -- is a property of the images**: 6.4x at
+`-Os` in `f64` there and 6.7x here, where run went from 5.4% one way to 9.1%
+the other.
 
 **1,864 B less heap resident**, because the compiler's working structures are
 not allocated and the source strings are not interned.

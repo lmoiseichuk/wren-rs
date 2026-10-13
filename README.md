@@ -688,9 +688,9 @@ It barely moves with the number width — 34,032 B against 34,240 at `-Os`,
 wide a double is.
 
 Loading the port's two programs takes 4.5 and 4.9 ms where compiling them takes
-27.3 and 32.4 ms, at `-Os` with 64-bit numbers on `c6b`: 9.4 ms against
-59.6 ms, 6.4×. Across the four builds of each kind -- `-Os` and `-O3`, `f64`
-and `f32` -- a program loads in 3.0–4.9 ms and compiles in 23.5–33.3 ms. The
+29.1 and 33.4 ms, at `-Os` with 64-bit numbers on `c6b`: 9.4 ms against
+62.5 ms, 6.7×. Across the four builds of each kind -- `-Os` and `-O3`, `f64`
+and `f32` -- a program loads in 3.0–4.9 ms and compiles in 24.0–33.4 ms. The
 four benchmarks are smaller, 509–1,673 B of bytecode against 4,458 and 4,587,
 and load in 835–1,768 µs at `-Os` in `ports/esp32c6-wrenc-rs`, which is µwren.
 The difference barely matters against a program that then runs for most of a
