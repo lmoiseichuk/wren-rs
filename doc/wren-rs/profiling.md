@@ -1651,6 +1651,72 @@ refusing the `match` loop's loss is not two independent choices: either the
 `match` loop's call arm is rebuilt until its time follows its work, or the
 change is weighed whole.
 
+**The call arm, rebuilt: each operator an arm of its own.** The `Call` and
+`Super` arm is back to the shape it had before the operators had opcodes,
+and each of the fourteen operators has an arm that is only its fast path --
+`answer_operator::<OPERATION>`, the same const-generic folding the threaded
+handlers use. What a fast path declines leaves its arm by a labelled `break`
+to one block after the `match`, which reads the arity and symbol again and
+calls `call_declined`: the method call, `#[inline(never)]` and `#[cold]`,
+reporting whether the loop must reload its locals from a new top frame. The
+benchmarks decline a few dozen times a run, every one a string's `+`.
+
+Read from the speed build's disassembly, from an arm's entry back to the
+dispatch (soft-float, `class_of`, `call_target` and `intrinsic` counted as
+the call to them):
+
+| path | `main` 77a986c | X19 ca4da8e | rebuilt |
+|---|---|---|---|
+| `f64` `+` | 64 | 47 | **28** |
+| `f64` `<` | 67 | 50 | **31** |
+| `f64` `!` | 44 | 38 | **25** |
+| `f64` method call | 106 | 98 | 99 |
+| `nofp` `+` | 54 | 43 | **23** |
+| `nofp` `<` | 54 | 44 | **25** |
+| `nofp` method call | 109 | 104 | 101 |
+
+The method call is a Wren closure on an instance; to the call of `class_of`
+it is 16 instructions in both modes, against 20 and 19 on `main`. The loop's
+frame is unchanged -- 0x170 B in `f64`, 0x150 B in `nofp`, all twelve saved
+registers, the constant pool and field offset in stack slots as before --
+and the numeric arms make no stack access at all, where every operator on
+`main` passed through a call arm that spilled one register on entry in `f64`
+and two in `nofp`. The `Call` arm still spills two in `nofp`, as `main`'s
+did. The threaded build's code is byte for byte what it was.
+
+Measured on `c6b` as above, all three trees in the same session, every image
+twice at padding 0, 4 and 8:
+
+| against X19 (ca4da8e) | f64 work | f64 time | `nofp` work | `nofp` time |
+|---|---|---|---|---|
+| `binary_trees` | −2.51% | −4.55 to −5.61% | −3.17% | −4.72 to −5.68% |
+| `fib` | −7.36% | −11.20 to −11.78% | −10.59% | −13.24 to −13.41% |
+| `list_build` | −3.27% | −4.83% | −7.96% | −9.20 to −9.46% |
+| `method_call` | −2.98% | −5.95 to −6.24% | −3.99% | −6.27 to −6.47% |
+| sum | **−5.18%** | **−8.35 to −9.01%** | **−7.14%** | **−9.44 to −9.74%** |
+| **against `main` (77a986c), sum** | **−9.15%** | **−7.35 to −8.65%** | **−9.96%** | **−9.10 to −9.51%** |
+
+**Time follows work again, and then some.** Cycles per instruction at the
+committed placement are 1.26-1.29 in `f64` and 1.27-1.31 in `nofp`, back to
+`main`'s 1.25-1.29 from X19's 1.28-1.34. So what X19's `match` loop lost was
+not the instructions it removed but the shape it left: one arm whose
+registers served sixteen opcodes. Every benchmark is faster than `main` at
+every placement, in both modes. By the acceptance rule X19 now holds for both
+interpreters.
+
+µwren's `fib` (`-Os`, `nofp`, the `match` loop): 5.187 s on `main`, 5.140 s
+at ca4da8e and 4.373 s rebuilt as committed (−15.7% against `main`); 5.107,
+5.163 and 4.329 s with branch targets padded to four bytes (−15.2%). The X19
+figure is 5.140 s here against 5.236 s in the run above, the same source
+built in another directory: a path in the image moves the code, and at `-Os`
+with no padding that alone is worth 2%.
+
+**Flash and RAM.** At the committed placement the default build is 478,608
+B, +1,680 B on ca4da8e and +2,240 B on `main`; `nofp` 404,768 B, +1,760 B and
++2,016 B; µwren 168,240 B, +1,296 B and +1,376 B. The fourteen arms each
+inline their arithmetic and its soft-float call. No RAM: VM resident and
+every peak are unchanged.
+
 **Flash and RAM.** At the committed placement the images move by +1,808 B
 (threaded f64), +1,040 B (threaded `nofp`), +560 B (`match` f64) and +256 B
 (`match` `nofp`) -- 476,368 B to 476,928 B for the default build -- and µwren
