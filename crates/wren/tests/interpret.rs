@@ -2226,6 +2226,64 @@ fn every_operator_answers_in_place_and_declines_to_the_method() {
     }
 }
 
+/// A declined operator's method runs in its own frame, and its errors carry
+/// the operator's line.
+///
+/// **The decline is a path of its own.** In the `match` loop a declined
+/// operator does not reach the `Call` arm: it goes out of line, and the loop
+/// then reloads its locals -- offset, base, module, field offset -- from the
+/// frame left on top. The test above sees only answers and messages, and
+/// every one of them comes out right with a stale module or field offset, so
+/// long as the method is in the main module and its class inherits no
+/// fields. These do not:
+///
+/// - `Tag` lives in an imported module and reads that module's `Suffix`; with
+///   the importer's module kept, the slot it reads is some other variable.
+/// - `Tag` inherits `Base`'s field, so its own `_name` is the second field;
+///   with the caller's field offset kept -- none, at the top level -- it
+///   reads `Base`'s `_kind`.
+///
+/// **The line is filled in on that path too**, for the error a primitive
+/// raises and for the method that is missing, and a test asking only for the
+/// message would pass with either line lost.
+#[test]
+fn a_declined_operator_runs_in_its_methods_own_frame() {
+    let module = "
+var Suffix = \"!\"
+class Base {
+  construct new() { _kind = \"base\" }
+}
+class Tag is Base {
+  construct new(name) {
+    super()
+    _name = name
+  }
+  +(other) { _name + other + Suffix }
+}
+";
+    assert_eq!(
+        run_with_modules(
+            "import \"m\" for Tag\nSystem.print(Tag.new(\"x\") + \"y\")",
+            &[("m", module)]
+        ),
+        "xy!\n"
+    );
+
+    // A primitive's error: `Num.+` refuses a string, on the third line.
+    let mut vm = Vm::new();
+    let result = vm.interpret("var a = 1\nvar b = 2\nSystem.print(a + \"x\")");
+    let failure = result.unwrap_err();
+    assert_eq!(failure.message(), "Right operand must be a number.");
+    assert_eq!(failure.line(), 3);
+
+    // A missing method: `Plain` has no `<`, on the fifth line.
+    let mut vm = Vm::new();
+    let result = vm.interpret("class Plain {\n  construct new() {}\n}\nvar p = Plain.new()\nSystem.print(p < 1)");
+    let failure = result.unwrap_err();
+    assert_eq!(failure.message(), "Plain does not implement '<(_)'.");
+    assert_eq!(failure.line(), 5);
+}
+
 /// Every operator's fast path is taken where it should be, not only right.
 ///
 /// **A lost fast path changes no answer.** If an arm stopped answering `+`,
