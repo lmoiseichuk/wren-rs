@@ -2232,9 +2232,10 @@ fn every_operator_answers_in_place_and_declines_to_the_method() {
 /// or answered it with the method call, every program would still print what
 /// it prints now, and only the board's counters would show it -- so the
 /// tests above cannot see it. The `profile` build counts every method lookup
-/// the call arm makes, in `Vm::lookups`, and a fast path that answers makes
-/// none; so each case runs a loop of the operator on receivers the fast path
-/// covers, and the operator's symbol must not appear among the lookups.
+/// the `match` loop makes, in `Vm::lookups` -- the `Call` arm's, and the
+/// method call an operator arm hands over to -- and a fast path that answers
+/// makes none; so each case runs a loop of the operator on receivers the fast
+/// path covers, and the operator's symbol must not appear among the lookups.
 ///
 /// **The `match` loop only.** `profile` counts inside `run_frames`, which the
 /// threaded build replaces, and refuses to build with `tail-calls`; the

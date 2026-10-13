@@ -202,6 +202,27 @@ struct CallTarget {
     field_offset: u16,
 }
 
+/// Where the `match` loop goes on after [`Vm::call_declined`].
+///
+/// **An enum, because a function cannot assign the loop's locals.** `ip`,
+/// `base`, the chunk and the rest live in `run_frames`' registers, and the
+/// call is out of line precisely so that they stay there; so the function
+/// changes the frames and says which kind of change it made, and the loop does
+/// the assigning.
+#[cfg(not(feature = "tail-calls"))]
+enum Resume {
+    /// The instruction after the call, in the same frame: a primitive answered
+    /// and its value is on the stack.
+    Next,
+    /// The frame now on top of `Vm::frames`, from the offset parked in it: a
+    /// closure entered, an error delivered to a fiber that catches it, or a
+    /// fiber switched to. The chunk is that frame's, which the frame does not
+    /// hold while it runs.
+    Top(ChunkRef),
+    /// The program asked to stop; `run_frames` returns.
+    Halt,
+}
+
 /// A request from a primitive to continue in a different fiber.
 pub struct Switch {
     /// Where to go.
@@ -511,7 +532,7 @@ pub struct Vm {
 
 /// **The answer a numeric operator gives two values, or `None` to call the
 /// method.** The arithmetic fast path, written once for both interpreters:
-/// the `match` loop's call arm and the threaded build's handlers each ask it
+/// the `match` loop's operator arms and the threaded build's handlers each ask it
 /// with their own opcode.
 ///
 /// `Num.+` and its siblings are the most-called methods in every benchmark
@@ -1627,6 +1648,41 @@ impl Vm {
         }
     }
 
+    /// **An operator's fast path, for one of the `match` loop's operator
+    /// arms**: the answer in place of the receiver, and `true`; or `false`,
+    /// and the stack untouched, for the method call.
+    ///
+    /// **Generic over the opcode, as the threaded handlers are.** `OPERATION`
+    /// is a constant in each instance, so the `match` below keeps one of its
+    /// two arms -- an instance for `+` is [`arithmetic`] folded to the
+    /// addition, one for `==` is the call to [`Vm::intrinsic`] -- and
+    /// [`operator::arity`], a `const fn`, makes the receiver's slot `len - 2`
+    /// or `len - 1` with nothing left to compute. `#[inline(always)]`, because
+    /// the point is that each arm *is* this body, with no call between.
+    ///
+    /// **Room for the push by the argument a return makes**: the stack held
+    /// the receiver a moment ago, so the slot the answer goes into exists, and
+    /// [`Vm::push_reserved`] need not test the capacity that `push` would.
+    #[cfg(not(feature = "tail-calls"))]
+    #[inline(always)]
+    fn answer_operator<const OPERATION: u8>(&mut self, symbol: usize) -> bool {
+        let receiver_at = self.stack.len() - operator::arity(OPERATION) - 1;
+        let answer = match OPERATION <= code::CALL_GREATER_EQUAL {
+            // `+` to `>=`: two numbers in, one value out.
+            true => arithmetic::<OPERATION>(&self.stack),
+            // `iterate(_)` to `!`: a built-in method, out of line.
+            false => self.intrinsic(OPERATION, receiver_at, symbol),
+        };
+        match answer {
+            Some(value) => {
+                self.stack.truncate(receiver_at);
+                self.push_reserved(value);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The packed entry an instance's class holds for `symbol`.
     ///
     /// `NO_METHOD` for anything that is not an instance, which `intrinsic`
@@ -2579,6 +2635,147 @@ impl Vm {
         Ok(())
     }
 
+    /// **The method call an operator's fast path declined**, for the `match`
+    /// loop: the `Call` arm's work from the class onwards, made out of line.
+    ///
+    /// **Out of line, so that the arms stay small.** Each operator arm is its
+    /// fast path and a `break` to the one place that calls this. Inline, the
+    /// method call would be a second copy of the `Call` arm's -- its registers
+    /// and its error paths -- in the middle of the loop, for a case the
+    /// benchmarks reach a few dozen times in a run, when a string is
+    /// concatenated for a printout. `#[cold]` says so to the compiler: the
+    /// branch to it is laid out as the unlikely one, and nothing on the hot
+    /// path is arranged around keeping it fast. Without it the `+` arm comes
+    /// out the same, and the `Call` arm's method call five instructions longer
+    /// in `f64`.
+    ///
+    /// **The loop's locals change only in the loop.** Entering a closure, a
+    /// delivered error and a fiber switch each leave a different frame on top;
+    /// this function does the frame work and reports [`Resume::Top`] with that
+    /// frame's chunk, and the loop reloads `ip`, `base`, `module` and
+    /// `field_offset` from the frame, as it does after a return. The `Call`
+    /// arm sets them straight from the callee instead, which saves those loads
+    /// on the call that runs most.
+    ///
+    /// `instruction` is the opcode's offset, for the line an error reports and
+    /// the profiler's call site; `next` is the offset past the symbol, where
+    /// the caller resumes.
+    #[cfg(not(feature = "tail-calls"))]
+    #[cold]
+    #[inline(never)]
+    fn call_declined(
+        &mut self,
+        chunk: ChunkRef,
+        instruction: usize,
+        next: usize,
+        arity: usize,
+        symbol: usize,
+    ) -> Result<Resume, RuntimeError> {
+        let receiver_at = self.stack.len() - arity - 1;
+        let receiver = self.stack[receiver_at];
+        let class = self
+            .class_of(receiver)
+            .ok_or_else(|| RuntimeError::new("Receiver has no class."))?;
+        // A closure would borrow `self`, which the calls below need mutably;
+        // a `chunk` is a pointer, so reading the line through it borrows
+        // nothing.
+        let line = chunk_of(chunk).line_at(instruction);
+
+        #[cfg(feature = "profile")]
+        {
+            *self.lookups.entry((class.raw(), symbol as u32)).or_insert(0) += 1;
+            let site = self
+                .call_sites
+                .entry((chunk.as_ptr() as usize, instruction))
+                .or_insert_with(|| (alloc::vec::Vec::new(), 0));
+            site.1 += 1;
+            if !site.0.contains(&class.raw()) {
+                site.0.push(class.raw());
+            }
+        }
+
+        let Some(method) = self.find_method(class, symbol) else {
+            let error = self.no_such_method(receiver_at, symbol, line);
+            return self.resume_after_error(error, next, chunk);
+        };
+        match method {
+            Method::Primitive(function) => {
+                let value = match function(self, receiver_at) {
+                    Ok(value) => value,
+                    Err(mut error) => {
+                        if error.line == 0 {
+                            error.line = line;
+                        }
+                        return self.resume_after_error(error, next, chunk);
+                    }
+                };
+                // As the `Call` arm: the result slot is cleared whatever
+                // happens next.
+                self.stack.truncate(receiver_at);
+                if self.halting {
+                    self.halting = false;
+                    return Ok(Resume::Halt);
+                }
+                if let Some(switch) = self.pending_switch.take() {
+                    let failing = switch.as_error.then_some(switch.value);
+                    self.perform_switch(switch, next, chunk)?;
+                    if let Some(value) = failing {
+                        // `transferError`: the target fails as it resumes.
+                        let message = self.to_string(value);
+                        let error = RuntimeError { message, line };
+                        return self.resume_after_error(error, 0, chunk);
+                    }
+                    return Ok(Resume::Top(self.resume_chunk()?));
+                }
+                self.stack.push(value);
+                if (NURSERY && self.heap.young() >= NURSERY_OBJECTS) || self.heap.collection_due() {
+                    self.collect_point(next);
+                }
+                Ok(Resume::Next)
+            }
+            Method::Closure(closure) => {
+                let target = self.call_target(closure)?;
+                if target.arity != arity {
+                    return Err(Self::wrong_arity(target.arity, arity, line));
+                }
+                if self.frames.len() >= MAX_FRAMES {
+                    return Err(Self::stack_overflow(line));
+                }
+                // The caller stops running here: park its offset and its
+                // chunk, which is what a return takes back.
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.ip = next;
+                    frame.chunk = Some(chunk);
+                }
+                self.stack.reserve(target.max_slots);
+                #[cfg(feature = "verify-slots")]
+                let entry_len = self.stack.len();
+                self.frames.push(Frame {
+                    #[cfg(feature = "verify-slots")]
+                    entry_len,
+                    closure,
+                    ip: 0,
+                    base: receiver_at,
+                    chunk: None,
+                    module: target.module,
+                    field_offset: target.field_offset,
+                });
+                Ok(Resume::Top(target.chunk))
+            }
+        }
+    }
+
+    /// [`Vm::deliver_error`], for [`Vm::call_declined`]: the error goes to the
+    /// fiber that catches it, whose frame is then on top, or out of
+    /// `run_frames` if none does.
+    #[cfg(not(feature = "tail-calls"))]
+    fn resume_after_error(&mut self, error: RuntimeError, next: usize, chunk: ChunkRef) -> Result<Resume, RuntimeError> {
+        match self.deliver_error(error, next, chunk)? {
+            Some((next_chunk, _, _)) => Ok(Resume::Top(next_chunk)),
+            None => unreachable!("deliver_error returns or switches"),
+        }
+    }
+
     /// Run with threaded dispatch instead of the `match` loop below; see
     /// `threaded`. Same contract, same callers.
     #[cfg(feature = "tail-calls")]
@@ -2773,352 +2970,566 @@ impl Vm {
                 }
             }
 
-            match byte {
-                code::CONSTANT => {
-                    let index = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    self.push_reserved(constants[index]);
-                }
-                code::NULL => self.push_reserved(Value::NULL),
-                code::FALSE => self.push_reserved(Value::FALSE),
-                code::TRUE => self.push_reserved(Value::TRUE),
-                code::LOAD_LOCAL => {
-                    let slot = Chunk::inline_operand(unit) as usize;
-                    self.push_reserved(self.stack[base + slot]);
-                }
-                // **The fused pairs.** Each occupies exactly the bytes of the
-                // two instructions it replaces, so the operands sit where they
-                // always did and there is a dead byte where the second
-                // opcode was. See the note on them in `bytecode.rs`.
-                code::LOAD_LOCAL_CONSTANT => {
-                    let slot = Chunk::inline_operand(unit) as usize;
-                    // **Three units, and the index is in the third.** This
-                    // spans a one-unit `LoadLocal` and a two-unit `Constant`,
-                    // and nothing moved when they fused -- so the constant is
-                    // where the `Constant` put it, past its own dead opcode.
-                    let index = unsafe { *ip.add(1) } as usize;
-                    ip = unsafe { ip.add(2) };
-                    // **One capacity test for two values.** Two `push`es test
-                    // twice and grow twice; this pair and `LoadLocalPair` are
-                    // between them a fifth of everything the benchmarks
-                    // execute, so the second test is worth removing even
-                    // though each one is only a compare and a branch.
-                    self.push_reserved_pair(self.stack[base + slot], constants[index]);
-                }
-                code::LOAD_LOCAL_PAIR => {
-                    let first = Chunk::inline_operand(unit) as usize;
-                    // The second slot rides inline in what was the second
-                    // `LoadLocal`'s own unit.
-                    let second = Chunk::inline_operand(unsafe { *ip }) as usize;
-                    ip = unsafe { ip.add(1) };
-                    // **The second slot can be the one the first push writes
-                    // into.** Reading both before pushing either -- which is
-                    // what makes one capacity test do for two values -- then
-                    // reads that slot's old contents, or past the end of the
-                    // stack. Only the unit tests missed it; the conformance
-                    // suite aborts.
-                    //
-                    // The first value lands at `top`, so that is the one slot
-                    // where the two orders disagree, and naming it costs a
-                    // compare against the capacity test it saves.
-                    let a = self.stack[base + first];
-                    let top = self.stack.len();
-                    let b = match base + second == top {
-                        true => a,
-                        false => self.stack[base + second],
-                    };
-                    self.push_reserved_pair(a, b);
-                }
-                code::STORE_FIELD_THIS_POP => {
-                    let index = Chunk::inline_operand(unit) as usize;
-                    ip = unsafe { ip.add(1) };
-                    // Popping first rather than storing and then popping: the
-                    // value is an argument to `set_field`, not something it
-                    // reads off the stack.
-                    let value = self.stack.pop().unwrap_or(Value::NULL);
-                    let receiver = self.stack[base];
-                    if !self.set_field(receiver, field_offset, index, value) {
-                        return Err(Vm::not_a_field());
-                    }
-                }
-                code::STORE_LOCAL => {
-                    let slot = Chunk::inline_operand(unit) as usize;
-                    self.stack[base + slot] = *self.stack.last().unwrap();
-                }
-                code::LOAD_MODULE_VAR => {
-                    let index = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    self.push_reserved(self.modules[module].values[index]);
-                }
-                code::STORE_MODULE_VAR => {
-                    let index = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    self.modules[module].values[index] = *self.stack.last().unwrap();
-                }
-                code::POP => {
-                    self.stack.pop();
-                }
-                code::LOAD_UPVALUE => {
-                    let slot = Chunk::inline_operand(unit) as usize;
-                    let value = self.read_upvalue(base, slot)?;
-                    self.stack.push(value);
-                }
-                code::STORE_UPVALUE => {
-                    let slot = Chunk::inline_operand(unit) as usize;
-                    let value = *self.stack.last().unwrap();
-                    self.write_upvalue(slot, value)?;
-                }
-                code::CLOSE_UPVALUE => {
-                    self.close_upvalues(self.stack.len() - 1);
-                    self.stack.pop();
-                }
-                code::CLOSURE => {
-                    // The upvalue count rides inline; the function's constant
-                    // index is the unit after, and the descriptors follow it.
-                    let count = Chunk::inline_operand(unit) as usize;
-                    let index = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    let function = constants[index]
-                        .as_object()
-                        .ok_or_else(|| RuntimeError::new("Closure constant is not a function."))?;
-
-                    let mut upvalues = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        // One unit per upvalue: whether it is a local in the
-                        // low byte, which one in the high byte.
-                        let descriptor = unsafe { *ip };
-                        let is_local = descriptor & 0xff != 0;
-                        let index = Chunk::inline_operand(descriptor) as usize;
-                        ip = unsafe { ip.add(1) };
-                        let captured = if is_local {
-                            self.capture_upvalue(base + index)
-                        } else {
-                            self.upvalue_of_current(index)?
-                        };
-                        upvalues.push(captured);
-                    }
-
-                    let id = self
-                        .heap
-                        .allocate(Object::Closure(ObjClosure { function, upvalues }));
-                    self.stack.push(Value::object(id));
-                    collect_if_due!();
-                }
-                code::CLASS => {
-                    let declared = Chunk::inline_operand(unit) as usize;
-                    let superclass = self.stack.pop().unwrap_or(Value::NULL);
-                    let name = self.stack.pop().unwrap_or(Value::NULL);
-                    let class = self.make_class(name, superclass, declared)?;
-                    self.stack.push(class);
-                    collect_if_due!();
-                }
-                code::METHOD_INSTANCE | code::METHOD_STATIC => {
-                    let symbol = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    let class = self.stack.pop().unwrap_or(Value::NULL);
-                    let body = self.stack.pop().unwrap_or(Value::NULL);
-                    self.bind_method(class, body, symbol, byte == code::METHOD_STATIC)?;
-                    collect_if_due!();
-                }
-                code::LOAD_FIELD_THIS => {
-                    let index = Chunk::inline_operand(unit) as usize;
-                    let Some(value) = self.field_of(self.stack[base], field_offset, index) else {
-                        return Err(Vm::not_a_field());
-                    };
-                    self.stack.push(value);
-                }
-                code::STORE_FIELD_THIS => {
-                    let index = Chunk::inline_operand(unit) as usize;
-                    let value = *self.stack.last().unwrap();
-                    let receiver = self.stack[base];
-                    if !self.set_field(receiver, field_offset, index, value) {
-                        return Err(Vm::not_a_field());
-                    }
-                }
-                code::LOAD_FIELD => {
-                    let index = Chunk::inline_operand(unit) as usize;
-                    let receiver = self.stack.pop().unwrap_or(Value::NULL);
-                    let Some(value) = self.field_of(receiver, field_offset, index) else {
-                        return Err(Vm::not_a_field());
-                    };
-                    self.stack.push(value);
-                }
-                code::STORE_FIELD => {
-                    let index = Chunk::inline_operand(unit) as usize;
-                    // **The value is on top, the receiver below it.** The
-                    // compiler pushes `this` first and then evaluates the
-                    // right-hand side, so popping the receiver first took the
-                    // value and stored the instance into itself. Assignment is
-                    // an expression, so the value is what stays.
-                    let value = self.stack.pop().unwrap_or(Value::NULL);
-                    let receiver = self.stack.pop().unwrap_or(Value::NULL);
-                    if !self.set_field(receiver, field_offset, index, value) {
-                        return Err(Vm::not_a_field());
-                    }
-                    self.stack.push(value);
-                }
-                code::CONSTRUCT => {
-                    let class = self.stack[base];
-                    let instance = self.instantiate(class)?;
-                    self.stack[base] = instance;
-                    collect_if_due!();
-                }
-                // **One arm for every call, the operators among them.** The
-                // threaded build gives each operator a handler of its own,
-                // which falls back to the method call by `become`; this loop
-                // has no way to fall from one arm into another, and the long
-                // call below is the same for all sixteen, so they share it and
-                // the operators part company inside, on the opcode.
-                code::CALL
-                | code::SUPER
-                | code::CALL_ADD
-                | code::CALL_SUBTRACT
-                | code::CALL_MULTIPLY
-                | code::CALL_DIVIDE
-                | code::CALL_MODULO
-                | code::CALL_LESS
-                | code::CALL_GREATER
-                | code::CALL_LESS_EQUAL
-                | code::CALL_GREATER_EQUAL
-                | code::CALL_ITERATE
-                | code::CALL_ITERATOR_VALUE
-                | code::CALL_EQUAL
-                | code::CALL_NOT_EQUAL
-                | code::CALL_NOT => 'call: {
-                    // The arity rides inline, an operator's as a method's; the
-                    // symbol is the unit after.
-                    let arity = Chunk::inline_operand(unit) as usize;
-                    let symbol = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-
-                    // **The fast paths, one arm per operator.** The compiler
-                    // already said which calls these are -- see the operators
-                    // in `Op` -- so an operator goes straight to its own arm:
-                    // there is no second question about which operation it
-                    // is. Each answers in place if its receiver allows and
-                    // gives `None` if not, and `None` is the ordinary call
-                    // below, which is always right.
-                    //
-                    // **A `Call` or a `Super` never enters.** The fourteen
-                    // operators are the opcodes from `CallAdd` to `CallNot`,
-                    // one range, so a single comparison sends the other two
-                    // past all of it. Without the test, a method call went
-                    // through the operators' `match` to its last arm only to
-                    // be told `None` -- and the compiler, which keeps the
-                    // `answer` the arms share in a stack slot, stored that
-                    // `None` on every method call and kept one more register
-                    // through the arm. Read from the disassembly of the speed
-                    // build, from the arm's entry to the call of `class_of`:
-                    // 23 instructions in `f64` with the shared `None`, 17
-                    // with this test, and 20 before the operators had opcodes
-                    // of their own; 20, 17 and 19 in `nofp`.
-                    //
-                    // **Giving each arm its own way out was tried first**, as
-                    // `if let Some(..) = .. { ..; break 'call; }` in every
-                    // arm with nothing shared, and lost: the method call came
-                    // back to 20 in `f64` but went to 22 in `nofp`, and `+`
-                    // got longer in both, because the nine exits kept more
-                    // values alive across the arm than the one did.
-                    let receiver_at = self.stack.len() - arity - 1;
-                    // `RangeInclusive::contains` -- `a..=b` is a value, a
-                    // range, with methods of its own -- compiles to the same
-                    // two comparisons as `byte >= a && byte <= b`, and says
-                    // which opcodes it means by naming the first and last.
-                    if (code::CALL_ADD..=code::CALL_NOT).contains(&byte) {
-                        let answer = match byte {
-                            code::CALL_ADD => arithmetic::<{ code::CALL_ADD }>(&self.stack),
-                            code::CALL_SUBTRACT => arithmetic::<{ code::CALL_SUBTRACT }>(&self.stack),
-                            code::CALL_MULTIPLY => arithmetic::<{ code::CALL_MULTIPLY }>(&self.stack),
-                            code::CALL_DIVIDE => arithmetic::<{ code::CALL_DIVIDE }>(&self.stack),
-                            code::CALL_MODULO => arithmetic::<{ code::CALL_MODULO }>(&self.stack),
-                            code::CALL_LESS => arithmetic::<{ code::CALL_LESS }>(&self.stack),
-                            code::CALL_GREATER => arithmetic::<{ code::CALL_GREATER }>(&self.stack),
-                            code::CALL_LESS_EQUAL => arithmetic::<{ code::CALL_LESS_EQUAL }>(&self.stack),
-                            code::CALL_GREATER_EQUAL => arithmetic::<{ code::CALL_GREATER_EQUAL }>(&self.stack),
-                            // A built-in method answered without calling it; see
-                            // `INTRINSIC_ITERATE`. One arm for the five, because
-                            // `intrinsic` is out of line here and asks the opcode
-                            // itself.
-                            code::CALL_ITERATE
-                            | code::CALL_ITERATOR_VALUE
-                            | code::CALL_EQUAL
-                            | code::CALL_NOT_EQUAL
-                            | code::CALL_NOT => self.intrinsic(byte, receiver_at, symbol),
-                            // Not reached -- the range test admits only the
-                            // fourteen -- but a `match` on a byte must say
-                            // what every other value does, and `None`, the
-                            // ordinary call, is right for any of them.
-                            _ => None,
-                        };
-                        if let Some(value) = answer {
-                            self.stack.truncate(receiver_at);
-                            self.stack.push(value);
-                            break 'call;
+            // **Two labelled blocks around the `match`, so that the operator
+            // arms can share one way out without sharing an arm.** Rust has no
+            // `goto`, and a `match` arm cannot fall into another; but `break
+            // 'label` leaves any enclosing block, so an arm that writes `break
+            // 'declined` arrives at the code after the inner block. An arm that
+            // simply ends falls out of the `match` onto `break 'arms`, past that
+            // code; one that says `continue 'interpret` or `return` leaves the
+            // way it always did. A labelled `break` is a jump, not a call:
+            // nothing is passed, and the compiler sees one more block.
+            //
+            // **`continue` needs its label inside a labelled block** --
+            // `continue 'interpret` rather than `continue` -- because Rust
+            // refuses an unlabelled one that would pass through a block label,
+            // where a reader could take it for a jump to that block.
+            'arms: {
+                'declined: {
+                    match byte {
+                        code::CONSTANT => {
+                            let index = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            self.push_reserved(constants[index]);
                         }
-                    }
-
-                    let start_from = if byte == code::SUPER {
-                        self.frames
-                            .last()
-                            .and_then(|frame| self.function_of(frame.closure))
-                            .and_then(|function| function.super_class)
-                            .ok_or_else(|| {
-                                RuntimeError::new("Cannot use 'super' outside of a method.")
-                            })?
-                    } else {
-                        let receiver = self.stack[receiver_at];
-                        self.class_of(receiver)
-                            .ok_or_else(|| RuntimeError::new("Receiver has no class."))?
-                    };
-
-                    #[cfg(feature = "profile")]
-                    {
-                        *self
-                            .lookups
-                            .entry((start_from.raw(), symbol as u32))
-                            .or_insert(0) += 1;
-                        let site = self
-                            .call_sites
-                            .entry((chunk.as_ptr() as usize, offset_of!(at)))
-                            .or_insert_with(|| (alloc::vec::Vec::new(), 0));
-                        site.1 += 1;
-                        if !site.0.contains(&start_from.raw()) {
-                            site.0.push(start_from.raw());
+                        code::NULL => self.push_reserved(Value::NULL),
+                        code::FALSE => self.push_reserved(Value::FALSE),
+                        code::TRUE => self.push_reserved(Value::TRUE),
+                        code::LOAD_LOCAL => {
+                            let slot = Chunk::inline_operand(unit) as usize;
+                            self.push_reserved(self.stack[base + slot]);
                         }
-                    }
-                    let found = self.find_method(start_from, symbol);
-                    let Some(method) = found else {
-                        let error = self.no_such_method(receiver_at, symbol, chunk_of(chunk).line_at(offset_of!(at)));
-                        match self.deliver_error(error, offset_of!(ip), chunk)? {
-                            Some((next_chunk, next_ip, next_base)) => {
-                                follow_chunk!(next_chunk);
-                                // SAFETY: an offset into the chunk just switched to.
-                                ip = unsafe { start.add(next_ip) };
-                                base = next_base;
-                                module = self.current_module();
-                                field_offset = self.current_field_offset();
-                                continue 'interpret;
+                        // **The fused pairs.** Each occupies exactly the bytes of the
+                        // two instructions it replaces, so the operands sit where they
+                        // always did and there is a dead byte where the second
+                        // opcode was. See the note on them in `bytecode.rs`.
+                        code::LOAD_LOCAL_CONSTANT => {
+                            let slot = Chunk::inline_operand(unit) as usize;
+                            // **Three units, and the index is in the third.** This
+                            // spans a one-unit `LoadLocal` and a two-unit `Constant`,
+                            // and nothing moved when they fused -- so the constant is
+                            // where the `Constant` put it, past its own dead opcode.
+                            let index = unsafe { *ip.add(1) } as usize;
+                            ip = unsafe { ip.add(2) };
+                            // **One capacity test for two values.** Two `push`es test
+                            // twice and grow twice; this pair and `LoadLocalPair` are
+                            // between them a fifth of everything the benchmarks
+                            // execute, so the second test is worth removing even
+                            // though each one is only a compare and a branch.
+                            self.push_reserved_pair(self.stack[base + slot], constants[index]);
+                        }
+                        code::LOAD_LOCAL_PAIR => {
+                            let first = Chunk::inline_operand(unit) as usize;
+                            // The second slot rides inline in what was the second
+                            // `LoadLocal`'s own unit.
+                            let second = Chunk::inline_operand(unsafe { *ip }) as usize;
+                            ip = unsafe { ip.add(1) };
+                            // **The second slot can be the one the first push writes
+                            // into.** Reading both before pushing either -- which is
+                            // what makes one capacity test do for two values -- then
+                            // reads that slot's old contents, or past the end of the
+                            // stack. Only the unit tests missed it; the conformance
+                            // suite aborts.
+                            //
+                            // The first value lands at `top`, so that is the one slot
+                            // where the two orders disagree, and naming it costs a
+                            // compare against the capacity test it saves.
+                            let a = self.stack[base + first];
+                            let top = self.stack.len();
+                            let b = match base + second == top {
+                                true => a,
+                                false => self.stack[base + second],
+                            };
+                            self.push_reserved_pair(a, b);
+                        }
+                        code::STORE_FIELD_THIS_POP => {
+                            let index = Chunk::inline_operand(unit) as usize;
+                            ip = unsafe { ip.add(1) };
+                            // Popping first rather than storing and then popping: the
+                            // value is an argument to `set_field`, not something it
+                            // reads off the stack.
+                            let value = self.stack.pop().unwrap_or(Value::NULL);
+                            let receiver = self.stack[base];
+                            if !self.set_field(receiver, field_offset, index, value) {
+                                return Err(Vm::not_a_field());
                             }
-                            None => unreachable!("deliver_error returns or switches"),
                         }
-                    };
+                        code::STORE_LOCAL => {
+                            let slot = Chunk::inline_operand(unit) as usize;
+                            self.stack[base + slot] = *self.stack.last().unwrap();
+                        }
+                        code::LOAD_MODULE_VAR => {
+                            let index = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            self.push_reserved(self.modules[module].values[index]);
+                        }
+                        code::STORE_MODULE_VAR => {
+                            let index = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            self.modules[module].values[index] = *self.stack.last().unwrap();
+                        }
+                        code::POP => {
+                            self.stack.pop();
+                        }
+                        code::LOAD_UPVALUE => {
+                            let slot = Chunk::inline_operand(unit) as usize;
+                            let value = self.read_upvalue(base, slot)?;
+                            self.stack.push(value);
+                        }
+                        code::STORE_UPVALUE => {
+                            let slot = Chunk::inline_operand(unit) as usize;
+                            let value = *self.stack.last().unwrap();
+                            self.write_upvalue(slot, value)?;
+                        }
+                        code::CLOSE_UPVALUE => {
+                            self.close_upvalues(self.stack.len() - 1);
+                            self.stack.pop();
+                        }
+                        code::CLOSURE => {
+                            // The upvalue count rides inline; the function's constant
+                            // index is the unit after, and the descriptors follow it.
+                            let count = Chunk::inline_operand(unit) as usize;
+                            let index = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            let function = constants[index]
+                                .as_object()
+                                .ok_or_else(|| RuntimeError::new("Closure constant is not a function."))?;
 
-                    match method {
-                        Method::Primitive(function) => {
-                            let outcome = function(self, receiver_at).map_err(|mut error| {
-                                if error.line == 0 {
-                                    error.line = chunk_of(chunk).line_at(offset_of!(at));
+                            let mut upvalues = Vec::with_capacity(count);
+                            for _ in 0..count {
+                                // One unit per upvalue: whether it is a local in the
+                                // low byte, which one in the high byte.
+                                let descriptor = unsafe { *ip };
+                                let is_local = descriptor & 0xff != 0;
+                                let index = Chunk::inline_operand(descriptor) as usize;
+                                ip = unsafe { ip.add(1) };
+                                let captured = if is_local {
+                                    self.capture_upvalue(base + index)
+                                } else {
+                                    self.upvalue_of_current(index)?
+                                };
+                                upvalues.push(captured);
+                            }
+
+                            let id = self
+                                .heap
+                                .allocate(Object::Closure(ObjClosure { function, upvalues }));
+                            self.stack.push(Value::object(id));
+                            collect_if_due!();
+                        }
+                        code::CLASS => {
+                            let declared = Chunk::inline_operand(unit) as usize;
+                            let superclass = self.stack.pop().unwrap_or(Value::NULL);
+                            let name = self.stack.pop().unwrap_or(Value::NULL);
+                            let class = self.make_class(name, superclass, declared)?;
+                            self.stack.push(class);
+                            collect_if_due!();
+                        }
+                        code::METHOD_INSTANCE | code::METHOD_STATIC => {
+                            let symbol = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            let class = self.stack.pop().unwrap_or(Value::NULL);
+                            let body = self.stack.pop().unwrap_or(Value::NULL);
+                            self.bind_method(class, body, symbol, byte == code::METHOD_STATIC)?;
+                            collect_if_due!();
+                        }
+                        code::LOAD_FIELD_THIS => {
+                            let index = Chunk::inline_operand(unit) as usize;
+                            let Some(value) = self.field_of(self.stack[base], field_offset, index) else {
+                                return Err(Vm::not_a_field());
+                            };
+                            self.stack.push(value);
+                        }
+                        code::STORE_FIELD_THIS => {
+                            let index = Chunk::inline_operand(unit) as usize;
+                            let value = *self.stack.last().unwrap();
+                            let receiver = self.stack[base];
+                            if !self.set_field(receiver, field_offset, index, value) {
+                                return Err(Vm::not_a_field());
+                            }
+                        }
+                        code::LOAD_FIELD => {
+                            let index = Chunk::inline_operand(unit) as usize;
+                            let receiver = self.stack.pop().unwrap_or(Value::NULL);
+                            let Some(value) = self.field_of(receiver, field_offset, index) else {
+                                return Err(Vm::not_a_field());
+                            };
+                            self.stack.push(value);
+                        }
+                        code::STORE_FIELD => {
+                            let index = Chunk::inline_operand(unit) as usize;
+                            // **The value is on top, the receiver below it.** The
+                            // compiler pushes `this` first and then evaluates the
+                            // right-hand side, so popping the receiver first took the
+                            // value and stored the instance into itself. Assignment is
+                            // an expression, so the value is what stays.
+                            let value = self.stack.pop().unwrap_or(Value::NULL);
+                            let receiver = self.stack.pop().unwrap_or(Value::NULL);
+                            if !self.set_field(receiver, field_offset, index, value) {
+                                return Err(Vm::not_a_field());
+                            }
+                            self.stack.push(value);
+                        }
+                        code::CONSTRUCT => {
+                            let class = self.stack[base];
+                            let instance = self.instantiate(class)?;
+                            self.stack[base] = instance;
+                            collect_if_due!();
+                        }
+                        // **A method call, and a `super` one: the arm as it was
+                        // before the operators had opcodes.** Nothing in it asks
+                        // whether this is an operator -- the fourteen have arms
+                        // of their own, below -- so it keeps the shape it had
+                        // when it was the call arm, less the operators.
+                        code::CALL | code::SUPER => {
+                            // The arity rides inline; the symbol is the unit after.
+                            let arity = Chunk::inline_operand(unit) as usize;
+                            let symbol = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+
+                            let start_from = if byte == code::SUPER {
+                                self.frames
+                                    .last()
+                                    .and_then(|frame| self.function_of(frame.closure))
+                                    .and_then(|function| function.super_class)
+                                    .ok_or_else(|| {
+                                        RuntimeError::new("Cannot use 'super' outside of a method.")
+                                    })?
+                            } else {
+                                let receiver_at = self.stack.len() - arity - 1;
+                                let receiver = self.stack[receiver_at];
+                                self.class_of(receiver)
+                                    .ok_or_else(|| RuntimeError::new("Receiver has no class."))?
+                            };
+
+                            let receiver_at = self.stack.len() - arity - 1;
+                            #[cfg(feature = "profile")]
+                            {
+                                *self
+                                    .lookups
+                                    .entry((start_from.raw(), symbol as u32))
+                                    .or_insert(0) += 1;
+                                let site = self
+                                    .call_sites
+                                    .entry((chunk.as_ptr() as usize, offset_of!(at)))
+                                    .or_insert_with(|| (alloc::vec::Vec::new(), 0));
+                                site.1 += 1;
+                                if !site.0.contains(&start_from.raw()) {
+                                    site.0.push(start_from.raw());
                                 }
-                                error
-                            });
+                            }
+                            let found = self.find_method(start_from, symbol);
+                            let Some(method) = found else {
+                                let error = self.no_such_method(receiver_at, symbol, chunk_of(chunk).line_at(offset_of!(at)));
+                                match self.deliver_error(error, offset_of!(ip), chunk)? {
+                                    Some((next_chunk, next_ip, next_base)) => {
+                                        follow_chunk!(next_chunk);
+                                        // SAFETY: an offset into the chunk just switched to.
+                                        ip = unsafe { start.add(next_ip) };
+                                        base = next_base;
+                                        module = self.current_module();
+                                        field_offset = self.current_field_offset();
+                                        continue 'interpret;
+                                    }
+                                    None => unreachable!("deliver_error returns or switches"),
+                                }
+                            };
 
-                            let value = match outcome {
-                                Ok(value) => value,
+                            match method {
+                                Method::Primitive(function) => {
+                                    let outcome = function(self, receiver_at).map_err(|mut error| {
+                                        if error.line == 0 {
+                                            error.line = chunk_of(chunk).line_at(offset_of!(at));
+                                        }
+                                        error
+                                    });
+
+                                    let value = match outcome {
+                                        Ok(value) => value,
+                                        Err(error) => match self.deliver_error(error, offset_of!(ip), chunk)? {
+                                            Some((next_chunk, next_ip, next_base)) => {
+                                                follow_chunk!(next_chunk);
+                                                // SAFETY: an offset into the chunk just switched to.
+                                        ip = unsafe { start.add(next_ip) };
+                                                base = next_base;
+                                                module = self.current_module();
+                                                field_offset = self.current_field_offset();
+                                                continue 'interpret;
+                                            }
+                                            None => unreachable!("deliver_error returns or switches"),
+                                        },
+                                    };
+
+                                    // **A primitive may have asked to continue
+                                    // somewhere else.** The result slot is cleared
+                                    // either way; a switch leaves the target to push
+                                    // its own value there when it comes back.
+                                    self.stack.truncate(receiver_at);
+                                    if self.halting {
+                                        self.halting = false;
+                                        return Ok(Value::NULL);
+                                    }
+                                    if let Some(switch) = self.pending_switch.take() {
+                                        let failing = switch.as_error.then_some(switch.value);
+                                        self.perform_switch(switch, offset_of!(ip), chunk)?;
+                                        if let Some(value) = failing {
+                                            // The target fails the moment it resumes,
+                                            // which is what makes `transferError`
+                                            // different from `transfer`.
+                                            let message = self.to_string(value);
+                                            let error = RuntimeError {
+                                                message,
+                                                line: chunk_of(chunk).line_at(offset_of!(at)),
+                                            };
+                                            match self.deliver_error(error, 0, chunk)? {
+                                                Some((next_chunk, next_ip, next_base)) => {
+                                                    follow_chunk!(next_chunk);
+                                                    // SAFETY: an offset into the chunk just switched to.
+                                        ip = unsafe { start.add(next_ip) };
+                                                    base = next_base;
+                                                    module = self.current_module();
+                                                    field_offset = self.current_field_offset();
+                                                    continue 'interpret;
+                                                }
+                                                None => unreachable!("deliver_error returns or switches"),
+                                            }
+                                        }
+                                        // Taking the chunk back is the move that pairs with the one
+                                        // the call made, and it empties the field so the frame counts
+                                        // as running again.
+                                        follow_chunk!(self.resume_chunk()?);
+                                        let frame = self.frames.last().expect("a frame to resume");
+                                        // SAFETY: a parked frame's offset, into the chunk now current.
+                                        ip = unsafe { start.add(frame.ip) };
+                                        base = frame.base;
+                                        module = frame.module;
+                                        field_offset = frame.field_offset as usize;
+                                        continue 'interpret;
+                                    }
+                                    self.stack.push(value);
+                                    // A primitive is where most allocation happens:
+                                    // strings, lists, ranges, maps.
+                                    collect_if_due!();
+                                }
+                                Method::Closure(closure) => {
+                                    // **One walk to the closure, not three.** Arity,
+                                    // code and module all come from the same `ObjFn`,
+                                    // and asking for them separately was the bulk of
+                                    // what a call cost.
+                                    let target = self.call_target(closure)?;
+                                    if target.arity != arity {
+                                        return Err(Self::wrong_arity(
+                                            target.arity,
+                                            arity,
+                                            chunk_of(chunk).line_at(offset_of!(at)),
+                                        ));
+                                    }
+                                    if self.frames.len() >= MAX_FRAMES {
+                                        return Err(Self::stack_overflow(chunk_of(chunk).line_at(offset_of!(at))));
+                                    }
+                                    // **The caller's chunk moves into its frame and
+                                    // the callee's into the local**: the caller stops
+                                    // running exactly here, which is already where
+                                    // its `ip` is written back.
+                                    // **Taken before the switch.** `offset_of!` is
+                                    // relative to `start`, and `start` is about to
+                                    // become the callee's chunk -- so the caller's
+                                    // offset has to be read while it still means what
+                                    // it says.
+                                    let caller_ip = offset_of!(ip);
+                                    let caller_chunk = {
+                                        // Same order as `follow_chunk!`, with
+                                        // `replace` handing the caller's chunk back
+                                        // to be parked.
+                                        let next = target.chunk;
+                                        units = code_units(next);
+                                        // **Every slice hoisted out of the chunk has
+                                        // to move here too.** This is a hand-inlined
+                                        // `follow_chunk!` -- it cannot use the macro,
+                                        // which discards the old chunk where this one
+                                        // hands it back to be parked -- and adding
+                                        // `constants` to the macro without adding it
+                                        // here read the *callee's* constants against
+                                        // the caller's pool, which showed up as
+                                        // `fib` calling `+` with a non-number.
+                                        constants = chunk_constants(next);
+                                        start = units.as_ptr();
+                                        ::core::mem::replace(&mut chunk, next)
+                                    };
+                                    if let Some(frame) = self.frames.last_mut() {
+                                        frame.ip = caller_ip;
+                                        frame.chunk = Some(caller_chunk);
+                                    }
+                                    self.stack.reserve(target.max_slots);
+                                    #[cfg(feature = "verify-slots")]
+                                    let entry_len = self.stack.len();
+                                    self.frames.push(Frame {
+                                        #[cfg(feature = "verify-slots")]
+                                        entry_len,
+                                        closure,
+                                        ip: 0,
+                                        base: receiver_at,
+                                        chunk: None,
+                                        module: target.module,
+                                        field_offset: target.field_offset,
+                                    });
+                                    ip = start;
+                                    base = receiver_at;
+                                    module = target.module;
+                                    field_offset = target.field_offset as usize;
+                                }
+                            }
+                        }
+                        // **The operators, one arm each, and each only its
+                        // fast path.** The compiler already said which calls
+                        // these are -- see the operators in `Op` -- so `+`
+                        // arrives at the `+` arm with nothing left to ask, and
+                        // `answer_operator::<{ code::CALL_ADD }>` is compiled
+                        // with the addition already chosen: the type tests, the
+                        // add, and the store.
+                        //
+                        // **What a fast path declines leaves the arm by `break
+                        // 'declined`**, to the one method call below the
+                        // `match`, which does the rest out of line. Nothing the
+                        // method call needs is kept alive across the arm -- the
+                        // arity and the symbol are read again there from `unit`
+                        // and `ip`, which every arm has anyway -- so an arm
+                        // holds no more registers than its own arithmetic does.
+                        //
+                        // **Why not inside the `Call` arm, as before.** Sharing
+                        // it gave the operators the method call's registers and
+                        // the method call the operators' tests: the loop retired
+                        // 3-4% fewer instructions than before the operators had
+                        // opcodes and ran no faster, its cycles per instruction
+                        // up by as much. Read from the speed build's
+                        // disassembly, from an arm's entry back to the
+                        // dispatch, `+` went from 47 instructions to 28 in `f64`
+                        // and from 43 to 23 in `nofp`; on `c6b` the four
+                        // benchmarks retire 5.2% (`f64`) and 7.1% (`nofp`)
+                        // fewer instructions and run 8.4-9.0% and 9.4-9.7%
+                        // faster across three placements.
+                        //
+                        // `unsafe { *ip }` is the symbol, the unit after the
+                        // opcode, as in a `Call`; only the intrinsics use it,
+                        // and in the numeric arms the load is dropped as dead.
+                        // `ip` moves past it only when the operator was
+                        // answered: a declined one leaves `ip` on the symbol for
+                        // the method call to read.
+                        code::CALL_ADD => match self.answer_operator::<{ code::CALL_ADD }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_SUBTRACT => match self.answer_operator::<{ code::CALL_SUBTRACT }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_MULTIPLY => match self.answer_operator::<{ code::CALL_MULTIPLY }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_DIVIDE => match self.answer_operator::<{ code::CALL_DIVIDE }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_MODULO => match self.answer_operator::<{ code::CALL_MODULO }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_LESS => match self.answer_operator::<{ code::CALL_LESS }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_GREATER => match self.answer_operator::<{ code::CALL_GREATER }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_LESS_EQUAL => match self.answer_operator::<{ code::CALL_LESS_EQUAL }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_GREATER_EQUAL => match self.answer_operator::<{ code::CALL_GREATER_EQUAL }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_ITERATE => match self.answer_operator::<{ code::CALL_ITERATE }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_ITERATOR_VALUE => match self.answer_operator::<{ code::CALL_ITERATOR_VALUE }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_EQUAL => match self.answer_operator::<{ code::CALL_EQUAL }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_NOT_EQUAL => match self.answer_operator::<{ code::CALL_NOT_EQUAL }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::CALL_NOT => match self.answer_operator::<{ code::CALL_NOT }>(unsafe { *ip } as usize) {
+                            true => ip = unsafe { ip.add(1) },
+                            false => break 'declined,
+                        },
+                        code::LOAD_STATIC_FIELD => {
+                            let index = Chunk::inline_operand(unit) as usize;
+                            let value = self.static_field(index);
+                            self.stack.push(value);
+                        }
+                        code::STORE_STATIC_FIELD => {
+                            let index = Chunk::inline_operand(unit) as usize;
+                            let value = *self.stack.last().unwrap();
+                            self.set_static_field(index, value)?;
+                            collect_if_due!();
+                        }
+                        code::SET_ATTRIBUTES => {
+                            self.set_attributes();
+                            collect_if_due!();
+                        }
+                        code::IMPORT_MODULE => {
+                            let index = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            let name = self.to_string(constants[index]);
+                            // Resolved against the module doing the importing.
+                            let name = resolve_module(&self.modules[module].name, &name);
+
+                            match self.load_module(&name) {
+                                Ok((_, None)) => {
+                                    // Already loaded: its body must not run twice.
+                                    self.stack.push(Value::NULL);
+                                    collect_if_due!();
+                                }
+                                Ok((_, Some(closure))) => {
+                                    // Run the module body as an ordinary call. Its
+                                    // return value lands where this instruction's
+                                    // result would have, so nothing special is needed
+                                    // on the way back.
+                                    // **Assigned, not `let`.** A fresh binding here
+                                    // would shadow the loop's `base` for this arm only,
+                                    // so the module body would run against the caller's
+                                    // base and its return would truncate the stack past
+                                    // the caller's own slots. The symptom was a `for`
+                                    // loop after any import reading its hidden
+                                    // iterator local as null.
+                                    base = self.stack.len();
+                                    self.stack.push(Value::NULL);
+                                    // The module body becomes the running frame, so
+                                    // this one stops running and takes its chunk back.
+                                    if let Some(frame) = self.frames.last_mut() {
+                                        frame.ip = offset_of!(ip);
+                                        frame.chunk = Some(chunk);
+                                    }
+                                    follow_chunk!(self.push_frame(closure, base)?);
+                                    ip = start;
+                                    module = self.module_of(closure);
+                                    field_offset = self.current_field_offset();
+                                    continue 'interpret;
+                                }
                                 Err(error) => match self.deliver_error(error, offset_of!(ip), chunk)? {
                                     Some((next_chunk, next_ip, next_base)) => {
                                         follow_chunk!(next_chunk);
                                         // SAFETY: an offset into the chunk just switched to.
-                                ip = unsafe { start.add(next_ip) };
+                                        ip = unsafe { start.add(next_ip) };
                                         base = next_base;
                                         module = self.current_module();
                                         field_offset = self.current_field_offset();
@@ -3126,360 +3537,201 @@ impl Vm {
                                     }
                                     None => unreachable!("deliver_error returns or switches"),
                                 },
-                            };
-
-                            // **A primitive may have asked to continue
-                            // somewhere else.** The result slot is cleared
-                            // either way; a switch leaves the target to push
-                            // its own value there when it comes back.
-                            self.stack.truncate(receiver_at);
-                            if self.halting {
-                                self.halting = false;
-                                return Ok(Value::NULL);
                             }
-                            if let Some(switch) = self.pending_switch.take() {
-                                let failing = switch.as_error.then_some(switch.value);
-                                self.perform_switch(switch, offset_of!(ip), chunk)?;
-                                if let Some(value) = failing {
-                                    // The target fails the moment it resumes,
-                                    // which is what makes `transferError`
-                                    // different from `transfer`.
-                                    let message = self.to_string(value);
-                                    let error = RuntimeError {
-                                        message,
-                                        line: chunk_of(chunk).line_at(offset_of!(at)),
-                                    };
-                                    match self.deliver_error(error, 0, chunk)? {
-                                        Some((next_chunk, next_ip, next_base)) => {
-                                            follow_chunk!(next_chunk);
-                                            // SAFETY: an offset into the chunk just switched to.
-                                ip = unsafe { start.add(next_ip) };
-                                            base = next_base;
-                                            module = self.current_module();
-                                            field_offset = self.current_field_offset();
-                                            continue 'interpret;
-                                        }
-                                        None => unreachable!("deliver_error returns or switches"),
+                        }
+                        code::IMPORT_VARIABLE => {
+                            let module_name = unsafe { *ip } as usize;
+                            let variable_name = unsafe { *ip.add(1) } as usize;
+                            ip = unsafe { ip.add(2) };
+
+                            let module_name = self.to_string(constants[module_name]);
+                            // The same resolution, or the `for` clause would look the
+                            // module up under the name as written rather than the one
+                            // it was loaded under.
+                            let module_name = resolve_module(&self.modules[module].name, &module_name);
+                            let variable = self.to_string(constants[variable_name]);
+
+                            let value = self.imported_variable(&module_name, &variable, chunk_of(chunk).line_at(offset_of!(at)))?;
+                            self.stack.push(value);
+                            collect_if_due!();
+                        }
+                        code::RETURN | code::END | code::LOAD_LOCAL_RETURN | code::LOAD_FIELD_THIS_RETURN => {
+                            // **The fused returns skip the stack entirely.** Pushing a
+                            // value so that the next instruction can pop it is what
+                            // the pair did; having one instruction, the value goes
+                            // straight into the result.
+                            let result = match byte {
+                                code::END => Value::NULL,
+                                code::LOAD_LOCAL_RETURN => {
+                                    let slot = Chunk::inline_operand(unit) as usize;
+                                    ip = unsafe { ip.add(1) };
+                                    self.stack[base + slot]
+                                }
+                                code::LOAD_FIELD_THIS_RETURN => {
+                                    let index = Chunk::inline_operand(unit) as usize;
+                                    ip = unsafe { ip.add(1) };
+                                    match self.field_of(self.stack[base], field_offset, index) {
+                                        Some(value) => value,
+                                        None => return Err(Vm::not_a_field()),
                                     }
                                 }
-                                // Taking the chunk back is the move that pairs with the one
-                                // the call made, and it empties the field so the frame counts
-                                // as running again.
-                                follow_chunk!(self.resume_chunk()?);
-                                let frame = self.frames.last().expect("a frame to resume");
-                                // SAFETY: a parked frame's offset, into the chunk now current.
-                                ip = unsafe { start.add(frame.ip) };
-                                base = frame.base;
-                                module = frame.module;
-                                field_offset = frame.field_offset as usize;
-                                continue 'interpret;
-                            }
-                            self.stack.push(value);
-                            // A primitive is where most allocation happens:
-                            // strings, lists, ranges, maps.
-                            collect_if_due!();
-                        }
-                        Method::Closure(closure) => {
-                            // **One walk to the closure, not three.** Arity,
-                            // code and module all come from the same `ObjFn`,
-                            // and asking for them separately was the bulk of
-                            // what a call cost.
-                            let target = self.call_target(closure)?;
-                            if target.arity != arity {
-                                return Err(Self::wrong_arity(
-                                    target.arity,
-                                    arity,
-                                    chunk_of(chunk).line_at(offset_of!(at)),
-                                ));
-                            }
-                            if self.frames.len() >= MAX_FRAMES {
-                                return Err(Self::stack_overflow(chunk_of(chunk).line_at(offset_of!(at))));
-                            }
-                            // **The caller's chunk moves into its frame and
-                            // the callee's into the local**: the caller stops
-                            // running exactly here, which is already where
-                            // its `ip` is written back.
-                            // **Taken before the switch.** `offset_of!` is
-                            // relative to `start`, and `start` is about to
-                            // become the callee's chunk -- so the caller's
-                            // offset has to be read while it still means what
-                            // it says.
-                            let caller_ip = offset_of!(ip);
-                            let caller_chunk = {
-                                // Same order as `follow_chunk!`, with
-                                // `replace` handing the caller's chunk back
-                                // to be parked.
-                                let next = target.chunk;
-                                units = code_units(next);
-                                // **Every slice hoisted out of the chunk has
-                                // to move here too.** This is a hand-inlined
-                                // `follow_chunk!` -- it cannot use the macro,
-                                // which discards the old chunk where this one
-                                // hands it back to be parked -- and adding
-                                // `constants` to the macro without adding it
-                                // here read the *callee's* constants against
-                                // the caller's pool, which showed up as
-                                // `fib` calling `+` with a non-number.
-                                constants = chunk_constants(next);
-                                start = units.as_ptr();
-                                ::core::mem::replace(&mut chunk, next)
+                                _ => self.stack.pop().unwrap_or(Value::NULL),
                             };
-                            if let Some(frame) = self.frames.last_mut() {
-                                frame.ip = caller_ip;
-                                frame.chunk = Some(caller_chunk);
+
+                            self.close_upvalues(base);
+                            self.stack.truncate(base);
+                            self.frames.pop();
+
+                            if self.frames.len() <= floor {
+                                // **A fiber running out of frames is finished**, and
+                                // control goes back to whoever resumed it rather than
+                                // out of the interpreter -- unless nobody did, in which
+                                // case this is the root and the program is over.
+                                // **A fiber is finished when it has no frames left**,
+                                // not when this particular `run_frames` returns. A
+                                // primitive that re-enters the interpreter -- `Fn.call`,
+                                // or any Sequence method taking a block -- returns
+                                // through here too, and marking the fiber done then
+                                // ended the fiber that merely *contained* the call.
+                                // The symptom was a second `fiber.call()` reporting the
+                                // fiber already finished after it had only yielded.
+                                let finished = self.frames.is_empty();
+                                let caller = self.current_fiber.and_then(|id| match self.heap.fiber(id) {
+                                    Some(fiber) => fiber.caller,
+                                    _ => None,
+                                });
+                                if let (Some(caller), true) = (caller, finished) {
+                                    self.perform_switch(
+                                        Switch {
+                                            target: caller,
+                                            value: result,
+                                            set_caller: false,
+                                            catching: false,
+                                            finishing: true,
+                                            as_error: false,
+                                        },
+                                        offset_of!(ip),
+                                        chunk,
+                                    )?;
+                                    // Taking the chunk back is the move that pairs with the one
+                                    // the call made, and it empties the field so the frame counts
+                                    // as running again.
+                                    follow_chunk!(self.resume_chunk()?);
+                                    let frame = self.frames.last().expect("a frame to resume");
+                                    // SAFETY: a parked frame's offset, into the chunk now current.
+                                    ip = unsafe { start.add(frame.ip) };
+                                    base = frame.base;
+                                    module = frame.module;
+                                    field_offset = frame.field_offset as usize;
+                                    continue 'interpret;
+                                }
+                                if finished {
+                                    if let Some(id) = self.current_fiber {
+                                        if let Some(fiber) = self.heap.fiber_mut(id) {
+                                            fiber.done = true;
+                                        }
+                                    }
+                                }
+                                return Ok(result);
                             }
-                            self.stack.reserve(target.max_slots);
-                            #[cfg(feature = "verify-slots")]
-                            let entry_len = self.stack.len();
-                            self.frames.push(Frame {
-                                #[cfg(feature = "verify-slots")]
-                                entry_len,
-                                closure,
-                                ip: 0,
-                                base: receiver_at,
-                                chunk: None,
-                                module: target.module,
-                                field_offset: target.field_offset,
-                            });
-                            ip = start;
-                            base = receiver_at;
-                            module = target.module;
-                            field_offset = target.field_offset as usize;
-                        }
-                    }
-                }
-                code::LOAD_STATIC_FIELD => {
-                    let index = Chunk::inline_operand(unit) as usize;
-                    let value = self.static_field(index);
-                    self.stack.push(value);
-                }
-                code::STORE_STATIC_FIELD => {
-                    let index = Chunk::inline_operand(unit) as usize;
-                    let value = *self.stack.last().unwrap();
-                    self.set_static_field(index, value)?;
-                    collect_if_due!();
-                }
-                code::SET_ATTRIBUTES => {
-                    self.set_attributes();
-                    collect_if_due!();
-                }
-                code::IMPORT_MODULE => {
-                    let index = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    let name = self.to_string(constants[index]);
-                    // Resolved against the module doing the importing.
-                    let name = resolve_module(&self.modules[module].name, &name);
 
-                    match self.load_module(&name) {
-                        Ok((_, None)) => {
-                            // Already loaded: its body must not run twice.
-                            self.stack.push(Value::NULL);
-                            collect_if_due!();
-                        }
-                        Ok((_, Some(closure))) => {
-                            // Run the module body as an ordinary call. Its
-                            // return value lands where this instruction's
-                            // result would have, so nothing special is needed
-                            // on the way back.
-                            // **Assigned, not `let`.** A fresh binding here
-                            // would shadow the loop's `base` for this arm only,
-                            // so the module body would run against the caller's
-                            // base and its return would truncate the stack past
-                            // the caller's own slots. The symptom was a `for`
-                            // loop after any import reading its hidden
-                            // iterator local as null.
-                            base = self.stack.len();
-                            self.stack.push(Value::NULL);
-                            // The module body becomes the running frame, so
-                            // this one stops running and takes its chunk back.
-                            if let Some(frame) = self.frames.last_mut() {
-                                frame.ip = offset_of!(ip);
-                                frame.chunk = Some(chunk);
-                            }
-                            follow_chunk!(self.push_frame(closure, base)?);
-                            ip = start;
-                            module = self.module_of(closure);
-                            field_offset = self.current_field_offset();
-                            continue;
-                        }
-                        Err(error) => match self.deliver_error(error, offset_of!(ip), chunk)? {
-                            Some((next_chunk, next_ip, next_base)) => {
-                                follow_chunk!(next_chunk);
-                                // SAFETY: an offset into the chunk just switched to.
-                                ip = unsafe { start.add(next_ip) };
-                                base = next_base;
-                                module = self.current_module();
-                                field_offset = self.current_field_offset();
-                                continue;
-                            }
-                            None => unreachable!("deliver_error returns or switches"),
-                        },
-                    }
-                }
-                code::IMPORT_VARIABLE => {
-                    let module_name = unsafe { *ip } as usize;
-                    let variable_name = unsafe { *ip.add(1) } as usize;
-                    ip = unsafe { ip.add(2) };
-
-                    let module_name = self.to_string(constants[module_name]);
-                    // The same resolution, or the `for` clause would look the
-                    // module up under the name as written rather than the one
-                    // it was loaded under.
-                    let module_name = resolve_module(&self.modules[module].name, &module_name);
-                    let variable = self.to_string(constants[variable_name]);
-
-                    let value = self.imported_variable(&module_name, &variable, chunk_of(chunk).line_at(offset_of!(at)))?;
-                    self.stack.push(value);
-                    collect_if_due!();
-                }
-                code::RETURN | code::END | code::LOAD_LOCAL_RETURN | code::LOAD_FIELD_THIS_RETURN => {
-                    // **The fused returns skip the stack entirely.** Pushing a
-                    // value so that the next instruction can pop it is what
-                    // the pair did; having one instruction, the value goes
-                    // straight into the result.
-                    let result = match byte {
-                        code::END => Value::NULL,
-                        code::LOAD_LOCAL_RETURN => {
-                            let slot = Chunk::inline_operand(unit) as usize;
-                            ip = unsafe { ip.add(1) };
-                            self.stack[base + slot]
-                        }
-                        code::LOAD_FIELD_THIS_RETURN => {
-                            let index = Chunk::inline_operand(unit) as usize;
-                            ip = unsafe { ip.add(1) };
-                            match self.field_of(self.stack[base], field_offset, index) {
-                                Some(value) => value,
-                                None => return Err(Vm::not_a_field()),
-                            }
-                        }
-                        _ => self.stack.pop().unwrap_or(Value::NULL),
-                    };
-
-                    self.close_upvalues(base);
-                    self.stack.truncate(base);
-                    self.frames.pop();
-
-                    if self.frames.len() <= floor {
-                        // **A fiber running out of frames is finished**, and
-                        // control goes back to whoever resumed it rather than
-                        // out of the interpreter -- unless nobody did, in which
-                        // case this is the root and the program is over.
-                        // **A fiber is finished when it has no frames left**,
-                        // not when this particular `run_frames` returns. A
-                        // primitive that re-enters the interpreter -- `Fn.call`,
-                        // or any Sequence method taking a block -- returns
-                        // through here too, and marking the fiber done then
-                        // ended the fiber that merely *contained* the call.
-                        // The symptom was a second `fiber.call()` reporting the
-                        // fiber already finished after it had only yielded.
-                        let finished = self.frames.is_empty();
-                        let caller = self.current_fiber.and_then(|id| match self.heap.fiber(id) {
-                            Some(fiber) => fiber.caller,
-                            _ => None,
-                        });
-                        if let (Some(caller), true) = (caller, finished) {
-                            self.perform_switch(
-                                Switch {
-                                    target: caller,
-                                    value: result,
-                                    set_caller: false,
-                                    catching: false,
-                                    finishing: true,
-                                    as_error: false,
-                                },
-                                offset_of!(ip),
-                                chunk,
-                            )?;
+                            // **Room by a simpler argument than the frames' own.**
+                            // `truncate(base)` above left the length at `base`, and
+                            // the capacity was at least the length it had before that
+                            // -- which was more than `base`, because slot `base` held
+                            // the receiver. So the slot exists and this cannot grow.
+                            // Reached only when there is a caller to return to; the
+                            // outermost return leaves by the branch above.
+                            self.push_reserved(result);
+                            // **The return path.** This ran twice per call before --
+                            // closure to function to chunk, and again for the module --
+                            // and is now two field reads and a refcount bump.
                             // Taking the chunk back is the move that pairs with the one
                             // the call made, and it empties the field so the frame counts
                             // as running again.
                             follow_chunk!(self.resume_chunk()?);
-                            let frame = self.frames.last().expect("a frame to resume");
+                            let frame = self.frames.last().expect("a frame to return to");
                             // SAFETY: a parked frame's offset, into the chunk now current.
                             ip = unsafe { start.add(frame.ip) };
                             base = frame.base;
                             module = frame.module;
                             field_offset = frame.field_offset as usize;
-                            continue;
                         }
-                        if finished {
-                            if let Some(id) = self.current_fiber {
-                                if let Some(fiber) = self.heap.fiber_mut(id) {
-                                    fiber.done = true;
-                                }
+                        code::JUMP => {
+                            let offset = unsafe { *ip } as usize;
+                            // One unit for the operand, then the distance -- which is
+                            // in units too, and so reaches four times as far as the
+                            // byte offset it replaces.
+                            ip = unsafe { ip.add(1 + offset) };
+                        }
+                        code::LOOP => {
+                            let offset = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            ip = unsafe { ip.sub(offset) };
+                        }
+                        code::JUMP_IF => {
+                            let offset = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            let condition = self.stack.pop().unwrap_or(Value::NULL);
+                            if condition.is_falsy() {
+                                ip = unsafe { ip.add(offset) };
                             }
                         }
-                        return Ok(result);
-                    }
+                        code::AND => {
+                            let offset = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
+                                ip = unsafe { ip.add(offset) };
+                            } else {
+                                self.stack.pop();
+                            }
+                        }
+                        code::OR => {
+                            let offset = unsafe { *ip } as usize;
+                            ip = unsafe { ip.add(1) };
+                            if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
+                                self.stack.pop();
+                            } else {
+                                ip = unsafe { ip.add(offset) };
+                            }
+                        }
 
-                    // **Room by a simpler argument than the frames' own.**
-                    // `truncate(base)` above left the length at `base`, and
-                    // the capacity was at least the length it had before that
-                    // -- which was more than `base`, because slot `base` held
-                    // the receiver. So the slot exists and this cannot grow.
-                    // Reached only when there is a caller to return to; the
-                    // outermost return leaves by the branch above.
-                    self.push_reserved(result);
-                    // **The return path.** This ran twice per call before --
-                    // closure to function to chunk, and again for the module --
-                    // and is now two field reads and a refcount bump.
-                    // Taking the chunk back is the move that pairs with the one
-                    // the call made, and it empties the field so the frame counts
-                    // as running again.
-                    follow_chunk!(self.resume_chunk()?);
-                    let frame = self.frames.last().expect("a frame to return to");
-                    // SAFETY: a parked frame's offset, into the chunk now current.
-                    ip = unsafe { start.add(frame.ip) };
-                    base = frame.base;
-                    module = frame.module;
-                    field_offset = frame.field_offset as usize;
-                }
-                code::JUMP => {
-                    let offset = unsafe { *ip } as usize;
-                    // One unit for the operand, then the distance -- which is
-                    // in units too, and so reaches four times as far as the
-                    // byte offset it replaces.
-                    ip = unsafe { ip.add(1 + offset) };
-                }
-                code::LOOP => {
-                    let offset = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    ip = unsafe { ip.sub(offset) };
-                }
-                code::JUMP_IF => {
-                    let offset = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    let condition = self.stack.pop().unwrap_or(Value::NULL);
-                    if condition.is_falsy() {
-                        ip = unsafe { ip.add(offset) };
+                        // **The byte that is not an opcode.** Matching the raw
+                        // byte costs the exhaustiveness a `match Op` gave for
+                        // free: an opcode with no arm above arrives here rather
+                        // than failing to compile. `bytecode::code` carries the
+                        // note about adding one, and the exhaustive `byte_of` in
+                        // its test module is what makes the omission visible.
+                        _ => return Err(Self::bad_opcode(byte, chunk_of(chunk).line_at(offset_of!(at)))),
                     }
-                }
-                code::AND => {
-                    let offset = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
-                        ip = unsafe { ip.add(offset) };
-                    } else {
-                        self.stack.pop();
-                    }
-                }
-                code::OR => {
-                    let offset = unsafe { *ip } as usize;
-                    ip = unsafe { ip.add(1) };
-                    if self.stack.last().copied().unwrap_or(Value::NULL).is_falsy() {
-                        self.stack.pop();
-                    } else {
-                        ip = unsafe { ip.add(offset) };
-                    }
+                    break 'arms;
                 }
 
-                // **The byte that is not an opcode.** Matching the raw
-                // byte costs the exhaustiveness a `match Op` gave for
-                // free: an opcode with no arm above arrives here rather
-                // than failing to compile. `bytecode::code` carries the
-                // note about adding one, and the exhaustive `byte_of` in
-                // its test module is what makes the omission visible.
-                _ => return Err(Self::bad_opcode(byte, chunk_of(chunk).line_at(offset_of!(at)))),
+                // **An operator its fast path declined: the method call, out
+                // of line.** A string on the left of `+`, an instance whose
+                // class defines `<`, `==` overridden. The instruction is laid
+                // out as a `Call` is -- the arity inline, the symbol at `ip` --
+                // so it is read the same way, and `call_declined` makes the
+                // call the `Call` arm would have made. See it for why it is
+                // a function and not a second copy of that arm.
+                let arity = Chunk::inline_operand(unit) as usize;
+                let symbol = unsafe { *ip } as usize;
+                ip = unsafe { ip.add(1) };
+                match self.call_declined(chunk, offset_of!(at), offset_of!(ip), arity, symbol)? {
+                    Resume::Next => {}
+                    Resume::Top(next) => {
+                        // The same reload as after a return: the chunk, then
+                        // the frame's own offset, base, module and fields.
+                        follow_chunk!(next);
+                        let frame = self.frames.last().expect("a frame to run");
+                        // SAFETY: a parked frame's offset, into the chunk now current.
+                        ip = unsafe { start.add(frame.ip) };
+                        base = frame.base;
+                        module = frame.module;
+                        field_offset = frame.field_offset as usize;
+                    }
+                    Resume::Halt => return Ok(Value::NULL),
+                }
             }
 
             // **No collection test here.** It was one boolean per instruction
