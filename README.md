@@ -149,8 +149,8 @@ What *does* transfer to a small part today, because it was built for one:
 
 - **Bytecode, so nothing compiles on the device.** The compiler is 34,480 B at
   `-Os` and a `.wrenc` carries a SHA-256 of the source it came from.
-- **32-bit numbers**, `--features f32`: 17–20 KB smaller, 6–13% faster, and a
-  fifth to a half off the heap. Not Wren — an `f32` is exact on integers only
+- **32-bit numbers**, `--features f32`: 16–18 KB smaller, 3–13% faster, and a
+  quarter to a half off the heap. Not Wren — an `f32` is exact on integers only
   to 2^24 — so it is off by default.
 - **A ceiling on garbage**, `Heap::set_headroom`: peak memory becomes *the live
   set plus a constant you choose*. **On a part holding few objects it is free**
@@ -165,9 +165,9 @@ identical constants on every implementation. Method and caveats:
 
 The wren-rs figures are from a run on 2026-10-13, after X19, on a second board
 of the same part (ESP32-C6FH4 rev 0.2). The build before X19 ran on both: the
-default build's four times agree to 0.3 ms, and every mode's, threaded and
-`nofp` included, to 0.4%. The C Wren and MicroPython columns are other
-runtimes, measured on the first board, and were not run again.
+default build's four times agree to 0.3 ms, and the threaded and `nofp`
+builds' to 0.4%; `f32` was not run on both. The C Wren and MicroPython columns
+are other runtimes, measured on the first board, and were not run again.
 
 ### Against C and MicroPython
 
@@ -237,19 +237,19 @@ four** in the default build, 5.3% less work and 5.3-5.6% less time in the
 threaded one, and more in `nofp`, for 1.0-2.2 KB of flash and no RAM. Every
 benchmark is faster in both builds, at every placement measured.
 
-**Read the seconds to about two percent.** The board is exact -- the same image gives
-the same time to the microsecond, three flashes running -- but *where the
-instructions land* is worth more than that: padding every branch target to four
-bytes, with the source untouched, takes `binary_trees` from 2.451 s to 2.410
-and `fib` from 3.631 s to 3.580 -- 1.7% and 1.4%, for identical instructions
-retired. (With X18's operator opcode the same padding moved those two opposite
-ways, by 0.8% and 0.4%; before it, both the same way by 1.5%; at the 80 MHz
-the board first ran at, by 3 to 4%.) So a small difference between two builds
-is a fact about placement until it has been measured at several placements, and consistency across all
-four benchmarks is not the check it looks like. The experiment, the mirror one showing that moving
+**Read the seconds to about two percent.** The board is all but exact -- two
+flashes of one image give the same time to 26 µs or better, most often to the
+microsecond -- but *where the instructions land* is worth more than that:
+padding every branch target to four bytes, with the source untouched, takes
+`binary_trees` from 2.451 s to 2.410 and `fib` from 3.631 s to 3.580 -- 1.7%
+and 1.4%, for identical instructions retired. (With X18's operator opcode the
+same padding moved those two opposite ways, by 0.8% and 0.4%; before it, both
+the same way by 1.5%; at the 80 MHz the board first ran at, by 3 to 4%.) So a
+small difference between two builds is a fact about placement until it has been
+measured at several placements, and consistency across all four benchmarks is
+not the check it looks like. The experiment, the mirror one showing that moving
 the *data* changes nothing at all, and the chip's performance counter that
-settles both are in
-**[`doc/wren-rs/profiling.md`](doc/wren-rs/profiling.md)**.
+settles both are in **[`doc/wren-rs/profiling.md`](doc/wren-rs/profiling.md)**.
 
 > Times are at 160 MHz. Rust-port times measured before 2026-09-29 were taken
 > at 80 MHz — esp-hal's default clock — and are shown halved: the clock fix
@@ -273,7 +273,7 @@ image flashed twice -- the two runs agree to 26 µs:
 | threaded `fib` ×5 | 3.134 s | 2.825 s | **2.113 s** |
 | threaded `list_build` | 0.159 s | 0.139 s | **0.069 s** |
 | threaded `method_call` | 0.501 s | 0.478 s | **0.430 s** |
-| `binary_trees` peak | 115,168 B | 86,100 B | 92,080 B |
+| `binary_trees` peak | 115,168 B | **86,100 B** | 92,080 B |
 | `list_build` peak | 132,292 B | 66,652 B | **66,636 B** |
 | VM resident | 23,176 B | 22,888 B | **21,316 B** |
 | image | 478,608 B | 462,480 B | **404,768 B** |
@@ -342,7 +342,7 @@ classes, method tables and names *at image build time* and compile them in as
 **Nothing of the core is in the heap.** Twenty-one classes, their flattened
 method tables and their names all live in `.rodata`; what the heap holds is the
 slots that address them, the VM's own vectors, and whatever the program
-computes — 930 B of objects at peak.
+computes — 927 B of objects at peak.
 
 **57,602 B fits a CH32V006's 63,488 B of flash**, which no build of this VM
 managed before -- 54,696 B when first measured; the speed work since has added

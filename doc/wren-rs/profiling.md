@@ -1300,7 +1300,7 @@ profile found them.
 | X17 | `<`, `>`, `<=`, `>=` on two doubles as integer tests on their bit patterns, instead of soft-float calls | about a third of `fib`'s arithmetic loses a call | comparisons | none | todo -- found by the U8 design pass; helps the `match` loop too |
 | X16 | `call_target` forced inline, so its result stops round-tripping through the stack | ~−1% read from the disassembly | calls | none | **refused**: +0.93% work, +1.7 to +2.4% time. Old experiment 16 found it already inlined; it no longer was, and inlining it now costs more in the arms around it |
 | X18 | **a call told from an operator by the compiler**: `Call` always names a method, `CallOperator` carries its operation -- LM's suggestion, one opcode split in two | ~−6.5% threaded, read from the disassembly | every call | none; `.wrenc` becomes version 4 | **kept**: threaded −6.21% work (f64) and −5.71% (`nofp`), time −3.4 to −8.5% on all four; `match` loop −1.16% (f64) and +0.14% (`nofp`); µwren `fib` −2.7% time. `CallOperator` itself was replaced by X19. See *X18* below |
-| X19 | **one opcode per operation**: the fourteen operators become opcodes 40 to 53, `CallAdd` to `CallNot`, so neither interpreter switches on the operation; the `match` loop gives each an arm that is only its fast path | ~−4% threaded `fib`, read from the disassembly | every operator | +1.0 to +2.2 KB flash, no RAM; `.wrenc` becomes version 5 | **kept**, in its second form: `match` loop −9.15% work (f64) and −9.96% (`nofp`), time −7.4 to −9.5%; threaded −5.28% and −6.87%, time −5.3 to −7.3%; µwren `fib` −15.7% time. Measured on `c6b`. See *X19* below |
+| X19 | **one opcode per operation**: the fourteen operators become opcodes 40 to 53, `CallAdd` to `CallNot`, so neither interpreter switches on the operation; the `match` loop gives each an arm that is only its fast path | ~−4% threaded `fib`, read from the disassembly | every operator | +1.0 to +2.2 KB flash, no RAM; `.wrenc` becomes version 5 | **kept**, in its second form: `match` loop −9.15% work (f64) and −9.96% (`nofp`), time −7.4 to −9.5%; threaded −5.28% and −6.87%, time −5.3 to −7.3%; µwren `fib` −15.7% time. Measured on `c6b`. A third form, five rare operators sharing one threaded handler, saved 416 B and 256 B of the threaded images and was not taken. See *X19* below |
 
 ### The clock
 
@@ -1581,7 +1581,9 @@ The threaded handlers are two definitions generic over the opcode,
 `call_numeric` and `call_intrinsic`; each instance has its operation as a
 constant, and `arithmetic`, shared with the `match` loop, folds to that one
 operation. The `match` loop was built twice. The first form is kept below as
-history, because what it got wrong is what the second form was built from.
+history, because what it got wrong is what the second form was built from. A
+third form, five rarely run operators sharing one threaded handler, was
+measured after the second and not taken; it closes the section.
 
 **The first form: one arm with a `match` inside.** The `match` loop kept one
 call arm, because its long call cannot be fallen into from another arm, and
@@ -1592,9 +1594,10 @@ operators' range, so a `Call` or a `Super` never entered that `match` at all.
 were built and flashed there -- `main` at 77a986c in a worktree, the branch at
 b66582d -- so no number in this section is compared with one from another
 board. The two boards agree anyway: `main` on `c6b` at the committed
-placement gives `binary_trees` 2.528 s and `fib` 4.067 s, where the README
-has 2.530 and 4.068. Every image was flashed twice: the two runs agree to
-30 µs or better, and instructions retired to 1,400 in 70 million.
+placement gives `binary_trees` 2.528 s and `fib` 4.067 s, where the README,
+from the first board, had 2.530 and 4.068 until X19. Every image was flashed
+twice: the two runs agree to 30 µs or better, and instructions retired to
+1,400 in 70 million.
 
 | first form | f64 work | f64 time | `nofp` work | `nofp` time |
 |---|---|---|---|---|

@@ -1,7 +1,8 @@
 # wren-rs on the ESP32-C6 — measured
 
 ESP32-C6FH4 rev v0.2 @ 160 MHz, the same board that produced
-[`benchmarks.md`](benchmarks.md). The same four programs from
+[`benchmarks.md`](benchmarks.md) -- except the first section below, measured
+on a second board of the same part. The same four programs from
 `benchmarks/wren`, unchanged, each timing itself with `System.clock` exactly as
 it does under the C port.
 
@@ -17,8 +18,9 @@ The default build -- `speed` profile, `f64` -- and the threaded one
 operator an opcode of its own. Measured on a second board of the same part,
 ESP32-C6FH4 rev 0.2, every image flashed twice: the two runs agree to 26 µs.
 The build before X19 ran on both boards, and the default build's four times
-agree to 0.3 ms, every mode's to 0.4%. The C Wren and MicroPython columns are
-the first board's, not measured again:
+agree to 0.3 ms, the threaded and `nofp` builds' to 0.4%; `f32` was not run on
+both. The C Wren and MicroPython columns are the first board's, not measured
+again:
 
 | benchmark | wren-rs `speed` | threaded | C Wren `-O2` | C Wren `-Os` | MicroPython | wren-rs vs C `-O2` | threaded vs C `-O2` | wren-rs vs MicroPython |
 |---|---|---|---|---|---|---|---|---|
