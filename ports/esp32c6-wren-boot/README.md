@@ -121,7 +121,8 @@ bytecode image -- and the functions move with it. Prepare here is within 4.8%
 of what those images took and run is up to 11.4% from it, and in `f64` the gap
 between bytecode and compiler changed sign: the compiler image ran 5.4% longer
 than the bytecode one at `-Os` there and runs 9.1% shorter here, and at `-O3`
-ran 9.6% shorter there and runs 7.0% longer here. In `f32` it kept its sign -- 9.6% shorter there and 2.9% here at `-Os`, 2.7% at `-O3` in both.
+ran 9.6% shorter there and runs 7.0% longer here. In `f32` it kept its sign
+-- 9.6% shorter there and 2.9% here at `-Os`, 2.7% at `-O3` in both.
 A gap whose sign the checkout's path decides says nothing about the images,
 and at up to 9.6% it is larger than any placement effect measured on the
 benchmarks, 3 to 4% at 80 MHz included (see the top-level README). **Only

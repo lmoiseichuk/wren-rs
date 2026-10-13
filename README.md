@@ -693,8 +693,8 @@ Loading the port's two programs takes 4.5 and 4.9 ms where compiling them takes
 and `f32` -- a program loads in 3.0–4.9 ms and compiles in 24.0–33.4 ms. The
 four benchmarks are smaller, 509–1,673 B of bytecode against 4,458 and 4,587,
 and load in 835–1,768 µs at `-Os` in `ports/esp32c6-wrenc-rs`, which is µwren.
-The difference barely matters against a program that then runs for most of a
-second -- and it is the dominant number on the duty cycle these parts are
+The difference barely matters against programs that then run for 0.6 to
+1.0 s -- and it is the dominant number on the duty cycle these parts are
 bought for, where a node wakes, samples and sleeps.
 
 **What bytecode costs is everything a compiler would have allowed**: no REPL,
