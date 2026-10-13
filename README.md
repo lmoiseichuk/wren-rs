@@ -56,7 +56,7 @@ its code can call and every variable it can reach, so a VM can be built with
 only those -- and a build step can freeze the resulting classes, method tables
 and names into the image rather than constructing them in RAM at start-up. On
 `fib` that leaves nothing of the core in the heap at all, and a run peaking at
-8,528 B against a CH32V006's 8,192 -- and 56,230 B of `wren` in flash against
+8,528 B against a CH32V006's 8,192 -- and 57,602 B of `wren` in flash against
 its 63,488. See
 **[`doc/wren_native.md`](doc/wren_native.md)** and
 **[`doc/wren-rs/memory.md`](doc/wren-rs/memory.md)**.
@@ -154,7 +154,7 @@ What *does* transfer to a small part today, because it was built for one:
   to 2^24 — so it is off by default.
 - **A ceiling on garbage**, `Heap::set_headroom`: peak memory becomes *the live
   set plus a constant you choose*. **On a part holding few objects it is free**
-  — `method_call` runs within 0.1% from a 32 KB ceiling down to 1 KB — because
+  — `method_call` runs within 0.11% from a 32 KB ceiling down to 1 KB — because
   a collection costs the live set, and a small part has a small one.
 
 ## The numbers
@@ -163,35 +163,41 @@ ESP32-C6FH4 at 160 MHz, `-O3`, the four programs in `benchmarks/wren` with
 identical constants on every implementation. Method and caveats:
 **[`doc/wren/benchmarks-wren-rs.md`](doc/wren/benchmarks-wren-rs.md)**.
 
+The wren-rs figures are from a run on 2026-10-13, after X19, on a second board
+of the same part (ESP32-C6FH4 rev 0.2). The build before X19 ran on both: the
+default build's four times agree to 0.3 ms, and every mode's, threaded and
+`nofp` included, to 0.4%. The C Wren and MicroPython columns are other
+runtimes, measured on the first board, and were not run again.
+
 ### Against C and MicroPython
 
 | benchmark | wren-rs | wren-rs threaded | C Wren `-O2` | MicroPython |
 |---|---|---|---|---|
-| `binary_trees` depth 9 | 2.530 s | 2.254 s | **2.160 s** | 4.729 s |
-| `fib(24)` ×5 | 4.068 s | 3.350 s | **3.250 s** | 7.109 s |
-| `list_build` 10,000 | 0.171 s | 0.172 s | **0.130 s** | 0.154 s |
-| `method_call` | 0.649 s | 0.538 s | **0.350 s** | 1.748 s |
+| `binary_trees` depth 9 | 2.410 s | 2.168 s | **2.160 s** | 4.729 s |
+| `fib(24)` ×5 | 3.580 s | **3.134 s** | 3.250 s | 7.109 s |
+| `list_build` 10,000 | 0.163 s | 0.159 s | **0.130 s** | 0.154 s |
+| `method_call` | 0.622 s | 0.501 s | **0.350 s** | 1.748 s |
 | **VM resident** | **23,176 B** | **23,176 B** | 83,036 B | — |
 
-**Between 1.2 and 1.9 times slower than C, and 72%
+**Between 1.1 and 1.8 times slower than C, and 72%
 smaller resident.** Against MicroPython it is *faster* on three of the four and
-slower on `list_build`; `--features nofp` overtakes it there too, at 0.094 s
+slower on `list_build`; `--features nofp` overtakes it there too, at 0.085 s
 against 0.154. The speed is
 the honest cost of reaching objects by a bounds-checked index rather than a
 pointer, which is what keeps `unsafe` out of the object model; the memory is
 what
 compiling no core library at start-up buys.
 
-**The threaded build is within 5% of C on `fib` and `binary_trees`**, and
-faster there than C built `-Os`. `--features tail-calls` turns the
-interpreter's one `match` into one function per opcode, each ending in a
-guaranteed tail call to the next -- the nearest Rust has to upstream's computed
-`goto`, with a register allocation per opcode instead of one for the whole
-loop. Against MicroPython that is 2.1 times faster on those two, where C is
-2.2, and 3.2 times on `method_call`. `list_build` gains nothing: its loop
-is `List.add`, a primitive the fast call path does not take, and `iterate`,
-whose soft-float keeps a register frame. It needs nightly Rust
-(`explicit_tail_calls`), costs 5,248 B of flash and no RAM, and is off by
+**The threaded build is faster than C on `fib`, and within 0.4% of it on
+`binary_trees`** -- faster on both than C built `-Os`. `--features tail-calls`
+turns the interpreter's one `match` into one function per opcode, each ending
+in a guaranteed tail call to the next -- the nearest Rust has to upstream's
+computed `goto`, with a register allocation per opcode instead of one for the
+whole loop. Against MicroPython that is 2.2 and 2.3 times faster on those two,
+where C is 2.2 on both, and 3.5 times on `method_call`. `list_build` gains
+least, 2.6%: its loop is `List.add`, a primitive the fast call path does not
+take, and `iterate`, whose soft-float keeps a register frame. It needs nightly
+Rust (`explicit_tail_calls`), costs 4,816 B of flash and no RAM, and is off by
 default; the suite passes 829 of 829 through it as well.
 
 **Judged by work, not only by time.** The chip's performance counter reports
@@ -234,12 +240,12 @@ benchmark is faster in both builds, at every placement measured.
 **Read the seconds to about two percent.** The board is exact -- the same image gives
 the same time to the microsecond, three flashes running -- but *where the
 instructions land* is worth more than that: padding every branch target to four
-bytes, with the source untouched, takes `binary_trees` from 2.550 s to 2.530
-and `fib` the *other* way, from 4.051 s to 4.068 -- 0.8% and 0.4%, for
-identical instructions retired. (Before the operator opcode the same padding
-moved both the same way, by 1.5%; at the 80 MHz the board first ran at, by 3
-to 4%.) So a small difference between two builds is a fact about placement
-until it has been measured at several placements, and consistency across all
+bytes, with the source untouched, takes `binary_trees` from 2.451 s to 2.410
+and `fib` from 3.631 s to 3.580 -- 1.7% and 1.4%, for identical instructions
+retired. (With X18's operator opcode the same padding moved those two opposite
+ways, by 0.8% and 0.4%; before it, both the same way by 1.5%; at the 80 MHz
+the board first ran at, by 3 to 4%.) So a small difference between two builds
+is a fact about placement until it has been measured at several placements, and consistency across all
 four benchmarks is not the check it looks like. The experiment, the mirror one showing that moving
 the *data* changes nothing at all, and the chip's performance counter that
 settles both are in
@@ -254,24 +260,24 @@ settles both are in
 ### The three numeric modes
 
 `Num` is a double in Wren. `--features f32` makes it a single and `--features
-nofp` makes it a 32-bit integer. Same board, same commit, same programs, one
-run each:
+nofp` makes it a 32-bit integer. Same board, same commit, same programs, each
+image flashed twice -- the two runs agree to 26 µs:
 
 | | `f64` | `f32` | `nofp` |
 |---|---|---|---|
-| `binary_trees` | 2.530 s | 2.373 s | **2.260 s** |
-| `fib` ×5 | 4.068 s | 3.743 s | **3.194 s** |
-| `list_build` | 0.171 s | 0.159 s | **0.094 s** |
-| `method_call` | 0.649 s | 0.632 s | **0.589 s** |
-| threaded `binary_trees` | 2.254 s | 2.077 s | **1.943 s** |
-| threaded `fib` ×5 | 3.350 s | 3.041 s | **2.335 s** |
-| threaded `list_build` | 0.172 s | 0.154 s | **0.085 s** |
-| threaded `method_call` | 0.538 s | 0.510 s | **0.465 s** |
+| `binary_trees` | 2.410 s | 2.253 s | **2.146 s** |
+| `fib` ×5 | 3.580 s | 3.288 s | **2.779 s** |
+| `list_build` | 0.163 s | 0.149 s | **0.085 s** |
+| `method_call` | 0.622 s | 0.603 s | **0.561 s** |
+| threaded `binary_trees` | 2.168 s | 2.001 s | **1.866 s** |
+| threaded `fib` ×5 | 3.134 s | 2.825 s | **2.113 s** |
+| threaded `list_build` | 0.159 s | 0.139 s | **0.069 s** |
+| threaded `method_call` | 0.501 s | 0.478 s | **0.430 s** |
 | `binary_trees` peak | 115,168 B | 86,100 B | 92,080 B |
-| `list_build` peak | 132,292 B | 66,644 B | **66,636 B** |
+| `list_build` peak | 132,292 B | 66,652 B | **66,636 B** |
 | VM resident | 23,176 B | 22,888 B | **21,316 B** |
-| image | 476,368 B | 460,736 B | **402,736 B** |
-| threaded image | 481,616 B | 463,904 B | **406,880 B** |
+| image | 478,608 B | 462,480 B | **404,768 B** |
+| threaded image | 483,424 B | 465,360 B | **407,920 B** |
 
 Both narrower modes are faster *and* smaller, because `riscv32imac` has neither
 the `F` nor the `D` extension — every width is software and the narrow ones are
@@ -281,7 +287,7 @@ whole memory is a list of numbers, halves with it.
 The threaded `nofp` build runs three of the four faster than C Wren does in
 `f64` -- not like for like, since C is paying for soft-float doubles, but it is
 what a part with no FPU would actually run. `method_call` is the exception, at
-0.465 s against 0.350.
+0.430 s against 0.350.
 
 **Neither is Wren, and the cost is exact rather than vague.** An `f32` is exact
 on integers only to 2^24, so `list_build` — which sums to 49,995,000 — prints
@@ -329,18 +335,18 @@ classes, method tables and names *at image build time* and compile them in as
 | the core's classes, tables and names in RAM | **0 B** | — |
 | heap once the VM is built | **4,008 B** | 23,176 B resident |
 | heap at the run's peak | **8,528 B** | — |
-| `wren` in flash | **56,230 B** | 87,884 B |
-| whole image | **173,872 B** | 476,368 B |
-| `fib(24)` ×5 | 5.15 s | 4.068 s |
+| `wren` in flash | **57,602 B** | 89,274 B |
+| whole image | **175,248 B** | 478,608 B |
+| `fib(24)` ×5 | 4.38 s | 3.580 s |
 
 **Nothing of the core is in the heap.** Twenty-one classes, their flattened
 method tables and their names all live in `.rodata`; what the heap holds is the
 slots that address them, the VM's own vectors, and whatever the program
 computes — 930 B of objects at peak.
 
-**56,230 B fits a CH32V006's 63,488 B of flash**, which no build of this VM
+**57,602 B fits a CH32V006's 63,488 B of flash**, which no build of this VM
 managed before -- 54,696 B when first measured; the speed work since has added
-1.5 KB -- and the 8,528 B heap peak is just over its 8,192 B of RAM —
+2.9 KB -- and the 8,528 B heap peak is just over its 8,192 B of RAM —
 with the `Vm` struct and the call stack still outside that figure.
 
 The one row that goes the wrong way is the clock, and it is not the VM's doing:
@@ -364,12 +370,12 @@ tools/make_native_executable.sh doc/examples --uwren --run          # a folder
 
 | on `fib` | full Wren | `--uwren` |
 |---|---|---|
-| executable | 760,512 B | **501,264 B** |
+| executable | 764,920 B | **505,448 B** |
 | bytecode compiled in | 589 B | 589 B |
-| generated core | — | 5,732 B of Rust |
+| generated core | — | 5,759 B of Rust |
 
 A third smaller, and most of what is left in either is the Rust standard
-library that a firmware does not carry. It runs in 33 ms.
+library that a firmware does not carry. It runs in 28 ms.
 
 **Why it is worth having.** The failures that matter in a tailored build do not
 look like failures: a method symbol numbered differently, or a frozen method
@@ -397,16 +403,16 @@ range on the same board:
 
 | ceiling | `binary_trees` (1,023 live) | its peak | `method_call` (109 live) |
 |---|---|---|---|
-| ratio, 1.5× *(default)* | 2.530 s | 115,168 B | 0.6485 s |
-| 32 KB | 2.466 s | 119,264 B | 0.6485 s |
-| 16 KB | 3.037 s | 106,784 B | 0.6485 s |
-| 8 KB | 3.686 s | **80,928 B** | 0.6485 s |
-| 4 KB | 5.462 s | **80,920 B** | 0.6486 s |
-| **1 KB** | 19.025 s | 105,764 B | **0.6491 s** |
+| ratio, 1.5× *(default)* | 2.410 s | 115,168 B | 0.6215 s |
+| 32 KB | 2.349 s | 119,264 B | 0.6216 s |
+| 16 KB | 2.909 s | 106,784 B | 0.6216 s |
+| 8 KB | 3.563 s | **80,928 B** | 0.6216 s |
+| 4 KB | 5.325 s | **80,928 B** | 0.6217 s |
+| **1 KB** | 18.738 s | 105,764 B | **0.6222 s** |
 
 **Read the last column.** `method_call` holds about a hundred objects and moves
-by less than a tenth of a per cent from the loosest setting to the
-tightest. `binary_trees` holds a thousand-node tree and pays seven and a half
+by about a tenth of a per cent from the loosest setting to the
+tightest. `binary_trees` holds a thousand-node tree and pays nearly eight
 times over for the same ceiling.
 
 That is not a coincidence, it is what tracing costs: **a collection is
@@ -459,7 +465,7 @@ one has to provide.
 | **the Rust VM** | **the language is complete** |
 | — upstream's test suite | **829 of 829** |
 | — conformance probes | **96 of 96** |
-| — this crate's own tests | 248 |
+| — this crate's own tests | 255 |
 | **shipping bytecode** | **measured** |
 | — the suite, run from `.wrenc` | **829 of 829** |
 | — the suite in an `f32` build | 798 of 829 — *not Wren, and off by default* |

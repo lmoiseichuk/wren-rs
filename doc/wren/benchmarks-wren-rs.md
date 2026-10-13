@@ -10,7 +10,29 @@ the result was not the one the design predicted and that is worth more than a
 flattering number. It has since been worked on; both sets of numbers are below,
 because the first one is what the second is owed to.
 
-## Now, at 160 MHz (2026-09-29)
+## Now, at 160 MHz, after X19 (2026-10-13)
+
+The default build -- `speed` profile, `f64` -- and the threaded one
+(`--features tail-calls`, which needs nightly Rust), after X19 gave each
+operator an opcode of its own. Measured on a second board of the same part,
+ESP32-C6FH4 rev 0.2, every image flashed twice: the two runs agree to 26 µs.
+The build before X19 ran on both boards, and the default build's four times
+agree to 0.3 ms, every mode's to 0.4%. The C Wren and MicroPython columns are
+the first board's, not measured again:
+
+| benchmark | wren-rs `speed` | threaded | C Wren `-O2` | C Wren `-Os` | MicroPython | wren-rs vs C `-O2` | threaded vs C `-O2` | wren-rs vs MicroPython |
+|---|---|---|---|---|---|---|---|---|
+| `binary_trees` | **2.410 s** | **2.168 s** | 2.160 s | 2.440 s | 4.729 s | 1.1x slower | 1.004x slower | 2.0x faster |
+| `fib` | **3.580 s** | **3.134 s** | 3.250 s | 3.710 s | 7.109 s | 1.1x slower | 1.04x faster | 2.0x faster |
+| `list_build` | **0.163 s** | **0.159 s** | 0.130 s | 0.150 s | 0.154 s | 1.3x slower | 1.2x slower | 1.1x slower |
+| `method_call` | **0.622 s** | **0.501 s** | 0.350 s | 0.420 s | 1.748 s | 1.8x slower | 1.4x slower | 2.8x faster |
+
+The threaded build is faster than C built `-O2` on `fib`, 0.4% slower on
+`binary_trees`, and faster than C built `-Os` on both. What each change since
+the first run was worth, and what was refused, is in
+[`doc/wren-rs/profiling.md`](../wren-rs/profiling.md).
+
+## Before X19, at 160 MHz (2026-09-29)
 
 The default build -- `speed` profile, `f64` -- and the threaded one
 (`--features tail-calls`, which needs nightly Rust), on the same clock as the C
