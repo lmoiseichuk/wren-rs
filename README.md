@@ -215,14 +215,21 @@ first. Together: **9.9% less work and 11-18% less time on every benchmark**, at
 the same clock. That pass also added a rule: when instructions retired and
 time disagree, time decides -- if it holds at several code placements.
 
-Two more changes have been measured the same way since. **The threaded build**
-above: 3.3% less work than the `match` loop, and 7-12% less time on three of
-the four. And **one opcode split in two**, LM's suggestion: a call used to ask
-at run time whether its method was `+`, and a plain method call paid for that
-question every time. The compiler knows from the signature, so it now emits
-`Call` for a method and `CallOperator` for an operator, and neither pays the
-other's tests -- **6.2% less work and 4-8% less time on all four** in the
-threaded build, 1.2% less work in the default one.
+Three more changes have been measured the same way since. **The threaded
+build** above: 3.3% less work than the `match` loop, and 7-12% less time on
+three of the four. Then **one opcode split in two**, LM's suggestion: a call
+used to ask at run time whether its method was `+`, and a plain method call
+paid for that question every time. The compiler knows from the signature, so
+it split the call opcode into one for a method and one for an operator, and
+neither paid the other's tests -- **6.2% less work and 4-8% less time on all
+four** in the threaded build, 1.2% less work in the default one. And **one
+opcode per operation**: the operator opcode still carried which operator it
+was, and both interpreters switched on that. Now each of the fourteen
+operators is an opcode of its own, and the `match` loop gives each an arm that
+is only its fast path -- **9.2% less work and 7.4-8.7% less time over the
+four** in the default build, 5.3% less work and 5.3-5.6% less time in the
+threaded one, and more in `nofp`, for 1.0-2.2 KB of flash and no RAM. Every
+benchmark is faster in both builds, at every placement measured.
 
 **Read the seconds to about two percent.** The board is exact -- the same image gives
 the same time to the microsecond, three flashes running -- but *where the

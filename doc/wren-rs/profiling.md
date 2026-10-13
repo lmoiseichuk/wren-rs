@@ -1299,7 +1299,8 @@ profile found them.
 | X15 | profile-guided layout: hot blocks together, from counts measured on the host | unknown | the whole loop | none | **refused**: +4.72% work, +3.4 to +7.9% time, +52 KB flash. The x86 profile matched every interpreter function and drove inlining that piled code into the hot paths -- LM's suggestion: order by frequency |
 | X17 | `<`, `>`, `<=`, `>=` on two doubles as integer tests on their bit patterns, instead of soft-float calls | about a third of `fib`'s arithmetic loses a call | comparisons | none | todo -- found by the U8 design pass; helps the `match` loop too |
 | X16 | `call_target` forced inline, so its result stops round-tripping through the stack | ~−1% read from the disassembly | calls | none | **refused**: +0.93% work, +1.7 to +2.4% time. Old experiment 16 found it already inlined; it no longer was, and inlining it now costs more in the arms around it |
-| X18 | **a call told from an operator by the compiler**: `Call` always names a method, `CallOperator` carries its operation -- LM's suggestion, one opcode split in two | ~−6.5% threaded, read from the disassembly | every call | none; `.wrenc` becomes version 4 | **kept**: threaded −6.21% work (f64) and −5.71% (`nofp`), time −3.4 to −8.5% on all four; `match` loop −1.16% (f64) and +0.14% (`nofp`); µwren `fib` −2.7% time. See *X18* below |
+| X18 | **a call told from an operator by the compiler**: `Call` always names a method, `CallOperator` carries its operation -- LM's suggestion, one opcode split in two | ~−6.5% threaded, read from the disassembly | every call | none; `.wrenc` becomes version 4 | **kept**: threaded −6.21% work (f64) and −5.71% (`nofp`), time −3.4 to −8.5% on all four; `match` loop −1.16% (f64) and +0.14% (`nofp`); µwren `fib` −2.7% time. `CallOperator` itself was replaced by X19. See *X18* below |
+| X19 | **one opcode per operation**: the fourteen operators become opcodes 40 to 53, `CallAdd` to `CallNot`, so neither interpreter switches on the operation; the `match` loop gives each an arm that is only its fast path | ~−4% threaded `fib`, read from the disassembly | every operator | +1.0 to +2.2 KB flash, no RAM; `.wrenc` becomes version 5 | **kept**, in its second form: `match` loop −9.15% work (f64) and −9.96% (`nofp`), time −7.4 to −9.5%; threaded −5.28% and −6.87%, time −5.3 to −7.3%; µwren `fib` −15.7% time. Measured on `c6b`. See *X19* below |
 
 ### The clock
 
@@ -1563,7 +1564,8 @@ still run, with every operator on the slow path.
 
 **The next split, one opcode per operation, is X19** below: it takes the
 operator handler's switch on the operation away, and was measured on a second
-board.
+board. X19 replaced `CallOperator` with fourteen opcodes, so this section
+describes the code as it was before X19, not as it is.
 
 ### X19: one opcode per operation
 
