@@ -3250,7 +3250,7 @@ impl Vm {
                                             Some((next_chunk, next_ip, next_base)) => {
                                                 follow_chunk!(next_chunk);
                                                 // SAFETY: an offset into the chunk just switched to.
-                                        ip = unsafe { start.add(next_ip) };
+                                                ip = unsafe { start.add(next_ip) };
                                                 base = next_base;
                                                 module = self.current_module();
                                                 field_offset = self.current_field_offset();
@@ -3285,7 +3285,7 @@ impl Vm {
                                                 Some((next_chunk, next_ip, next_base)) => {
                                                     follow_chunk!(next_chunk);
                                                     // SAFETY: an offset into the chunk just switched to.
-                                        ip = unsafe { start.add(next_ip) };
+                                                    ip = unsafe { start.add(next_ip) };
                                                     base = next_base;
                                                     module = self.current_module();
                                                     field_offset = self.current_field_offset();
