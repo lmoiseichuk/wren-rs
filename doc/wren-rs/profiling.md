@@ -1561,10 +1561,111 @@ it. The interpreter needs no test of its own for it.
 fails with either check removed. `.wrenc` is version 4: a version-3 file would
 still run, with every operator on the slow path.
 
-**Next: one opcode per operation.** The operator handler still switches on the
-operation -- eight instructions of jump table on every `+` -- and a handler per
-operation drops it: about −4% of `fib` by the same reading. Fourteen opcodes
-take 54 of the 64.
+**The next split, one opcode per operation, is X19** below: it takes the
+operator handler's switch on the operation away, and was measured on a second
+board.
+
+### X19: one opcode per operation
+
+X18's `CallOperator` still carried its operation, and both interpreters
+switched on it: the threaded handler spent fourteen instructions of every `+`
+(seventeen in `nofp`) taking the operation out of the unit, testing its range
+and jumping through a table. The opcode can be that switch already taken. The
+fourteen operators are now opcodes 40 to 53, `CallAdd` to `CallNot`, each laid
+out as a `Call` is -- the arity inline, the symbol after -- so a receiver the
+fast path declines is handed to the method call unchanged.
+
+The threaded handlers are two definitions generic over the opcode,
+`call_numeric` and `call_intrinsic`; each instance has its operation as a
+constant, and `arithmetic`, shared with the `match` loop, folds to that one
+operation. The `match` loop keeps one call arm, because its long call cannot
+be fallen into from another arm, and dispatches inside it on the opcode -- but
+only when the opcode is in the operators' range, so a `Call` or a `Super`
+never enters that `match` at all.
+
+**Measured on `c6b`, not on the board the tables above came from.** Both sides
+were built and flashed there -- `main` at 77a986c in a worktree, the branch at
+b66582d -- so no number in this section is compared with one from another
+board. The two boards agree anyway: `main` on `c6b` at the committed
+placement gives `binary_trees` 2.528 s and `fib` 4.067 s, where the README
+has 2.530 and 4.068. Every image was flashed twice: the two runs agree to
+30 µs or better, and instructions retired to 1,400 in 70 million.
+
+| | f64 work | f64 time | `nofp` work | `nofp` time |
+|---|---|---|---|---|
+| threaded `binary_trees` | −3.87% | −3.47 to −3.88% | −3.86% | −3.24 to −4.26% |
+| threaded `fib` | −5.78% | −6.19 to −6.46% | −8.87% | −9.15 to −9.50% |
+| threaded `list_build` | −8.15% | −7.27 to −7.36% | **−18.54%** | −18.47 to −18.58% |
+| threaded `method_call` | −6.98% | −6.47 to −6.87% | −7.20% | −7.61 to −7.69% |
+| threaded, sum | **−5.28%** | −5.33 to −5.59% | **−6.87%** | −6.95 to −7.29% |
+| `match` `binary_trees` | −2.13% | +0.58 to +1.25% | −1.60% | −0.03 to +0.40% |
+| `match` `fib` | −5.97% | −0.24 to +0.94% | −4.37% | −0.51 to +0.29% |
+| `match` `list_build` | −2.01% | +0.45 to +0.53% | −3.66% | −0.90 to −0.01% |
+| `match` `method_call` | −1.52% | **+2.22 to +3.25%** | −1.19% | **+0.43 to +1.86%** |
+| `match` loop, sum | **−4.19%** | **+0.27 to +1.24%** | **−3.03%** | −0.24 to +0.48% |
+
+Work is instructions retired; time is the range over branch padding 0, 4 and
+8 bytes, the sum of time being the sum of the four per-run times. Threaded is
+nightly with `tail-calls` against nightly with `tail-calls`; the `match` loop
+is stable against stable. µwren's `fib`, which runs `fib.wrenc` on the `match`
+loop in `nofp` at `-Os`, went the same way as the `match` loop: 5.187 s to
+5.236 s (+0.95%) as committed, and 5.107 s to 5.163 s (+1.10%) with branch
+targets padded to four bytes.
+
+**The threaded build gains on every benchmark, in both modes, at every
+placement**, and time follows work on each of them to within 0.7%. X18 predicted
+−4% of `fib` from the jump table alone; it is −5.8% in f64 and −8.9% in `nofp`,
+because the `nofp` handler lost its frame as well. `list_build` gains most,
+not `fib`: a `for` over a list reached `list_iterate` after 89 instructions
+before -- 20 in the operator handler deciding to hand over, 69 in
+`call_intrinsic` with a nine-register frame and its own switch on the
+operation -- and after 57 now, in an instance that saves seven registers and
+switches on nothing.
+
+**The `match` loop does less work and takes longer.** Every benchmark retires
+fewer instructions, in both modes, and none is reliably faster: `method_call`
+is 2.2-3.3% slower in f64 and up to 1.9% slower in `nofp` at every placement.
+Wall time over instructions at 160 MHz, at the committed placement, puts the
+cycles per instruction of the `match` loop at 1.25-1.29 before and 1.28-1.34
+after, on all four and in both
+modes, where the threaded build's did not move (`method_call` 1.149 and 1.151).
+So the instructions that went were cheap ones, or what is left stalls more.
+Which, is not yet measured: the cycle count (event 0) beside instructions
+retired, on the two `match` builds, is the reading that would say, and the
+disassembly of the call arm the place to look. What this rules out is
+placement: three paddings agree on the sign of `method_call` and of the f64
+sum.
+
+**By the acceptance rule** -- at least 1% on the four-benchmark sum of work,
+with time across placements deciding whether it holds:
+
+| | work | time | by the rule |
+|---|---|---|---|
+| threaded f64 | −5.28% | −5.3 to −5.6% | **holds** |
+| threaded `nofp` | −6.87% | −7.0 to −7.3% | **holds** |
+| `match` f64 | −4.19% | +0.3 to +1.2% | **does not hold**: slower at every placement |
+| `match` `nofp` | −3.03% | −0.2 to +0.5% | **does not hold**: no gain in time |
+
+The two interpreters share the opcodes, so keeping the threaded gain and
+refusing the `match` loop's loss is not two independent choices: either the
+`match` loop's call arm is rebuilt until its time follows its work, or the
+change is weighed whole.
+
+**Flash and RAM.** At the committed placement the images move by +1,808 B
+(threaded f64), +1,040 B (threaded `nofp`), +560 B (`match` f64) and +256 B
+(`match` `nofp`) -- 476,368 B to 476,928 B for the default build -- and µwren
+by +80 B. No RAM: VM resident and every peak are unchanged, but for
+`list_build`'s in threaded f64, 8 B lower.
+
+**A version-4 `.wrenc` is refused on load**, with a message naming both
+versions. Its opcode 40 was `CallOperator`, carrying an operation where a
+version-5 `CallAdd` carries an arity, so read as version 5 every operator in it
+would have the wrong arity. Translating it would mean a second reader to keep
+tested for files nobody keeps; the committed bytecode is rebuilt from source by
+`tools/build-bytecode.sh`. The loader still decides every operator again
+against the VM that will run it, and now also refuses an operator whose arity
+is not its operation's, and an operator opcode on a signature that is not an
+operator -- neither of which the compiler writes.
 
 ---
 
