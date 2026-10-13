@@ -639,8 +639,8 @@ wants.
 measured, and what each instrument lies about. Why a workstation called every
 real optimisation noise; a sampling profiler built out of `gdb` because there
 is no `perf`, and the three things it gets wrong; the board being exact to the
-microsecond while **1.5% of a benchmark is where the code landed** (3 to 4% at
-80 MHz); and the
+microsecond while **padding the branch targets, with the source untouched,
+moves `binary_trees` 1.7% and `fib` 1.4%** (3 to 4% at 80 MHz); and the
 chip's performance counter, whose event numbers are in no header here and were
 found by experiment — and whose own cycle count, 1.3 per instruction, retired
 the reading that the interpreter spends two cycles in three retiring nothing:

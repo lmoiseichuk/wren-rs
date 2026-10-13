@@ -1,10 +1,15 @@
 # try/ — every binary this repository can build
 
 Built by `tools/build-variants.sh`, which is the only thing that should
-write here. Nothing in this folder is committed: it is a scratch tree, and
-rebuilding it is how its numbers stay true.
+write here. **The folder is committed as a snapshot**, so a clone has
+binaries to try without a toolchain: every file in it comes from one build,
+at the commit below, and every size in its tables is read off those files.
+They are that commit's sizes, and the tree may have moved since: the
+top-level README's figures are measured separately and say where. `try/` is in
+`.gitignore`, so a rebuild is committed only on purpose, with
+`git add -f try`.
 
-Commit: `54919ce37ac8`
+Commit: `54919ce37ac8`, 2026-09-20
 
 ## ESP32-C6
 

@@ -1807,7 +1807,9 @@ run the operator at all.
 
 The five least run in the test suite are the five the third form shares, and
 none of them runs more than fifteen times in any benchmark; the nine that keep
-their own are each 2-12% of some benchmark's instructions. `<=` and `!=` are
+their own are each 3.0-11.8% of some benchmark's instructions -- the least
+`>=`, 30,000 of `method_call`'s 1,000,123, the most `<` and `-`, each some
+750,000 of `fib`'s 6,377,165. `<=` and `!=` are
 rare in every program counted -- `main.wren` runs them once and never. **The
 corpus does not settle `*`, `/` and `%` on its own:** `main.wren` runs `*` and
 `/` 8,000 times each, as often as `-`, and the three together are 3.2% of its

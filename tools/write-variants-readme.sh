@@ -20,10 +20,16 @@ commas() { printf "%'d" "$1"; }
     echo "# try/ — every binary this repository can build"
     echo
     echo "Built by \`tools/build-variants.sh\`, which is the only thing that should"
-    echo "write here. Nothing in this folder is committed: it is a scratch tree, and"
-    echo "rebuilding it is how its numbers stay true."
+    echo "write here. **The folder is committed as a snapshot**, so a clone has"
+    echo "binaries to try without a toolchain: every file in it comes from one build,"
+    echo "at the commit below, and every size in its tables is read off those files."
+    echo "They are that commit's sizes, and the tree may have moved since: the"
+    echo "top-level README's figures are measured separately and say where. \`try/\` is in"
+    echo "\`.gitignore\`, so a rebuild is committed only on purpose, with"
+    echo "\`git add -f try\`."
     echo
-    echo "Commit: \`$(field "$(ls -d "$OUT"/*/*/ | head -1)" commit)\`"
+    commit="$(field "$(ls -d "$OUT"/*/*/ | head -1)" commit)"
+    echo "Commit: \`$commit\`, $(git -C "$ROOT" log -1 --format=%ad --date=short "$commit" 2>/dev/null || echo "date unknown")"
     echo
     echo "## ESP32-C6"
     echo
