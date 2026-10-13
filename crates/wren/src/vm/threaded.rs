@@ -1217,9 +1217,14 @@ fn import_variable(vm: &mut Vm, ip: *const u16, _unit: u32, table: &'static Tabl
     dispatch!(vm, ip, table)
 }
 
-/// The 24 table entries past the last opcode. Unreachable for any chunk that
-/// can exist -- see `code::HIGHEST` -- and an error rather than undefined
-/// behaviour if one ever is.
+/// The table entries past `code::HIGHEST`, the last opcode. Unreachable for
+/// any chunk that can exist, and an error rather than undefined behaviour if
+/// one ever is.
+///
+/// **No count here.** This said "the 24 entries", which went stale as opcodes
+/// were added -- 23 with 41 opcodes, 10 once the operators took 54 of the 64.
+/// A number derived from `code::HIGHEST` is stale every time that moves;
+/// `64 - (code::HIGHEST + 1)` is the count, always.
 fn bad_opcode(vm: &mut Vm, ip: *const u16, unit: u32, _table: &'static Table) -> Exit {
     let line = line_of(vm, ip);
     fail!(vm, Vm::bad_opcode(Chunk::opcode_of(unit as u16), line));
