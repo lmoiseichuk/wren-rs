@@ -289,9 +289,11 @@ def build(rev, as_shipped, keep):
     decisions follow the order those names give: 7e864d3, built from three
     different directories, came out at 111,640, 111,682 and 111,698 B -- one
     or two small generic functions inlined in one build and kept out of line
-    in another. A fixed path makes a commit's figure the same on every run;
-    it cannot make it the same as a build from another checkout, so a change
-    of a few tens of bytes between commits is not a finding.
+    in another; 6a143d2, from two, at 107,344 and 107,446 B, every byte of the
+    difference in the monomorphisations row. A fixed path makes a commit's
+    figure the same on every run; it cannot make it the same as a build from
+    another checkout, so a change of up to about a hundred bytes between
+    commits is not a finding.
     """
     full = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", f"{rev}^{{commit}}"],
                           capture_output=True, text=True, check=True).stdout.strip()

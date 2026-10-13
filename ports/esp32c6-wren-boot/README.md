@@ -69,13 +69,15 @@ The same for the other three builds:
 | `-O3` `f32` bytecode | 6,131 µs | 576,850 µs | 218,912 B | 22,888 B |
 | `-O3` `f32` compiler | 56,921 µs | 561,285 µs | 217,264 B | 22,888 B |
 
-> These figures used to be 80 MHz runs halved, as the rest of this
-> repository's pre-2026-09-29 times are. Halving held for running and not for
-> preparing: c8b4b34 at 80 MHz, run again on `c6b`, prepared both files in
-> 9,851 µs and 63,166 µs, and c75f9f5, the commit that set 160 MHz, in 8,395
-> and 60,458 µs, where halving predicted 4,911 and 32,077. The two commits
-> differ in code as well as clock, and why a one-off pass barely speeds up
-> with the clock has not been tested.
+> These figures used to be 80 MHz runs halved, as the rest of this repository's
+> pre-2026-09-29 times are. Halving held for running -- the clock fix measured
+> every benchmark at 50.0-50.2% of its 80 MHz time
+> ([`doc/wren-rs/profiling.md`](../../doc/wren-rs/profiling.md), *The clock*)
+> -- and not for preparing: c8b4b34 at 80 MHz, run again on `c6b`, prepared
+> both files in 9,851 µs and 63,166 µs, and c75f9f5, the commit that set 160
+> MHz, built with `wren/core_full`, in 8,395 and 60,458 µs, where halving
+> predicted 4,911 and 32,077. The two commits differ in code as well as clock,
+> and why a one-off pass barely speeds up with the clock has not been tested.
 
 Images for all four builds, which is the whole of what the two features are
 worth on flash:
@@ -110,15 +112,16 @@ milliseconds. For that duty cycle the ratio inverts and this is the dominant
 number.
 
 **Running should be a wash, and is not.** Both builds execute the same program
-through the same interpreter -- `main` reports the same 107 frames from the
-same 2,000 cycles in every build -- yet the compiler build's run is 5.4%
-longer at `-Os` in `f64`, and shorter in the other three: by 9.6% at `-O3` in
-`f64`, 9.6% at `-Os` in `f32` and 2.7% at `-O3` in `f32`. A difference whose
-sign changes with the build is what code placement produces, and padding
-branch targets moved the benchmarks by 1.4-1.7% (see the top-level README);
-but this port has no padding control and no instruction counter, so that it is
-placement here is not shown, and three of the four gaps are larger than any
-placement effect measured elsewhere, 3 to 4% at 80 MHz included.
+through the same interpreter -- `main` reports the same frames from the same
+2,000 cycles in both builds of a configuration, 107 in `f64` and 106 in `f32`
+-- yet the compiler build's run is 5.4% longer at `-Os` in `f64`, and shorter
+in the other three: by 9.6% at `-O3` in `f64`, 9.6% at `-Os` in `f32` and 2.7%
+at `-O3` in `f32`. A difference whose sign changes with the build is what code
+placement produces, and padding branch targets moved `binary_trees` by 1.7% and
+`fib` by 1.4% (see the top-level README); but this port has no padding control
+and no instruction counter, so that it is placement here is not shown, and
+three of the four gaps are larger than any placement effect measured elsewhere,
+3 to 4% at 80 MHz included.
 
 **1,864 B less heap resident**, because the compiler's working structures are
 not allocated and the source strings are not interned.

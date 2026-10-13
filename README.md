@@ -94,9 +94,10 @@ one codegen unit. Where it goes:
 | the frozen core's class lookup | — | 72 | |
 | **total** | **111,640** | **108,890** | |
 
-**The core library is 59,852 B of the 108,890 -- 55%**, which is what this
-section used to claim without a number behind it; it was 61,568 B. The machine
-is 43,032 B, and a 62 KB part needs both to come down.
+**The core library is 59,852 B of the 108,890 -- 55%** -- every row but the
+machine, the monomorphisations and `math` -- which is what this section used to
+claim without a number behind it; it was 61,568 B. The machine is 43,032 B, and
+a 62 KB part needs both to come down.
 
 **Counted by [`tools/uwren-breakdown.py`](tools/uwren-breakdown.py)**, which
 builds the port at any commit in a worktree of its own and attributes the
@@ -111,24 +112,29 @@ build's symbols grouped by hand, from rules that missed `wren::core`'s own
 module -- it is mangled `s_4core`, not `4core` -- and `install_lazy_sequences`;
 its core helpers were seven named functions and its monomorphisations four, and
 its percentages added to 91. `--rules 2026-09-20` reproduces every row of it
-to the byte; the 7e864d3 column above is the same image counted completely.
+to the byte; the 7e864d3 column above is the same image counted completely. That
+image was built from another checkout: the tool's own build of 7e864d3 is
+111,698 B, the 58 B all in the monomorphisations row, for the reason below.
 
 Three limits on what a row means:
 
 - **What fat LTO inlines is counted where it landed**, and generic code under
-  the `wren` type it was instantiated for: 4,472 B of the total, 1,616 B of it
-  `drop_glue::<Vm>` in the interpreter's row. `--detail` lists every symbol
+  the `wren` type it was instantiated for: 4,522 B of the total -- every symbol
+  in a `wren` row whose name does not begin with a `wren::` path -- 1,616 B of
+  it `drop_glue::<Vm>` in the interpreter's row. `--detail` lists every symbol
   under its row.
 - **`core::install`'s row is code.** The signature strings it passes are
   anonymous `.rodata`, which no symbol owns; they are not in any figure here
   and were not measured.
-- **The checkout's path moves the build by a few tens of bytes.** Cargo hashes
-  a path dependency's location into every symbol name, and fat LTO's inlining
-  follows the order that gives: 7e864d3 built in four directories came out at
-  111,640 (twice), 111,682 and 111,698 B. The tool builds each commit at a
-  path fixed by the commit, so its own figure repeats -- 111,698 for 7e864d3
-  in both of two runs, 108,890 for cac0550 in all of five -- but a difference
-  of that size between two commits is not a finding.
+- **The checkout's path moves the build by up to about a hundred bytes.** Cargo
+  hashes a path dependency's location into every symbol name, and fat LTO's
+  inlining follows the order that gives: 7e864d3 built in four directories came
+  out at 111,640 (twice), 111,682 and 111,698 B, and 6a143d2 in two at 107,344
+  and 107,446 B. Every such difference whose rows were counted is in the
+  monomorphisations row; `wren`'s own rows came out the same. The tool builds
+  each commit at a path fixed by the commit, so its own figure repeats --
+  111,698 for 7e864d3 in each of three runs, 108,890 for cac0550 in each of six
+  -- but a difference of that size between two commits is not a finding.
 
 What moved since 2026-09-20, read from `--detail` on both sides:
 
@@ -150,14 +156,19 @@ What moved since 2026-09-20, read from `--detail` on both sides:
 - **`core::install`, −1,344 B**: `Sequence`'s bindings became a table walked
   by one loop (506ec07), and the metaclass block one helper (89eeb84).
 
-X18 and X19 counted alone, each side built and counted the same way: +478 B
-and +1,546 B, the second inside the 1.0-2.2 KB X19 added to the images in
-[`profiling.md`](doc/wren-rs/profiling.md).
+X18 and X19 counted alone by the tool, 4a4bbfc to 6a143d2 and 6a143d2 to
+cac0550: +666 B and +1,444 B, the second inside the 1.0-2.2 KB X19 added to the
+images in [`profiling.md`](doc/wren-rs/profiling.md). `wren`'s own rows are
++564 B and +1,402 B of that, and the monomorphisations row the rest -- the row
+the checkout's path moves: built from other directories, the same commits
+differed by +478 B and +1,546 B, with the same +564 and +1,402 in `wren`'s own
+rows.
 
-**As shipped the port builds `uwren`**, integer-only: 89,274 B by the same
-count (`--as-shipped`), of which `Num` is 3,186 B. There `core::install` has no
-row of its own -- fat LTO inlined it into `Vm::build_frozen`, in the
-interpreter's 32,492 B.
+**As shipped the port takes `wren` with `uwren`**, integer-only, and still the
+whole core library by its own default `core_full`: the same binary is 89,290 B
+by the same count (`--as-shipped`), of which `Num` is 3,186 B. There
+`core::install` has no row of its own -- fat LTO inlined it into
+`Vm::build_frozen`, in the interpreter's 32,492 B.
 
 What the table says to remove, largest first:
 
