@@ -1767,6 +1767,127 @@ against the VM that will run it, and now also refuses an operator whose arity
 is not its operation's, and an operator opcode on a signature that is not an
 operator -- neither of which the compiler writes.
 
+**The third form: only the common operators keep an arm -- measured, and not
+taken.** LM, 2026-10-13: the full X19 is kept, the second form above, with an
+arm or a handler for every operator. The third form is on the branch
+`x19-selected` for reference, and nothing in this part describes the code on
+`main`. The question it answered: the second form pays 1.0-2.2 KB of flash for
+an arm or a handler per operator, and an operator that hardly runs might not
+earn one. Which operators are common was not decided on the four benchmarks,
+which are the timing and not a sample of programs, but over a wider corpus:
+the 829 scripts of Wren's own test suite, `doc/examples`' `boot.wren` and
+`main.wren`, and the benchmarks. Each was run on the host with the `profile`
+build's opcode histogram, so a count is how many times that operator's
+instruction executed. The last row is every instruction executed, of any
+opcode; the test suite's count is followed by the number of its scripts that
+run the operator at all.
+
+| operator | test suite | `boot` | `main` | `binary_trees` | `fib` | `list_build` | `method_call` | third form |
+|---|---|---|---|---|---|---|---|---|
+| `iterate` | 2,541,278 (62) | 14 | 13,984 | 685 | 6 | 20,002 | 20,002 | own |
+| `iteratorValue` | 2,539,160 (65) | 12 | 11,985 | 681 | 5 | 20,000 | 20,000 | own |
+| `+` | 136,610 (74) | 27 | 18,050 | 100,061 | 375,122 | 10,002 | 30,002 | own |
+| `!` | 112,420 (14) | 0 | 2,001 | 0 | 0 | 0 | 40,000 | own |
+| `<` | 2,350 (19) | 7 | 37,147 | 4 | 750,245 | 0 | 0 | own |
+| `==` | 1,470 (58) | 1 | 3,992 | 100,030 | 0 | 0 | 0 | own |
+| `>` | 1,186 (29) | 1 | 4,003 | 100,030 | 0 | 0 | 0 | own |
+| `-` | 1,164 (11) | 10 | 8,004 | 148,027 | 750,241 | 1 | 1 | own |
+| `>=` | 412 (12) | 2 | 3,896 | 0 | 0 | 0 | 30,000 | own |
+| `/` | 93 (14) | 1 | 8,000 | 3 | 0 | 0 | 0 | shared |
+| `!=` | 59 (12) | 7 | 0 | 0 | 0 | 0 | 0 | shared |
+| `*` | 43 (19) | 1 | 8,003 | 12 | 0 | 0 | 0 | shared |
+| `<=` | 26 (8) | 10 | 1 | 0 | 0 | 0 | 0 | shared |
+| `%` | 14 (4) | 0 | 4,001 | 0 | 0 | 0 | 0 | shared |
+| every instruction | 43,895,857 | 771 | 633,731 | 2,801,180 | 6,377,165 | 250,046 | 1,000,123 | |
+
+The five least run in the test suite are the five the third form shares, and
+none of them runs more than fifteen times in any benchmark; the nine that keep
+their own are each 2-12% of some benchmark's instructions. `<=` and `!=` are
+rare in every program counted -- `main.wren` runs them once and never. **The
+corpus does not settle `*`, `/` and `%` on its own:** `main.wren` runs `*` and
+`/` 8,000 times each, as often as `-`, and the three together are 3.2% of its
+instructions. The third form shared them because the shared path keeps their
+fast path: measured below at about twenty machine instructions more per
+operator than a handler of its own, which is some 0.4 million instructions on
+`main.wren`'s 20,004 and still no method call.
+
+**The split was the threaded build's only.** There the five shared one
+handler, `call_shared`, which took the opcode from the unit -- the switch the
+table takes for the other nine -- tested the operands once for the four
+numeric ones and answered `!=` through `Vm::intrinsic`, as `call_intrinsic`
+does. What it declined went to `call_general`, the long call, with the unit
+unchanged; an opcode it had no case for declined too, so a wrong table entry
+was slower and never wrong. One decline changed path: a user class's `*`,
+`/`, `%` or `<=` -- vector arithmetic, say -- goes to `call_method`'s leaf in
+the second form and took the long call in the third. The answers were the
+same; no benchmark does it. The arithmetic was written once, as
+`arithmetic_by`, with the operation an argument; `arithmetic::<OPERATION>`
+called it with its constant and folded to the one operation as before. The
+bytecode was unchanged: fourteen opcodes.
+
+The third form left the `match` loop its fourteen arms. An arm there is
+34-86 B, and a prototype that moved the same five into one out-of-line
+function, fast path and all, cost 16 B in f64, 128 B in `nofp` and 16 B in
+µwren. The one form that saved flash in the `match` loop -- 128 B of µwren --
+gave the five no fast path there at all, so `2 * 3` would have been a method
+call, which is the one thing a shared path must not be.
+
+**Flash**, at the committed placement and built in one directory:
+
+| image | second form | third form | saved | against `main` 77a986c |
+|---|---|---|---|---|
+| threaded f64 | 483,424 B | 483,008 B | **416 B** | +1,392 B |
+| threaded `nofp` | 407,920 B | 407,664 B | **256 B** | +784 B |
+| `match` f64 | 478,608 B | 478,608 B | 0 | +2,240 B |
+| `match` `nofp` | 404,768 B | 404,768 B | 0 | +2,016 B |
+| µwren | 168,240 B | 168,240 B | 0 | +1,376 B |
+
+The `match` loop at padding 0 (471,856 and 398,592 B) and µwren padded to
+four bytes (169,744 B) are unchanged too. In those images every function
+keeps its address, size and instructions; only data addresses moved. In the
+threaded build the nine handlers kept are the same instructions as before at
+new addresses, and `call_shared` is 740 B in f64 and 532 B in `nofp`. No RAM:
+VM resident and every peak are the second form's.
+
+**Time.** Measured on `c6b` at 047f651 against the second form's tip f423b82.
+Both were built in one worktree directory -- the path is in the image, and
+moves code -- checked out in turn in the order second, third, third, second
+for each configuration, every image flashed twice.
+
+| third form, against the second | f64 time | `nofp` time | runs agree to |
+|---|---|---|---|
+| `match` loop, sum, padding 0 | +0.000% | −0.000% | 9 µs |
+| `match` loop, sum, padding 4 | −0.000% | +0.000% | 34 µs |
+| threaded `binary_trees`, padding 4 | −0.148% | −0.127% | 0 µs |
+| threaded `fib`, padding 4 | −0.020% | 0.000% | 6 µs |
+| threaded `list_build`, padding 4 | −0.046% | +0.013% | 1 µs |
+| threaded `method_call`, padding 4 | +0.004% | −0.008% | 47 µs |
+| threaded, sum, padding 4 | **−0.066%** | **−0.054%** | 47 µs |
+| µwren `fib`, as committed | +0.000% | | 1 µs |
+| µwren `fib`, padded to 4 B | 0.000% | | 1 µs |
+
+The `match` loop and µwren run the same code and take the same time: every
+benchmark's mean within 13 µs of the second form's, which is inside what the
+two runs of one image differ by (up to 24 µs), and µwren's `fib` 4.373 s as
+committed and 4.329 s padded, to 1 µs, as above. The threaded build differs in work only where a
+rare operator runs: `binary_trees`' twelve `*` and three `/` retire 327 more
+instructions in f64 and 282 in `nofp`, about twenty a time; the other three
+benchmarks retire what they did, to the run's spread. Its time moved by less
+than 0.15% on every benchmark, faster on the sum in both modes. That is past
+the run-to-run spread but not past placement's: X19's threaded `binary_trees`
+spanned 0.4 points across three paddings in f64 and 1.0 in `nofp`, and the
+nine handlers moved. It was measured at the committed placement only.
+
+**By the acceptance rule** the third form is not a speed change and was not
+meant to be one: the benchmark time holds -- the same in the `match` loop and
+µwren, −0.07% and −0.05% in the threaded build -- for 416 B and 256 B of the
+threaded images, and nothing in the `match` loop or µwren. **It was not
+taken.** The saving is the threaded build's only, and `*`, `/` and `%` would
+pay for it -- `main.wren` runs the first two as often as `-` -- at about
+twenty instructions more each, with a user class's `*`, `/`, `%` and `<=`
+moved to the long call. The full X19 is kept; `x19-selected` holds the third
+form for reference.
+
 ---
 
 ## The protocol, as it now stands
