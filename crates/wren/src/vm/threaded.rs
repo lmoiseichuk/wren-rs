@@ -53,11 +53,10 @@
 //! nothing happened.
 
 use super::{
-    chunk_constants, chunk_of, code_units, ChunkRef, Frame, RuntimeError, Switch, Vm,
-    MAX_FRAMES, NUM_ADD, NUM_DIV, NUM_GE, NUM_GT, NUM_LE, NUM_LT, NUM_MOD, NUM_MUL,
-    NUM_SUB, NURSERY, NURSERY_OBJECTS,
+    arithmetic, chunk_constants, chunk_of, code_units, ChunkRef, Frame, RuntimeError, Switch, Vm,
+    MAX_FRAMES, NURSERY, NURSERY_OBJECTS,
 };
-use crate::bytecode::{code, operator, Chunk, OPERAND_SHIFT};
+use crate::bytecode::{code, operator, Chunk};
 use crate::object::{Method, ObjClosure, Object};
 use crate::value::Value;
 
@@ -366,7 +365,25 @@ static TABLE: Table = Table({
     table[code::CONSTRUCT as usize] = construct;
     // A `Call` is always a method, so the handler is the method call itself.
     table[code::CALL as usize] = call_method;
-    table[code::CALL_OPERATOR as usize] = call_operator;
+    // **One handler per operator, from two definitions.** `call_numeric` and
+    // `call_intrinsic` are generic over the opcode, and `::<{ .. }>` names
+    // one instance of each: a separate function, compiled with its operation
+    // already known. The braces are how Rust takes an expression -- here a
+    // constant's path -- as a const generic argument.
+    table[code::CALL_ADD as usize] = call_numeric::<{ code::CALL_ADD }>;
+    table[code::CALL_SUBTRACT as usize] = call_numeric::<{ code::CALL_SUBTRACT }>;
+    table[code::CALL_MULTIPLY as usize] = call_numeric::<{ code::CALL_MULTIPLY }>;
+    table[code::CALL_DIVIDE as usize] = call_numeric::<{ code::CALL_DIVIDE }>;
+    table[code::CALL_MODULO as usize] = call_numeric::<{ code::CALL_MODULO }>;
+    table[code::CALL_LESS as usize] = call_numeric::<{ code::CALL_LESS }>;
+    table[code::CALL_GREATER as usize] = call_numeric::<{ code::CALL_GREATER }>;
+    table[code::CALL_LESS_EQUAL as usize] = call_numeric::<{ code::CALL_LESS_EQUAL }>;
+    table[code::CALL_GREATER_EQUAL as usize] = call_numeric::<{ code::CALL_GREATER_EQUAL }>;
+    table[code::CALL_ITERATE as usize] = call_intrinsic::<{ code::CALL_ITERATE }>;
+    table[code::CALL_ITERATOR_VALUE as usize] = call_intrinsic::<{ code::CALL_ITERATOR_VALUE }>;
+    table[code::CALL_EQUAL as usize] = call_intrinsic::<{ code::CALL_EQUAL }>;
+    table[code::CALL_NOT_EQUAL as usize] = call_intrinsic::<{ code::CALL_NOT_EQUAL }>;
+    table[code::CALL_NOT as usize] = call_intrinsic::<{ code::CALL_NOT }>;
     table[code::SUPER as usize] = super_call;
     table[code::LOAD_STATIC_FIELD as usize] = load_static_field;
     table[code::STORE_STATIC_FIELD as usize] = store_static_field;
@@ -562,81 +579,67 @@ fn or(vm: &mut Vm, ip: *const u16, _unit: u32, table: &'static Table) -> Exit {
 }
 
 // ---------------------------------------------------------------------------
-// Calls. `Call` goes straight to `call_method`. `call_operator` keeps only the
-// arithmetic fast path, the one place a hot handler calls out (to soft-float);
-// everything else leaves for `call_intrinsic`, `call_method` or
-// `call_general`.
+// Calls. `Call` goes straight to `call_method`. Each operator has a handler of
+// its own: `call_numeric` for the nine whose fast path is arithmetic -- the one
+// place a hot handler calls out, to soft-float -- and `call_intrinsic` for the
+// five built-in methods. Whatever they decline leaves for `call_method` or
+// `call_general` with the unit unchanged, because an operator carries its
+// arity and symbol exactly where a `Call` does.
 // ---------------------------------------------------------------------------
 
-/// The unit a `Call` of `arity` would have had, for handing an operator the
-/// fast path declined to the ordinary call handlers -- which read the arity
-/// where an operator keeps its operation.
-#[inline(always)]
-fn as_call(unit: u32, arity: usize) -> u32 {
-    (unit & 0xff) | ((arity as u32) << OPERAND_SHIFT)
-}
-
-#[allow(unsafe_code)]
-fn call_operator(vm: &mut Vm, ip: *const u16, unit: u32, table: &'static Table) -> Exit {
-    let operation = Chunk::inline_operand(unit as u16);
-    if operation <= NUM_GE {
-        let top = vm.stack.len();
-        let left = vm.stack[top - 2];
-        let right = vm.stack[top - 1];
-        if left.is_num() && right.is_num() {
-            let (a, b) = (left.num_unchecked(), right.num_unchecked());
-            #[allow(clippy::float_cmp)]
-            let value = match operation {
-                NUM_DIV | NUM_MOD
-                    if cfg!(feature = "nofp") && b == (0 as crate::value::Num) =>
-                {
-                    None
-                }
-                NUM_ADD => Some(Value::num(a + b)),
-                NUM_SUB => Some(Value::num(a - b)),
-                NUM_MUL => Some(Value::num(a * b)),
-                NUM_DIV => Some(Value::num(a / b)),
-                NUM_MOD => Some(Value::num(a % b)),
-                NUM_LT => Some(Value::bool(a < b)),
-                NUM_GT => Some(Value::bool(a > b)),
-                NUM_LE => Some(Value::bool(a <= b)),
-                _ => Some(Value::bool(a >= b)),
-            };
-            if let Some(value) = value {
-                // The receiver's slot is free again, and the stack held
-                // two values a moment ago: room by the same argument as a
-                // return's result.
-                vm.stack.truncate(top - 2);
-                vm.push_reserved(value);
-                dispatch!(vm, unsafe { ip.add(1) }, table);
-            }
-        }
-        // Every numeric operator takes one argument.
-        become call_method(vm, ip, as_call(unit, 1), table);
-    }
-    become call_intrinsic(vm, ip, unit, table)
-}
-
-/// A call whose symbol names an intrinsic: answered here if the receiver
-/// allows, otherwise the ordinary call.
+/// A numeric operator: answered here when both operands are numbers,
+/// otherwise the method call.
 ///
-/// **Never inlined**, like every cold continuation: LLVM may inline the
-/// target of a direct `become`, and inlining this into the hot handler that
-/// leaves to it would bring its calls -- and the register-saving frame they
-/// need -- back onto the hot path it was split off from.
-#[inline(never)]
+/// **Generic over its opcode, so the fourteen handlers are two definitions.**
+/// The table holds `call_numeric::<{ code::CALL_ADD }>` for `+` and so on,
+/// and each instance is compiled with `OPERATION` a constant, which folds
+/// [`arithmetic`]'s `match` to the single operation. What runs on a `+` is
+/// the type tests, the addition and the next dispatch -- not the jump table
+/// that one shared handler needed to tell `+` from `-`. Fourteen hand-written
+/// copies would compile to the same thing and be fourteen places to keep in
+/// step; a macro would generate them too, but would hide a body a reader can
+/// otherwise read once as ordinary Rust.
+///
+/// **The fallback is `call_method`, as for a `Call`.** A string on the left of
+/// `+` or an instance of a class defining `<` is an ordinary method call, and
+/// this operator's unit is already laid out as one -- the arity inline, the
+/// symbol after -- so it is handed over unchanged.
 #[allow(unsafe_code)]
-fn call_intrinsic(vm: &mut Vm, ip: *const u16, unit: u32, table: &'static Table) -> Exit {
-    let operation = Chunk::inline_operand(unit as u16);
-    let arity = operator::arity(operation);
+fn call_numeric<const OPERATION: u8>(vm: &mut Vm, ip: *const u16, unit: u32, table: &'static Table) -> Exit {
+    if let Some(value) = arithmetic::<OPERATION>(&vm.stack) {
+        // Receiver and argument off -- every numeric operator takes exactly
+        // one -- and the answer on. The receiver's slot is free again, and
+        // the stack held two values a moment ago: room by the same argument
+        // as a return's result.
+        let top = vm.stack.len();
+        vm.stack.truncate(top - 2);
+        vm.push_reserved(value);
+        dispatch!(vm, unsafe { ip.add(1) }, table);
+    }
+    become call_method(vm, ip, unit, table)
+}
+
+/// An intrinsic -- `iterate(_)`, `iteratorValue(_)`, `==(_)`, `!=(_)` or `!`:
+/// answered here if the receiver allows, otherwise the ordinary call.
+///
+/// **Generic over its opcode for the same reason as [`call_numeric`].**
+/// `Vm::intrinsic` is inlined into this handler and, with `OPERATION` a
+/// constant, keeps only its own case: `iteratorValue(_)` on a range is a
+/// type test and a copy, with none of `iterate(_)`'s arithmetic beside it.
+/// The arity is a constant too, from [`operator::arity`].
+///
+/// **The fallback is `call_general`, as it was** -- the long call, which takes
+/// any receiver, and gets the unit unchanged.
+#[allow(unsafe_code)]
+fn call_intrinsic<const OPERATION: u8>(vm: &mut Vm, ip: *const u16, unit: u32, table: &'static Table) -> Exit {
     let symbol = unsafe { *ip } as usize;
-    let receiver_at = vm.stack.len() - arity - 1;
-    if let Some(value) = vm.intrinsic(operation, receiver_at, symbol) {
+    let receiver_at = vm.stack.len() - operator::arity(OPERATION) - 1;
+    if let Some(value) = vm.intrinsic(OPERATION, receiver_at, symbol) {
         vm.stack.truncate(receiver_at);
         vm.push_reserved(value);
         dispatch!(vm, unsafe { ip.add(1) }, table);
     }
-    become call_general(vm, ip, as_call(unit, arity), table)
+    become call_general(vm, ip, unit, table)
 }
 
 /// The common call, kept a leaf: an instance or a class receiving a method

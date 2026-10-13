@@ -65,7 +65,18 @@ const MAGIC: [u8; 6] = *b"WRENC\0";
 /// still run, every operator taking the slow path as a plain method call --
 /// and a program that silently runs at a fraction of its speed is exactly
 /// what this number exists to prevent.
-pub const VERSION: u16 = 4;
+///
+/// 5: each operator has an opcode of its own, `CallAdd` to `CallNot`, laid
+/// out as a `Call` is, with the arity inline. **A version-4 file is refused**,
+/// like every other version: its opcode 40 was `CallOperator`, carrying an
+/// operation where a version-5 `CallAdd` carries an arity, so read as this
+/// version every operator in it would have the wrong arity. It could be
+/// translated instead -- the loader decides each operator again from its
+/// signature anyway -- but only the arity would need the old table, the
+/// committed bytecode is rebuilt from its source by `tools/build-bytecode.sh`,
+/// and a reader that accepts two layouts is a second one to keep tested for
+/// files nobody keeps. The refusal names both versions, which says what to do.
+pub const VERSION: u16 = 5;
 
 /// What went wrong reading a `.wrenc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,16 +139,9 @@ fn table_operands(code: &[u16]) -> Result<Vec<(Table, usize)>, LoadError> {
             Op::Call | Op::Super | Op::MethodInstance | Op::MethodStatic => {
                 found.push((Table::Symbol, at + 1))
             }
-            // An operator's symbol is where a call's is. Its inline operand is
-            // an operation, and one the compiler never writes is refused here:
-            // the interpreter treats every number below the intrinsics as a
-            // numeric operator.
-            Op::CallOperator => {
-                if !crate::bytecode::operator::is_known(Chunk::inline_operand(code[at])) {
-                    return Err(LoadError::Malformed("unknown operator"));
-                }
-                found.push((Table::Symbol, at + 1))
-            }
+            // An operator is laid out as a call, so its symbol is in the same
+            // place. Its arity is settled on load; see `settle_operators`.
+            op if crate::bytecode::operator::is_operator(op) => found.push((Table::Symbol, at + 1)),
             Op::LoadModuleVar | Op::StoreModuleVar => found.push((Table::Variable, at + 1)),
             _ => {}
         }
@@ -752,37 +756,45 @@ fn read_constant(
 
 /// Decide each operator call again, against the VM that will run it.
 ///
-/// **The file was compiled by a different VM.** Its compiler made a call a
-/// `CallOperator` because *its* `Num` had that method; a VM built from a
-/// manifest that leaves `-(_)` out does not, and there `1 - 2` must report the
-/// method missing, as dispatch would. So each one is asked the same question
+/// **The file was compiled by a different VM.** Its compiler made a call
+/// `CallSubtract` because *its* `Num` had `-(_)`; a VM built from a manifest
+/// that leaves `-(_)` out does not, and there `1 - 2` must report the method
+/// missing, as dispatch would. So each operator is asked the same question
 /// the compiler asks -- [`Vm::operator_for`] on its signature -- and becomes a
 /// plain `Call` if the answer is no.
 ///
-/// **The operation is taken from the signature, not from the file.** A file
-/// that paired `-(_)` with the code for `+` would add numbers and subtract
-/// everything else; settled here it cannot. Only the arity survives from the
-/// file, and a rewrite keeps it, so the stack depths `max_slots` measures
-/// after this are the ones the compiler measured.
+/// **The operator is taken from the signature, not from the file.** A file
+/// that paired `-(_)` with `CallAdd` would add numbers and subtract
+/// everything else; settled here it cannot. And an operator whose inline
+/// arity is not its method's becomes a plain `Call` of that arity: the
+/// handlers take an operator's arity as given -- the threaded ones as a
+/// constant -- so by the time one runs, the two must agree.
+///
+/// **Only the opcode changes.** An operator carries its arity and symbol
+/// where a `Call` does, so the length bits and the inline arity stay, the
+/// instruction does not move, and the stack depths `max_slots` measures after
+/// this are the ones the compiler measured.
 fn settle_operators(vm: &Vm, code: &mut [u16]) {
     let mut at = 0;
     while at < code.len() {
         let unit = code[at];
-        if Chunk::opcode_of(unit) == Op::CallOperator as u8 {
-            let arity = crate::bytecode::operator::arity(Chunk::inline_operand(unit));
+        let written = match Op::from_byte(Chunk::opcode_of(unit)) {
+            Some(op) => op,
+            // The walk in `remap` has already refused an unknown opcode.
+            None => return,
+        };
+        if crate::bytecode::operator::is_operator(written) {
+            let arity = Chunk::inline_operand(unit) as usize;
             let symbol = code[at + 1] as usize;
-            let operation = match vm.method_names.name(symbol) {
+            let decided = match vm.method_names.name(symbol) {
                 Some(signature) => vm.operator_for(signature),
                 None => None,
             };
-            // Only the opcode and the inline operand change; the length bits
-            // between them stay, because the instruction does not move.
-            let length = unit & !(crate::bytecode::OPCODE_MASK | (0xff << crate::bytecode::OPERAND_SHIFT));
-            code[at] = match operation {
-                Some(operation) if crate::bytecode::operator::arity(operation) == arity => {
-                    Op::CallOperator as u16 | length | (u16::from(operation) << crate::bytecode::OPERAND_SHIFT)
-                }
-                _ => Op::Call as u16 | length | ((arity as u16) << crate::bytecode::OPERAND_SHIFT),
+            // Everything but the opcode: the length and the inline arity.
+            let rest = unit & !crate::bytecode::OPCODE_MASK;
+            code[at] = match decided {
+                Some(op) if crate::bytecode::operator::arity(op as u8) == arity => op as u16 | rest,
+                _ => Op::Call as u16 | rest,
             };
         }
         // The walk in `remap` has already refused a stream that does not

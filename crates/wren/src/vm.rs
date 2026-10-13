@@ -21,8 +21,9 @@ use alloc::vec::Vec;
 
 use crate::bytecode::Chunk;
 use crate::bytecode::operator;
-// The `match` loop's opcode constants; the threaded interpreter names its own.
-#[cfg(not(feature = "tail-calls"))]
+use crate::bytecode::Op;
+// The opcode constants: the `match` loop's arms, and the operators that the
+// fast paths below -- shared by both interpreters -- are generic over.
 use crate::bytecode::code;
 #[cfg(feature = "compiler")]
 use crate::compiler;
@@ -280,8 +281,7 @@ pub struct Vm {
     pub primitives: Vec<crate::object::Primitive>,
     /// Method signatures, interned. `Op::Call` carries an index into this.
     pub method_names: SymbolTable,
-    /// Which receivers the operators a `CallOperator` names may answer for;
-    /// see
+    /// Which receivers the operator opcodes may answer for; see
     /// [`INTRINSIC_ITERATE`].
     intrinsics: Intrinsics,
     /// The threaded interpreter's view of the running frame; see
@@ -509,28 +509,76 @@ pub struct Vm {
     previous_depth: usize,
 }
 
-/// The numeric operations the `CallOperator` arm handles without dispatching,
-/// under the names the interpreter has always used for them. The numbers are
-/// the bytecode's; see [`operator`].
+/// **The answer a numeric operator gives two values, or `None` to call the
+/// method.** The arithmetic fast path, written once for both interpreters:
+/// the `match` loop's call arm and the threaded build's handlers each ask it
+/// with their own opcode.
 ///
-/// **Only the ones whose primitive is pure arithmetic on two doubles.** `==`
-/// and `!=` are deliberately absent: they are defined on `Object` and answer
-/// for every pair of values, so a number-only fast path for them would be a
-/// second implementation of equality rather than a shortcut through one.
-/// `..` and `...` allocate a range, which is a different kind of work.
-const NUM_ADD: u8 = operator::ADD;
-const NUM_SUB: u8 = operator::SUB;
-const NUM_MUL: u8 = operator::MUL;
-const NUM_DIV: u8 = operator::DIV;
-const NUM_MOD: u8 = operator::MOD;
-const NUM_LT: u8 = operator::LT;
-const NUM_GT: u8 = operator::GT;
-const NUM_LE: u8 = operator::LE;
-const NUM_GE: u8 = operator::GE;
+/// `Num.+` and its siblings are the most-called methods in every benchmark
+/// here -- 71% of `fib`'s dispatches, 22% of `method_call`'s -- and their
+/// primitives are exactly `a + b` on two numbers; see `arithmetic!` in
+/// `core`. So when both operands are numbers, a dispatch could only arrive at
+/// the code written below: `Num` is a core class and Wren cannot reopen a
+/// class, so nothing can replace the method that would be found. Anything
+/// else -- a string on either side, a user class defining `+` -- is `None`,
+/// and the caller makes the real call, so this can only *skip* work, never
+/// change an answer. That is what makes it safe to ask before knowing the
+/// receiver's class.
+///
+/// **Only the operators whose primitive is pure arithmetic.** `==` and `!=`
+/// are deliberately absent: they are defined on `Object` and answer for every
+/// pair of values, so they are intrinsics; see [`INTRINSIC_ITERATE`]. `..` and
+/// `...` allocate a range, which is a different kind of work.
+///
+/// **A const generic, so there is no switch left to run.** `OPERATION` is a
+/// parameter of the *type*, not of the call: `arithmetic::<{ code::CALL_ADD
+/// }>` is a function of its own, compiled with the `match` below already
+/// decided, and what remains of it is the two type tests and one addition.
+/// Passing the opcode as an ordinary argument would leave that to the
+/// inliner; this way the language guarantees it. The threaded handlers rely
+/// on that -- each one *is* such an instance -- and the `match` loop gets the
+/// same code in each of its arms.
+///
+/// **It reads the top two values of `stack`** -- the receiver and the
+/// argument, in the order the caller pushed them -- and leaves taking them off
+/// to the caller, which knows how it pushes.
+#[inline(always)]
+fn arithmetic<const OPERATION: u8>(stack: &[Value]) -> Option<Value> {
+    let top = stack.len();
+    let (left, right) = (stack[top - 2], stack[top - 1]);
+    // **Tested first, extracted after.** `as_num` gives an `Option<Num>`,
+    // which for a double has no niche and so is sixteen bytes in memory --
+    // two of them and a tuple match, on the hottest path there is. See
+    // `Value::num_unchecked`.
+    if !left.is_num() || !right.is_num() {
+        return None;
+    }
+    let (a, b) = (left.num_unchecked(), right.num_unchecked());
+    #[allow(clippy::float_cmp)]
+    match OPERATION {
+        // **Dividing by zero declines rather than answering.** A float build
+        // has an infinity to give and gives it; an integer build does not,
+        // and `a / 0` would panic. Declining hands the case to the
+        // primitive, which raises "Cannot divide by zero." as an error a
+        // program can catch.
+        code::CALL_DIVIDE | code::CALL_MODULO if cfg!(feature = "nofp") && b == (0 as crate::value::Num) => None,
+        code::CALL_ADD => Some(Value::num(a + b)),
+        code::CALL_SUBTRACT => Some(Value::num(a - b)),
+        code::CALL_MULTIPLY => Some(Value::num(a * b)),
+        code::CALL_DIVIDE => Some(Value::num(a / b)),
+        code::CALL_MODULO => Some(Value::num(a % b)),
+        code::CALL_LESS => Some(Value::bool(a < b)),
+        code::CALL_GREATER => Some(Value::bool(a > b)),
+        code::CALL_LESS_EQUAL => Some(Value::bool(a <= b)),
+        code::CALL_GREATER_EQUAL => Some(Value::bool(a >= b)),
+        // Not a numeric operator, which no caller asks: the real call is
+        // always right.
+        _ => None,
+    }
+}
 
-/// **Built-in methods the `CallOperator` arm answers without calling them.**
-/// The same opcode as the numeric operators, and the same argument for why it
-/// is safe:
+/// **Built-in methods the operator opcodes answer without calling them.**
+/// The same argument for why it is safe as for [`arithmetic`]:
 /// a built-in class cannot be subclassed or reopened, so once the receiver's
 /// type is known, so is the method a lookup would find. Where the receiver is
 /// an instance -- `tree == null` -- its class *can* override the method, so
@@ -542,11 +590,20 @@ const NUM_GE: u8 = operator::GE;
 /// other. Each answer comes from the same function the primitive uses -- see
 /// `core::range_iterate` -- and anything unusual falls through to the real
 /// call, so an intrinsic can only skip work, never change an answer.
-const INTRINSIC_ITERATE: u8 = operator::ITERATE;
-const INTRINSIC_ITERATOR_VALUE: u8 = operator::ITERATOR_VALUE;
-const INTRINSIC_EQ: u8 = operator::EQ;
-const INTRINSIC_NE: u8 = operator::NE;
-const INTRINSIC_NOT: u8 = operator::NOT;
+///
+/// The names are the interpreter's own for five of the operator opcodes,
+/// whose numbers they are.
+const INTRINSIC_ITERATE: u8 = code::CALL_ITERATE;
+const INTRINSIC_ITERATOR_VALUE: u8 = code::CALL_ITERATOR_VALUE;
+const INTRINSIC_EQ: u8 = code::CALL_EQUAL;
+const INTRINSIC_NE: u8 = code::CALL_NOT_EQUAL;
+const INTRINSIC_NOT: u8 = code::CALL_NOT;
+
+/// The bit an [`Intrinsics::numeric`] mask keeps for a numeric operator: its
+/// place in the run of nine, `CallAdd` first.
+fn numeric_bit(op: Op) -> u16 {
+    1 << (op as u8 - Op::CallAdd as u8)
+}
 
 /// Which receivers each intrinsic may answer for, learned once the core is
 /// installed and flattened.
@@ -557,10 +614,11 @@ const INTRINSIC_NOT: u8 = operator::NOT;
 /// instance's class holds -- equal means not overridden.
 #[derive(Clone, Copy)]
 struct Intrinsics {
-    /// Which numeric operators `Num` really has, one bit per [`operator`]
-    /// number. **Read by the compiler, not the interpreter**: an operator
-    /// `Num` lacks is compiled as a plain `Call`, so it fails as dispatch
-    /// would, and the fast path needs no test of its own.
+    /// Which numeric operators `Num` really has, one bit each; see
+    /// [`numeric_bit`]. **Read by the compiler and the loader, not the
+    /// interpreter**: an operator `Num` lacks is compiled as a plain `Call`,
+    /// so it fails as dispatch would, and the fast path needs no test of its
+    /// own.
     numeric: u16,
     range_iterate: bool,
     range_iterator_value: bool,
@@ -1430,7 +1488,8 @@ impl Vm {
         Some(Method::Primitive(*function))
     }
 
-    /// Record which built-in methods the `Call` arm may answer itself.
+    /// Record which built-in methods the operator opcodes may answer
+    /// themselves, and which numeric operators `Num` has.
     ///
     /// See [`INTRINSIC_ITERATE`]. Run once, after the core is installed and
     /// flattened: a flag is set only where the class's own table -- with what
@@ -1467,28 +1526,32 @@ impl Vm {
         };
         for signature in ["+(_)", "-(_)", "*(_)", "/(_)", "%(_)", "<(_)", ">(_)", "<=(_)", ">=(_)"] {
             let symbol = symbol_of(self, signature);
-            if let Some(operation) = operator::of(signature) {
-                if answers(self, self.num_class, symbol) {
-                    self.intrinsics.numeric |= 1 << operation;
-                }
+            let Some(op) = operator::of(signature) else {
+                continue;
+            };
+            if answers(self, self.num_class, symbol) {
+                self.intrinsics.numeric |= numeric_bit(op);
             }
         }
     }
 
-    /// The operation a call to `signature` should be compiled to, or `None`
-    /// for a plain `Call`.
+    /// The operator opcode a call to `signature` should be compiled to, or
+    /// `None` for a plain `Call`.
     ///
     /// **A numeric operator `Num` does not have is a plain call.** A manifest
     /// can leave `-(_)` out, and then `1 - 2` must report the method missing,
     /// as dispatch would; compiling it as a `Call` is what makes it do that,
     /// with no test in the interpreter. The intrinsics need no such care --
     /// they already ask, per receiver, whether the class answers.
-    pub(crate) fn operator_for(&self, signature: &str) -> Option<u8> {
-        let operation = operator::of(signature)?;
-        if operation <= NUM_GE && self.intrinsics.numeric & (1 << operation) == 0 {
-            return None;
+    pub(crate) fn operator_for(&self, signature: &str) -> Option<Op> {
+        match operator::of(signature) {
+            // A numeric operator this VM's `Num` lacks: a method call, which
+            // will find nothing.
+            Some(op) if operator::is_numeric(op) && self.intrinsics.numeric & numeric_bit(op) == 0 => None,
+            Some(op) => Some(op),
+            // Not an operator at all.
+            None => None,
         }
-        Some(operation)
     }
 
     /// Answer a built-in method without calling it, or say it cannot.
@@ -2900,101 +2963,69 @@ impl Vm {
                     self.stack[base] = instance;
                     collect_if_due!();
                 }
-                code::CALL | code::SUPER | code::CALL_OPERATOR => 'call: {
-                    // The arity rides inline -- or, for an operator, the
-                    // operation, which implies it. The symbol is the unit
-                    // after.
-                    let operand = Chunk::inline_operand(unit);
-                    let arity = match byte {
-                        code::CALL_OPERATOR => operator::arity(operand),
-                        _ => operand as usize,
-                    };
+                // **One arm for every call, the operators among them.** The
+                // threaded build gives each operator a handler of its own,
+                // which falls back to the method call by `become`; this loop
+                // has no way to fall from one arm into another, and the long
+                // call below is the same for all sixteen, so they share it and
+                // the operators part company inside, on the opcode.
+                code::CALL
+                | code::SUPER
+                | code::CALL_ADD
+                | code::CALL_SUBTRACT
+                | code::CALL_MULTIPLY
+                | code::CALL_DIVIDE
+                | code::CALL_MODULO
+                | code::CALL_LESS
+                | code::CALL_GREATER
+                | code::CALL_LESS_EQUAL
+                | code::CALL_GREATER_EQUAL
+                | code::CALL_ITERATE
+                | code::CALL_ITERATOR_VALUE
+                | code::CALL_EQUAL
+                | code::CALL_NOT_EQUAL
+                | code::CALL_NOT => 'call: {
+                    // The arity rides inline, an operator's as a method's; the
+                    // symbol is the unit after.
+                    let arity = Chunk::inline_operand(unit) as usize;
                     let symbol = unsafe { *ip } as usize;
                     ip = unsafe { ip.add(1) };
 
-                    // **The arithmetic fast path.**
-                    //
-                    // `Num.+` and its siblings are the most-called methods in
-                    // every benchmark here -- 71% of `fib`'s dispatches, 22%
-                    // of `method_call`'s -- and their primitives are exactly
-                    // `a + b` on two doubles; see `arithmetic!` in `core`. So
-                    // when both operands are numbers, the dispatch can only
-                    // arrive at the code written below: `Num` is a core class
-                    // and Wren cannot reopen a class, so nothing can replace
-                    // the method that would be found.
-                    //
-                    // Everything else falls through to the real dispatch and
-                    // behaves exactly as before -- a string on either side, a
-                    // user class defining `+`, a `super` call, any arity but
-                    // one. The fast path can only *skip* work, never change an
-                    // answer, which is what makes it safe to take before
-                    // knowing the receiver's class.
-                    // **The compiler already said which calls these are.** A
-                    // `CallOperator` names its operation; a `Call` is never
-                    // one. See `Op::CallOperator`.
-                    if byte == code::CALL_OPERATOR {
-                        let operation = operand;
-                        // **The numeric codes only.** `==` is an intrinsic,
-                        // and `1 == 1` reaching the match below would be
-                        // answered by its last arm, `>=`.
-                        if operation <= NUM_GE {
-                            let top = self.stack.len();
-                            // Receiver and argument, in the order the caller
-                            // pushed them.
-                            let left = self.stack[top - 2];
-                            let right = self.stack[top - 1];
-                            // **Tested first, extracted after.** `as_num`
-                            // gives an `Option<Num>`, which for a double has
-                            // no niche and so is sixteen bytes in memory --
-                            // two of them and a tuple match, on the hottest
-                            // path there is. See `Value::num_unchecked`.
-                            if left.is_num() && right.is_num() {
-                                let (a, b) = (left.num_unchecked(), right.num_unchecked());
-                                #[allow(clippy::float_cmp)]
-                                let value = match operation {
-                                    // **Dividing by zero declines rather than
-                                    // answering.** A float build has an
-                                    // infinity to give and gives it; an
-                                    // integer build does not, and `a / 0`
-                                    // would panic. Declining hands the case to
-                                    // the primitive, which raises "Cannot
-                                    // divide by zero." as an error a program
-                                    // can catch.
-                                    NUM_DIV | NUM_MOD
-                                        if cfg!(feature = "nofp") && b == (0 as crate::value::Num) =>
-                                    {
-                                        None
-                                    }
-                                    NUM_ADD => Some(Value::num(a + b)),
-                                    NUM_SUB => Some(Value::num(a - b)),
-                                    NUM_MUL => Some(Value::num(a * b)),
-                                    NUM_DIV => Some(Value::num(a / b)),
-                                    NUM_MOD => Some(Value::num(a % b)),
-                                    NUM_LT => Some(Value::bool(a < b)),
-                                    NUM_GT => Some(Value::bool(a > b)),
-                                    NUM_LE => Some(Value::bool(a <= b)),
-                                    // The compiler writes nothing else below
-                                    // the intrinsics, and a loaded file is
-                                    // checked for it, so this is `>=`.
-                                    _ => Some(Value::bool(a >= b)),
-                                };
-                                if let Some(value) = value {
-                                    self.stack.truncate(top - 2);
-                                    self.stack.push(value);
-                                    break 'call;
-                                }
-                            }
-                        } else {
-                            // A built-in method answered without calling it;
-                            // see `INTRINSIC_ITERATE`. `None` is the ordinary
-                            // call below, which is always right.
-                            let receiver_at = self.stack.len() - arity - 1;
-                            if let Some(value) = self.intrinsic(operation, receiver_at, symbol) {
-                                self.stack.truncate(receiver_at);
-                                self.stack.push(value);
-                                break 'call;
-                            }
-                        }
+                    // **The fast paths, one arm per operator.** The compiler
+                    // already said which calls these are -- see the operators
+                    // in `Op` -- so a `Call` or a `Super` goes straight to the
+                    // last arm, and an operator straight to its own: there is
+                    // no second question about which operation it is. Each
+                    // answers in place if its receiver allows and gives `None`
+                    // if not, and `None` is the ordinary call below, which is
+                    // always right.
+                    let receiver_at = self.stack.len() - arity - 1;
+                    let answer = match byte {
+                        code::CALL_ADD => arithmetic::<{ code::CALL_ADD }>(&self.stack),
+                        code::CALL_SUBTRACT => arithmetic::<{ code::CALL_SUBTRACT }>(&self.stack),
+                        code::CALL_MULTIPLY => arithmetic::<{ code::CALL_MULTIPLY }>(&self.stack),
+                        code::CALL_DIVIDE => arithmetic::<{ code::CALL_DIVIDE }>(&self.stack),
+                        code::CALL_MODULO => arithmetic::<{ code::CALL_MODULO }>(&self.stack),
+                        code::CALL_LESS => arithmetic::<{ code::CALL_LESS }>(&self.stack),
+                        code::CALL_GREATER => arithmetic::<{ code::CALL_GREATER }>(&self.stack),
+                        code::CALL_LESS_EQUAL => arithmetic::<{ code::CALL_LESS_EQUAL }>(&self.stack),
+                        code::CALL_GREATER_EQUAL => arithmetic::<{ code::CALL_GREATER_EQUAL }>(&self.stack),
+                        // A built-in method answered without calling it; see
+                        // `INTRINSIC_ITERATE`. One arm for the five, because
+                        // `intrinsic` is out of line here and asks the opcode
+                        // itself.
+                        code::CALL_ITERATE
+                        | code::CALL_ITERATOR_VALUE
+                        | code::CALL_EQUAL
+                        | code::CALL_NOT_EQUAL
+                        | code::CALL_NOT => self.intrinsic(byte, receiver_at, symbol),
+                        // A method, or a `super` call.
+                        _ => None,
+                    };
+                    if let Some(value) = answer {
+                        self.stack.truncate(receiver_at);
+                        self.stack.push(value);
+                        break 'call;
                     }
 
                     let start_from = if byte == code::SUPER {
@@ -3006,13 +3037,11 @@ impl Vm {
                                 RuntimeError::new("Cannot use 'super' outside of a method.")
                             })?
                     } else {
-                        let receiver_at = self.stack.len() - arity - 1;
                         let receiver = self.stack[receiver_at];
                         self.class_of(receiver)
                             .ok_or_else(|| RuntimeError::new("Receiver has no class."))?
                     };
 
-                    let receiver_at = self.stack.len() - arity - 1;
                     #[cfg(feature = "profile")]
                     {
                         *self

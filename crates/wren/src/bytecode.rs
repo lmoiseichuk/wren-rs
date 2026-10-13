@@ -183,22 +183,60 @@ pub enum Op {
     /// `LoadFieldThis` then `Return`. Operands: `u8` field, a dead byte.
     LoadFieldThisReturn = 25,
 
-    /// Invoke an operator or an intrinsic: a [`Op::Call`] whose signature is
-    /// one of the few the interpreter can answer without the method. Operands:
-    /// the [`operator`] inline where a call has its arity, then symbol `u16`.
-    ///
-    /// **The compiler decides, so the interpreter does not have to.** Every
-    /// call used to ask at run time whether its symbol named `+` or
-    /// `iterate(_)` -- an arity test, a symbol load and a table lookup -- and
-    /// a plain method call paid all of it to learn "no". The signature is a
-    /// string the compiler already holds, so it answers once: a `Call` is
-    /// now always a method, and this is always an operator.
-    ///
-    /// **The symbol stays.** A receiver the fast path does not cover -- a
-    /// string on the left of `+`, a user class defining `==` -- is called
-    /// exactly as a `Call` would call it, and needs the symbol for that. The
-    /// arity is implied by the operation; see [`operator::arity`].
-    CallOperator = 40,
+    // **The operators, one opcode each.** Each is a [`Op::Call`] whose
+    // signature is one of the fourteen the interpreter can answer without
+    // finding the method, laid out exactly as a `Call` is: the arity inline,
+    // then the symbol `u16`.
+    //
+    // **The compiler decides, so the interpreter does not have to.** Every
+    // call used to ask at run time whether its symbol named `+` or
+    // `iterate(_)`; then one `CallOperator` carried the operation where a call
+    // carries its arity, and its handler switched on it -- eight instructions
+    // of jump table on every `+`. The opcode is that switch, already taken:
+    // the dispatch that every instruction pays anyway lands on the code for
+    // `+` and nothing else.
+    //
+    // **The symbol and the arity stay.** A receiver the fast path does not
+    // cover -- a string on the left of `+`, a user class defining `==` -- is
+    // called exactly as a `Call` would call it, from the same unit, and needs
+    // both for that. The arity is the one [`operator::arity`] gives; a loaded
+    // file is held to it.
+    //
+    // **Numbered in one run, after everything else,** so the nine numeric
+    // operators are a contiguous range -- [`operator::is_numeric`] is a range
+    // test -- and no opcode before them is renumbered. 54 of the 64 a six-bit
+    // field holds.
+    /// `+(_)`: two numbers added in place, anything else called.
+    CallAdd = 40,
+    /// `-(_)`.
+    CallSubtract = 41,
+    /// `*(_)`.
+    CallMultiply = 42,
+    /// `/(_)`. In an integer build a zero divisor is called, so that the
+    /// primitive raises its error.
+    CallDivide = 43,
+    /// `%(_)`. As `/(_)` for a zero divisor.
+    CallModulo = 44,
+    /// `<(_)`.
+    CallLess = 45,
+    /// `>(_)`.
+    CallGreater = 46,
+    /// `<=(_)`.
+    CallLessEqual = 47,
+    /// `>=(_)`.
+    CallGreaterEqual = 48,
+    /// `iterate(_)`: answered in place for a range or a list.
+    CallIterate = 49,
+    /// `iteratorValue(_)`: answered in place for a range or a list.
+    CallIteratorValue = 50,
+    /// `==(_)`: answered in place for null, a boolean, or an instance whose
+    /// class kept `Object`'s.
+    CallEqual = 51,
+    /// `!=(_)`: as `==(_)`.
+    CallNotEqual = 52,
+    /// `!`, the one operator with no argument: answered in place for a
+    /// boolean, null, or an instance whose class kept `Object`'s.
+    CallNot = 53,
 }
 
 /// The opcodes as plain bytes, for matching the instruction stream directly.
@@ -220,7 +258,7 @@ pub mod code {
     /// loaded file whole and rejects an unknown opcode before it can run.
     /// `the_bound_on_opcodes_is_tight` keeps this honest when an `Op` is
     /// added.
-    pub const HIGHEST: u8 = Op::CallOperator as u8;
+    pub const HIGHEST: u8 = Op::CallNot as u8;
 
     pub const CONSTANT: u8 = Op::Constant as u8;
     pub const NULL: u8 = Op::Null as u8;
@@ -262,69 +300,88 @@ pub mod code {
     pub const LOAD_LOCAL_RETURN: u8 = Op::LoadLocalReturn as u8;
     pub const STORE_FIELD_THIS_POP: u8 = Op::StoreFieldThisPop as u8;
     pub const LOAD_FIELD_THIS_RETURN: u8 = Op::LoadFieldThisReturn as u8;
-    pub const CALL_OPERATOR: u8 = Op::CallOperator as u8;
+    pub const CALL_ADD: u8 = Op::CallAdd as u8;
+    pub const CALL_SUBTRACT: u8 = Op::CallSubtract as u8;
+    pub const CALL_MULTIPLY: u8 = Op::CallMultiply as u8;
+    pub const CALL_DIVIDE: u8 = Op::CallDivide as u8;
+    pub const CALL_MODULO: u8 = Op::CallModulo as u8;
+    pub const CALL_LESS: u8 = Op::CallLess as u8;
+    pub const CALL_GREATER: u8 = Op::CallGreater as u8;
+    pub const CALL_LESS_EQUAL: u8 = Op::CallLessEqual as u8;
+    pub const CALL_GREATER_EQUAL: u8 = Op::CallGreaterEqual as u8;
+    pub const CALL_ITERATE: u8 = Op::CallIterate as u8;
+    pub const CALL_ITERATOR_VALUE: u8 = Op::CallIteratorValue as u8;
+    pub const CALL_EQUAL: u8 = Op::CallEqual as u8;
+    pub const CALL_NOT_EQUAL: u8 = Op::CallNotEqual as u8;
+    pub const CALL_NOT: u8 = Op::CallNot as u8;
 }
 
-/// What a [`Op::CallOperator`] does when its receiver allows, carried in the
-/// instruction's inline operand.
+/// Which calls are operators: the fourteen signatures that have an opcode of
+/// their own, and what the compiler and the loader ask about them.
 ///
-/// **Part of the bytecode, not of the interpreter.** A `.wrenc` stores these
-/// numbers, so they are fixed the way opcode numbers are: a new one is added,
-/// an old one is never renumbered.
+/// **The opcode is the operation.** Under version 4 of `.wrenc` an operator
+/// was one opcode and the operation a number in its operand; the numbers this
+/// module held then are gone with it, and the opcode numbers in [`Op`] are
+/// the ones a file stores -- fixed the way every opcode number is.
 pub mod operator {
-    /// The numeric operators: pure arithmetic on two numbers. `==` and `!=`
-    /// are not among them -- they are defined on `Object` and answer for any
-    /// pair of values, so they are intrinsics below.
-    pub const ADD: u8 = 1;
-    pub const SUB: u8 = 2;
-    pub const MUL: u8 = 3;
-    pub const DIV: u8 = 4;
-    pub const MOD: u8 = 5;
-    pub const LT: u8 = 6;
-    pub const GT: u8 = 7;
-    pub const LE: u8 = 8;
-    pub const GE: u8 = 9;
-    /// The intrinsics: built-in methods answered in place when the receiver
-    /// is a built-in that really has them. See `INTRINSIC_ITERATE` in `vm`.
-    pub const ITERATE: u8 = 16;
-    pub const ITERATOR_VALUE: u8 = 17;
-    pub const EQ: u8 = 18;
-    pub const NE: u8 = 19;
-    pub const NOT: u8 = 20;
+    use super::Op;
 
-    /// The operation a method signature names, if it names one.
-    pub fn of(signature: &str) -> Option<u8> {
-        let operation = match signature {
-            "+(_)" => ADD,
-            "-(_)" => SUB,
-            "*(_)" => MUL,
-            "/(_)" => DIV,
-            "%(_)" => MOD,
-            "<(_)" => LT,
-            ">(_)" => GT,
-            "<=(_)" => LE,
-            ">=(_)" => GE,
-            "iterate(_)" => ITERATE,
-            "iteratorValue(_)" => ITERATOR_VALUE,
-            "==(_)" => EQ,
-            "!=(_)" => NE,
-            "!" => NOT,
+    /// The opcode a call to `signature` is compiled to when the interpreter
+    /// may answer it in place, or `None` for a plain [`Op::Call`].
+    ///
+    /// **Only the opcode the signature could have.** Whether the running VM
+    /// really has that method is a separate question, which
+    /// `Vm::operator_for` asks.
+    pub fn of(signature: &str) -> Option<Op> {
+        let op = match signature {
+            "+(_)" => Op::CallAdd,
+            "-(_)" => Op::CallSubtract,
+            "*(_)" => Op::CallMultiply,
+            "/(_)" => Op::CallDivide,
+            "%(_)" => Op::CallModulo,
+            "<(_)" => Op::CallLess,
+            ">(_)" => Op::CallGreater,
+            "<=(_)" => Op::CallLessEqual,
+            ">=(_)" => Op::CallGreaterEqual,
+            "iterate(_)" => Op::CallIterate,
+            "iteratorValue(_)" => Op::CallIteratorValue,
+            "==(_)" => Op::CallEqual,
+            "!=(_)" => Op::CallNotEqual,
+            "!" => Op::CallNot,
             _ => return None,
         };
-        Some(operation)
+        Some(op)
     }
 
-    /// Whether a byte is one of the operations above -- what a loaded file
-    /// is checked against, since the compiler writes nothing else.
-    pub fn is_known(operation: u8) -> bool {
-        matches!(operation, ADD..=GE | ITERATE..=NOT)
+    /// Whether `op` is one of the fourteen.
+    pub fn is_operator(op: Op) -> bool {
+        let byte = op as u8;
+        (Op::CallAdd as u8..=Op::CallNot as u8).contains(&byte)
     }
 
-    /// How many arguments the operation's method takes: `!` none, every
-    /// other one.
-    pub fn arity(operation: u8) -> usize {
-        match operation {
-            NOT => 0,
+    /// Whether `op` is one of the nine numeric operators: pure arithmetic on
+    /// two numbers, whose fast path asks nothing of a class.
+    ///
+    /// **`==` and `!=` are not among them.** They are defined on `Object` and
+    /// answer for any pair of values, so a number-only fast path for them
+    /// would be a second implementation of equality rather than a shortcut
+    /// through one; they are intrinsics, with `iterate(_)`,
+    /// `iteratorValue(_)` and `!`.
+    pub fn is_numeric(op: Op) -> bool {
+        let byte = op as u8;
+        (Op::CallAdd as u8..=Op::CallGreaterEqual as u8).contains(&byte)
+    }
+
+    /// How many arguments an operator's method takes: `!` none, every other
+    /// one.
+    ///
+    /// **Asked with the opcode's byte, and a `const fn`,** so that a threaded
+    /// handler generic over its opcode -- which has the byte, as a constant
+    /// -- gets the arity as a constant too, rather than reading it out of the
+    /// instruction.
+    pub const fn arity(opcode: u8) -> usize {
+        match opcode {
+            super::code::CALL_NOT => 0,
             _ => 1,
         }
     }
@@ -382,7 +439,20 @@ mod opcode_bytes {
             Op::LoadLocalReturn => code::LOAD_LOCAL_RETURN,
             Op::StoreFieldThisPop => code::STORE_FIELD_THIS_POP,
             Op::LoadFieldThisReturn => code::LOAD_FIELD_THIS_RETURN,
-            Op::CallOperator => code::CALL_OPERATOR,
+            Op::CallAdd => code::CALL_ADD,
+            Op::CallSubtract => code::CALL_SUBTRACT,
+            Op::CallMultiply => code::CALL_MULTIPLY,
+            Op::CallDivide => code::CALL_DIVIDE,
+            Op::CallModulo => code::CALL_MODULO,
+            Op::CallLess => code::CALL_LESS,
+            Op::CallGreater => code::CALL_GREATER,
+            Op::CallLessEqual => code::CALL_LESS_EQUAL,
+            Op::CallGreaterEqual => code::CALL_GREATER_EQUAL,
+            Op::CallIterate => code::CALL_ITERATE,
+            Op::CallIteratorValue => code::CALL_ITERATOR_VALUE,
+            Op::CallEqual => code::CALL_EQUAL,
+            Op::CallNotEqual => code::CALL_NOT_EQUAL,
+            Op::CallNot => code::CALL_NOT,
         }
     }
 
@@ -474,7 +544,20 @@ impl Op {
             37 => Op::ImportVariable,
             38 => Op::LoadLocalConstant,
             39 => Op::Closure,
-            40 => Op::CallOperator,
+            40 => Op::CallAdd,
+            41 => Op::CallSubtract,
+            42 => Op::CallMultiply,
+            43 => Op::CallDivide,
+            44 => Op::CallModulo,
+            45 => Op::CallLess,
+            46 => Op::CallGreater,
+            47 => Op::CallLessEqual,
+            48 => Op::CallGreaterEqual,
+            49 => Op::CallIterate,
+            50 => Op::CallIteratorValue,
+            51 => Op::CallEqual,
+            52 => Op::CallNotEqual,
+            53 => Op::CallNot,
             _ => return None,
         };
         Some(op)
@@ -499,7 +582,7 @@ pub const MAX_JUMP: usize = u16::MAX as usize / 2;
 
 /// Which bits of an instruction's first unit hold what. See [`Chunk::code`].
 ///
-/// Six bits of opcode is 64, against the 41 there are; two bits of length
+/// Six bits of opcode is 64, against the 54 there are; two bits of length
 /// cover one, two and three units, and the fourth value is the escape for the
 /// one instruction whose length is not fixed.
 pub const OPCODE_MASK: u16 = 0x3f;
@@ -828,8 +911,24 @@ impl Chunk {
             Op::LoadLocalConstant | Op::LoadLocalPair => (0, 2),
             Op::Pop | Op::CloseUpvalue | Op::StoreFieldThisPop => (1, 0),
             // Takes the receiver and its arguments, leaves the result.
-            Op::Call | Op::Super => (Chunk::inline_operand(unit) as i32 + 1, 1),
-            Op::CallOperator => (operator::arity(Chunk::inline_operand(unit)) as i32 + 1, 1),
+            // An operator carries its arity where a call does, so the two are
+            // read alike.
+            Op::Call
+            | Op::Super
+            | Op::CallAdd
+            | Op::CallSubtract
+            | Op::CallMultiply
+            | Op::CallDivide
+            | Op::CallModulo
+            | Op::CallLess
+            | Op::CallGreater
+            | Op::CallLessEqual
+            | Op::CallGreaterEqual
+            | Op::CallIterate
+            | Op::CallIteratorValue
+            | Op::CallEqual
+            | Op::CallNotEqual
+            | Op::CallNot => (Chunk::inline_operand(unit) as i32 + 1, 1),
             Op::LoadField => (1, 1),
             Op::StoreField => (2, 1),
             Op::Class => (2, 1),
@@ -1181,18 +1280,27 @@ pub fn disassemble(chunk: &Chunk) -> alloc::string::String {
                     chunk.code[offset + 1]
                 );
             }
-            Op::Call | Op::Super => {
+            // The operators are laid out as a call is, so they print as one;
+            // the opcode's own name already says which operation it is.
+            Op::Call
+            | Op::Super
+            | Op::CallAdd
+            | Op::CallSubtract
+            | Op::CallMultiply
+            | Op::CallDivide
+            | Op::CallModulo
+            | Op::CallLess
+            | Op::CallGreater
+            | Op::CallLessEqual
+            | Op::CallGreaterEqual
+            | Op::CallIterate
+            | Op::CallIteratorValue
+            | Op::CallEqual
+            | Op::CallNotEqual
+            | Op::CallNot => {
                 let _ = write!(
                     operand,
                     " arity {} symbol {}",
-                    Chunk::inline_operand(chunk.code[at]),
-                    chunk.code[offset]
-                );
-            }
-            Op::CallOperator => {
-                let _ = write!(
-                    operand,
-                    " operation {} symbol {}",
                     Chunk::inline_operand(chunk.code[at]),
                     chunk.code[offset]
                 );

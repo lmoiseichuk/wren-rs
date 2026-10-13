@@ -1812,7 +1812,7 @@ fn a_compiled_chunk_can_be_run_again() {
 /// The fast path may skip work; it must never change an answer.
 ///
 /// **Each of these is a case where the operands are not two numbers**, so the
-/// `Call` arm has to fall through to real dispatch. They are written out
+/// operator's handler has to fall through to real dispatch. They are written out
 /// because the fast path is taken *before* the receiver's class is known --
 /// that is the whole of its speed -- so the guard that sends these down the
 /// slow path is the only thing keeping them correct.
@@ -1934,53 +1934,337 @@ fn a_vm_built_from_a_manifest_runs_that_program_and_nothing_else() {
     }
 }
 
+/// The disassembly of `source`'s module body, compiled by `vm`.
+fn disassembly(vm: &mut Vm, source: &str) -> String {
+    let chunk = wren::compiler::compile(vm, source).expect("compiles");
+    wren::bytecode::disassemble(&chunk)
+}
+
 /// An operator a manifest leaves out is missing, however the code got here.
 ///
-/// **The fast path must not answer for a method that is not there.** `1 - 2`
-/// is compiled to an operator call only when `Num` really has `-(_)`; a VM
+/// **The fast path must not answer for a method that is not there.** `3 - 1`
+/// is compiled to `CallSubtract` only when `Num` really has `-(_)`; a VM
 /// built without it has to report the method missing, exactly as dispatch
-/// would. Two routes reach the interpreter and both are checked: source
-/// compiled by the tailored VM itself, and a `.wrenc` compiled by a full one,
-/// whose compiler did see `-(_)` and chose the operator.
+/// would. Two routes reach the interpreter and both are checked, for each of
+/// the nine numeric operators and for `!`: source compiled by the tailored VM
+/// itself, and a `.wrenc` compiled by a full one, whose compiler did see the
+/// method and chose the operator's opcode.
+///
+/// **`!` is the one intrinsic a manifest can leave out** -- `iterate(_)`,
+/// `iteratorValue(_)`, `==(_)` and `!=(_)` are in `core::ALWAYS` -- and it
+/// takes the other road to the same answer: the compiler emits `CallNot`
+/// whatever the VM has, and the handler declines because `Bool` does not
+/// answer `!`. The numeric operators never reach a handler at all; they are
+/// compiled, or settled on load, as a plain `Call`.
 #[test]
 fn an_operator_a_manifest_leaves_out_is_reported_missing() {
-    let without_minus: Vec<String> = ["print(_)", "+(_)"].iter().map(|name| name.to_string()).collect();
-    // The two routes fail with different error types, so each hands over
-    // its message.
-    let missing = |result: Result<(), String>, route: &str| match result {
-        Ok(()) => panic!("{route}: `-` ran without `Num.-(_)` installed"),
-        Err(message) => assert!(
-            message.contains("does not implement '-(_)'"),
-            "{route}: expected `-(_)` missing, got {message:?}"
-        ),
-    };
+    // (signature, a program that calls it, what a full VM prints, the opcode
+    // a full VM compiles it to, the receiver's class)
+    let cases = [
+        ("+(_)", "System.print(3 + 1)", "4\n", "CallAdd", "Num"),
+        ("-(_)", "System.print(3 - 1)", "2\n", "CallSubtract", "Num"),
+        ("*(_)", "System.print(3 * 2)", "6\n", "CallMultiply", "Num"),
+        ("/(_)", "System.print(6 / 3)", "2\n", "CallDivide", "Num"),
+        ("%(_)", "System.print(7 % 3)", "1\n", "CallModulo", "Num"),
+        ("<(_)", "System.print(1 < 2)", "true\n", "CallLess", "Num"),
+        (">(_)", "System.print(1 > 2)", "false\n", "CallGreater", "Num"),
+        ("<=(_)", "System.print(2 <= 2)", "true\n", "CallLessEqual", "Num"),
+        (">=(_)", "System.print(1 >= 2)", "false\n", "CallGreaterEqual", "Num"),
+        ("!", "System.print(!true)", "false\n", "CallNot", "Bool"),
+    ];
+    let every: Vec<&str> = cases.iter().map(|case| case.0).collect();
 
-    // Compiled here: the operator the VM has works, the one it lacks is missing.
-    let mut here = Vm::with_core_methods(&without_minus);
-    here.interpret("System.print(1 + 2)").expect("`+` is installed");
-    assert_eq!(here.output_str(), "3\n");
-    missing(
-        here.interpret("System.print(3 - 1)").map_err(|error| error.message().to_string()),
-        "compiled by the tailored VM",
+    for (left_out, source, printed, opcode, class) in cases {
+        // Everything the cases call except the one under test, so a failure
+        // names one missing method and not a different one.
+        let mut manifest: Vec<String> = vec!["print(_)".to_string()];
+        for signature in &every {
+            if *signature != left_out {
+                manifest.push(signature.to_string());
+            }
+        }
+        let expected = format!("{class} does not implement '{left_out}'");
+        // The two routes fail with different error types, so each hands over
+        // its message.
+        let missing = |result: Result<(), String>, route: &str| match result {
+            Ok(()) => panic!("{route}: `{left_out}` ran without it installed"),
+            Err(message) => assert!(
+                message.contains(&expected),
+                "{route}: expected {expected:?}, got {message:?}"
+            ),
+        };
+
+        // A full VM compiles it to the operator's own opcode -- which is what
+        // makes the `.wrenc` route below a test of the loader.
+        let compiled_by_full = disassembly(&mut Vm::new(), source);
+        assert!(
+            compiled_by_full.contains(&format!(" {opcode} arity ")),
+            "a full VM should compile {source:?} to {opcode}:\n{compiled_by_full}"
+        );
+
+        // Compiled here: the operator the VM lacks is missing.
+        let mut here = Vm::with_core_methods(&manifest);
+        missing(
+            here.interpret(source).map_err(|error| error.message().to_string()),
+            "compiled by the tailored VM",
+        );
+
+        // Compiled elsewhere, by a VM that had it.
+        let mut host = Vm::new();
+        let chunk = wren::compiler::compile(&mut host, source).expect("compiles");
+        let bytes = wren::wrenc::write(&host, &chunk, source.as_bytes()).expect("writes");
+        let mut tailored = Vm::with_core_methods(&manifest);
+        let loaded = wren::wrenc::load(&mut tailored, &bytes).expect("loads");
+        missing(
+            tailored.run_closure(loaded.closure).map_err(|error| error.message),
+            "loaded from a .wrenc",
+        );
+
+        // And the same file on a VM that has it runs.
+        let mut full = Vm::new();
+        let loaded = wren::wrenc::load(&mut full, &bytes).expect("loads");
+        full.run_closure(loaded.closure).expect("runs");
+        assert_eq!(full.output_str(), printed, "{source:?} on a full VM");
+    }
+
+    // The ones it kept still take their opcode: leaving `-(_)` out costs `-`
+    // its fast path and nothing else.
+    let without_minus: Vec<String> = ["print(_)", "+(_)"].iter().map(|name| name.to_string()).collect();
+    let mut tailored = Vm::with_core_methods(&without_minus);
+    let kept = disassembly(&mut tailored, "System.print(1 + 2)\nSystem.print(3 - 1)");
+    assert!(kept.contains(" CallAdd arity 1 "), "`+` keeps its opcode:\n{kept}");
+    assert!(!kept.contains("CallSubtract"), "`-` is a plain call:\n{kept}");
+    let mut tailored = Vm::with_core_methods(&without_minus);
+    tailored.interpret("System.print(1 + 2)").expect("`+` is installed");
+    assert_eq!(tailored.output_str(), "3\n");
+}
+
+/// Each of the fourteen operators compiles to an opcode of its own, laid out
+/// as a call.
+///
+/// **The arity is inline, as a `Call`'s is**, which is what lets a handler
+/// that declines pass its instruction to the method call unchanged.
+#[test]
+fn every_operator_compiles_to_an_opcode_of_its_own() {
+    let cases = [
+        ("1 + 2", "CallAdd", 1),
+        ("1 - 2", "CallSubtract", 1),
+        ("1 * 2", "CallMultiply", 1),
+        ("1 / 2", "CallDivide", 1),
+        ("1 % 2", "CallModulo", 1),
+        ("1 < 2", "CallLess", 1),
+        ("1 > 2", "CallGreater", 1),
+        ("1 <= 2", "CallLessEqual", 1),
+        ("1 >= 2", "CallGreaterEqual", 1),
+        ("[1].iterate(null)", "CallIterate", 1),
+        ("[1].iteratorValue(0)", "CallIteratorValue", 1),
+        ("1 == 2", "CallEqual", 1),
+        ("1 != 2", "CallNotEqual", 1),
+        ("!true", "CallNot", 0),
+    ];
+    for (expression, opcode, arity) in cases {
+        let text = disassembly(&mut Vm::new(), &format!("System.print({expression})"));
+        assert!(
+            text.contains(&format!(" {opcode} arity {arity} ")),
+            "{expression} should be {opcode} of arity {arity}:\n{text}"
+        );
+    }
+
+    // A `for` loop asks for the next value through the same two opcodes.
+    let looped = disassembly(&mut Vm::new(), "for (i in 1..2) System.print(i)");
+    assert!(looped.contains(" CallIterate arity 1 "), "{looped}");
+    assert!(looped.contains(" CallIteratorValue arity 1 "), "{looped}");
+
+    // And anything else is a method.
+    let method = disassembly(&mut Vm::new(), "System.print(\"abc\".count)");
+    assert!(method.contains(" Call arity 0 "), "{method}");
+    assert!(!method.contains("CallAdd"), "{method}");
+}
+
+/// Every operator's fast path answers, and every way it declines reaches the
+/// method.
+///
+/// **Each opcode has a handler of its own**, so each has its own fast path
+/// and its own way back to a call -- fourteen of each, where there were one.
+/// For every operator this runs a case the fast path answers, and cases it
+/// must hand on: a receiver of a class that defines the operator, and a
+/// built-in receiver the fast path does not cover, whose method then gives
+/// the answer or the error. Run with and without `tail-calls`, it takes both
+/// interpreters through all of them; in an integer build it also takes the
+/// one decline that is about a value rather than a type, division by zero.
+#[test]
+fn every_operator_answers_in_place_and_declines_to_the_method() {
+    // A class answering every operator with its own name, and one answering
+    // none, so `Object`'s methods are what it has.
+    let prelude = r#"
+        class Ops {
+            construct new() {}
+            +(other) { "+" }
+            -(other) { "-" }
+            *(other) { "*" }
+            /(other) { "/" }
+            %(other) { "%" }
+            <(other) { "<" }
+            >(other) { ">" }
+            <=(other) { "<=" }
+            >=(other) { ">=" }
+            ==(other) { "==" }
+            !=(other) { "!=" }
+            ! { "!" }
+            iterate(iterator) {
+                if (iterator == null) return 1
+                if (iterator < 3) return iterator + 1
+                return false
+            }
+            iteratorValue(iterator) { "v%(iterator)" }
+        }
+        class Plain {
+            construct new() {}
+        }
+        var ops = Ops.new()
+        var plain = Plain.new()
+    "#;
+    let printed = |expression: &str| run(&format!("{prelude}\nSystem.print({expression})"));
+    let failed = |expression: &str| error(&format!("{prelude}\nSystem.print({expression})"));
+
+    // (expression, what it prints). Integers only, so that every build --
+    // `f64`, `f32` and `nofp` -- agrees on the text.
+    let answered = [
+        // The fast paths.
+        ("7 + 5", "12"),
+        ("7 - 5", "2"),
+        ("7 * 5", "35"),
+        ("35 / 5", "7"),
+        ("7 % 5", "2"),
+        // Each comparison at, below and above equality, which tells it from
+        // every one of its neighbours.
+        ("4 < 5", "true"),
+        ("5 < 5", "false"),
+        ("6 < 5", "false"),
+        ("4 > 5", "false"),
+        ("5 > 5", "false"),
+        ("6 > 5", "true"),
+        ("4 <= 5", "true"),
+        ("5 <= 5", "true"),
+        ("6 <= 5", "false"),
+        ("4 >= 5", "false"),
+        ("5 >= 5", "true"),
+        ("6 >= 5", "true"),
+        ("(1..3).iterate(null)", "1"),
+        ("(1..3).iterate(1)", "2"),
+        ("[7, 8].iterate(null)", "0"),
+        ("(1..3).iteratorValue(2)", "2"),
+        ("[7, 8].iteratorValue(1)", "8"),
+        ("null == null", "true"),
+        ("true == false", "false"),
+        ("plain == plain", "true"),
+        ("null != false", "true"),
+        ("plain != plain", "false"),
+        ("!true", "false"),
+        ("!null", "true"),
+        ("!plain", "false"),
+        // A class that defines the operator: its method, by every route.
+        ("ops + 1", "+"),
+        ("ops - 1", "-"),
+        ("ops * 1", "*"),
+        ("ops / 1", "/"),
+        ("ops % 1", "%"),
+        ("ops < 1", "<"),
+        ("ops > 1", ">"),
+        ("ops <= 1", "<="),
+        ("ops >= 1", ">="),
+        ("ops.iterate(null)", "1"),
+        ("ops.iteratorValue(2)", "v2"),
+        ("ops == 1", "=="),
+        ("ops != 1", "!="),
+        ("!ops", "!"),
+        // A built-in receiver the fast path does not cover: its own method.
+        ("\"a\" + \"b\"", "ab"),
+        ("[1] + [2]", "[1, 2]"),
+        ("\"ab\".iterate(null)", "0"),
+        ("\"ab\".iteratorValue(1)", "b"),
+        ("1 == 1", "true"),
+        ("\"a\" == \"a\"", "true"),
+        ("1 != 2", "true"),
+        ("\"a\" != \"a\"", "false"),
+        ("!0", "false"),
+        ("!\"\"", "false"),
+    ];
+    for (expression, expected) in answered {
+        assert_eq!(printed(expression), format!("{expected}\n"), "{expression}");
+    }
+
+    // A loop over each kind of sequence: the range and the list in place, a
+    // user class through its own methods.
+    assert_eq!(
+        run(&format!("{prelude}\nfor (i in 1..3) System.print(i)")),
+        "1\n2\n3\n"
+    );
+    assert_eq!(
+        run(&format!("{prelude}\nfor (i in [4, 5]) System.print(i)")),
+        "4\n5\n"
+    );
+    assert_eq!(
+        run(&format!("{prelude}\nfor (i in ops) System.print(i)")),
+        "v1\nv2\nv3\n"
     );
 
-    // Compiled elsewhere, by a VM that had `-(_)`.
+    // A number on the left and something else on the right: declined, and
+    // `Num`'s own method raises its error. A non-number on the left with no
+    // such method: declined, and missing.
+    for operator in ["+", "-", "*", "/", "%", "<", ">", "<=", ">="] {
+        assert_eq!(
+            failed(&format!("1 {operator} \"x\"")),
+            "Right operand must be a number.",
+            "1 {operator} \"x\""
+        );
+        assert_eq!(
+            failed(&format!("plain {operator} 1")),
+            format!("Plain does not implement '{operator}(_)'."),
+            "plain {operator} 1"
+        );
+    }
+}
+
+/// An integer build declines to divide by zero, and the primitive raises it.
+///
+/// A float build has an infinity to answer with; an integer one would panic
+/// in Rust, so the fast path hands the call to the method instead.
+#[test]
+#[cfg(feature = "nofp")]
+fn an_integer_build_hands_division_by_zero_to_the_method() {
+    assert_eq!(error("System.print(1 / 0)"), "Cannot divide by zero.");
+    assert_eq!(error("System.print(1 % 0)"), "Cannot divide by zero.");
+    assert_eq!(run("System.print(7 / 2)"), "3\n", "and divides otherwise");
+}
+
+/// A `.wrenc` of version 4 is refused, not read as version 5.
+///
+/// **Version 4 kept every operator under one opcode, 40**, with its operation
+/// where version 5 keeps an arity, so read as this version each would run as
+/// `CallAdd` with a nonsense arity. Refusing it says so at load time, naming
+/// both versions; rebuilding it from its source is the remedy.
+#[test]
+fn a_version_4_wrenc_is_refused() {
     let source = "System.print(3 - 1)";
     let mut host = Vm::new();
     let chunk = wren::compiler::compile(&mut host, source).expect("compiles");
-    let bytes = wren::wrenc::write(&host, &chunk, source.as_bytes()).expect("writes");
-    let mut tailored = Vm::with_core_methods(&without_minus);
-    let loaded = wren::wrenc::load(&mut tailored, &bytes).expect("loads");
-    missing(
-        tailored.run_closure(loaded.closure).map_err(|error| error.message),
-        "loaded from a .wrenc",
-    );
-
-    // And the same file on a VM that has it runs.
-    let mut full = Vm::new();
-    let loaded = wren::wrenc::load(&mut full, &bytes).expect("loads");
-    full.run_closure(loaded.closure).expect("runs");
-    assert_eq!(full.output_str(), "2\n");
+    let mut bytes = wren::wrenc::write(&host, &chunk, source.as_bytes()).expect("writes");
+    // The version is the `u16` after the six bytes of magic.
+    bytes[6..8].copy_from_slice(&4u16.to_le_bytes());
+    let refusal = wren::wrenc::LoadError::WrongVersion {
+        found: 4,
+        expected: wren::wrenc::VERSION,
+    };
+    assert_eq!(wren::wrenc::VERSION, 5);
+    match wren::wrenc::load(&mut Vm::new(), &bytes) {
+        Ok(_) => panic!("a version-4 file loaded"),
+        Err(error) => assert_eq!(error, refusal),
+    }
+    match wren::wrenc::manifest(&bytes) {
+        Ok(_) => panic!("a version-4 file gave a manifest"),
+        Err(error) => assert_eq!(error, refusal),
+    }
 }
 
 /// A manifest that never names `List` must still let a program declare a class.
@@ -2047,8 +2331,8 @@ fn a_fused_local_pair_sees_the_value_it_just_pushed() {
     }
 }
 
-// **The intrinsics may skip a call, never change an answer.** The `Call` arm
-// answers `iterate(_)`, `iteratorValue(_)`, `==(_)`, `!=(_)` and `!` itself when
+// **The intrinsics may skip a call, never change an answer.** Their opcodes
+// answer `iterate(_)`, `iteratorValue(_)`, `==(_)`, `!=(_)` and `!` in place when
 // the receiver's class is known to hold the built-in method. Each test below
 // is a case where it must *not* answer, or must answer exactly as the
 // primitive would; each fails if the intrinsic ignores the condition it names.

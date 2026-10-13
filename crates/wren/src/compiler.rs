@@ -2427,18 +2427,16 @@ impl<'a> Compiler<'a> {
             return Err(self.error_at(self.previous, "Too many method names."));
         }
         // **An operator is told apart here, once, rather than on every call.**
-        // See `Op::CallOperator`: the interpreter then never asks whether a
-        // plain call might have been `+`.
-        match self.vm.operator_for(signature) {
-            Some(operation) => {
-                self.chunk_mut().emit_op(Op::CallOperator, line);
-                self.chunk_mut().emit_byte(operation, line);
-            }
-            None => {
-                self.chunk_mut().emit_op(Op::Call, line);
-                self.chunk_mut().emit_byte(arity as u8, line);
-            }
-        }
+        // `+(_)` becomes `CallAdd` and a method stays `Call`, so the
+        // interpreter never asks which a call is -- see the operators in
+        // `Op`. The two are laid out alike, the arity inline and the symbol
+        // after, so only the opcode depends on the answer.
+        let op = match self.vm.operator_for(signature) {
+            Some(operator) => operator,
+            None => Op::Call,
+        };
+        self.chunk_mut().emit_op(op, line);
+        self.chunk_mut().emit_byte(arity as u8, line);
         self.chunk_mut().emit_short(symbol as u16, line);
         Ok(())
     }
