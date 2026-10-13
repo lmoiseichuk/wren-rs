@@ -2267,6 +2267,123 @@ fn a_version_4_wrenc_is_refused() {
     }
 }
 
+/// `source` compiled by a full VM and written to a `.wrenc`, with the first
+/// unit of opcode `from` in its module body rewritten to opcode `to` and, if
+/// given, a different inline arity.
+///
+/// **How a file this compiler would never write is made.** The chunk's code
+/// is a public `Vec<u16>`, so the unit is changed there, before the writer
+/// renumbers the symbols, rather than by hunting for its two bytes in the
+/// output -- where the same pair could also turn up in the source's digest.
+/// A unit is the opcode in its low six bits, the instruction's length in the
+/// next two, and the inline operand -- a call's arity -- in the top eight.
+fn crafted(source: &str, from: u8, to: u8, arity: Option<u8>) -> Vec<u8> {
+    use wren::bytecode::{Chunk, OPCODE_MASK, OPERAND_SHIFT};
+
+    let mut host = Vm::new();
+    let mut chunk = wren::compiler::compile(&mut host, source).expect("compiles");
+    let mut found = false;
+    let mut at = 0;
+    while at < chunk.code.len() {
+        let unit = chunk.code[at];
+        if Chunk::opcode_of(unit) == from {
+            // Keep the length bits; replace the opcode, and the arity if
+            // asked.
+            let mut rewritten = (unit & !OPCODE_MASK) | u16::from(to);
+            if let Some(arity) = arity {
+                let low = rewritten & ((1 << OPERAND_SHIFT) - 1);
+                rewritten = low | (u16::from(arity) << OPERAND_SHIFT);
+            }
+            chunk.code[at] = rewritten;
+            found = true;
+            break;
+        }
+        match Chunk::instruction_units(&chunk.code, at) {
+            Some(length) => at += length,
+            None => break,
+        }
+    }
+    assert!(found, "{source:?} has no opcode {from}");
+    wren::wrenc::write(&host, &chunk, source.as_bytes()).expect("writes")
+}
+
+/// A loaded operator is the one its signature names, not the one the file
+/// wrote.
+///
+/// **The loader decides the opcode again from the symbol.** A file that
+/// paired `-(_)` with `CallAdd` would, if the opcode were trusted, add two
+/// numbers and send everything else to `-` -- so `3 - 1` would print `4`.
+/// Settled from the signature, it subtracts. Run with and without
+/// `tail-calls`, this holds in both interpreters.
+#[test]
+fn a_loaded_operator_is_the_one_its_signature_names() {
+    use wren::bytecode::code;
+
+    let bytes = crafted("System.print(3 - 1)", code::CALL_SUBTRACT, code::CALL_ADD, None);
+    let mut vm = Vm::new();
+    let loaded = wren::wrenc::load(&mut vm, &bytes).expect("loads");
+    vm.run_closure(loaded.closure).expect("runs");
+    assert_eq!(vm.output_str(), "2\n", "`-(_)` written as `CallAdd` must still subtract");
+}
+
+/// An operator whose inline arity is not its operator's is refused on load.
+///
+/// **The handlers take an operator's arity as given** -- the threaded ones as
+/// a constant -- so a `CallNot` carrying arity 1 would leave the stack a slot
+/// deeper than measured, and a `CallEqual` carrying 0 would reach `==(_)`'s
+/// primitive with its argument missing. The compiler writes neither, so the
+/// file is malformed and is refused, the same in both interpreters, rather
+/// than run as a plain `Call` that reads past the stack.
+#[test]
+fn an_operator_with_the_wrong_arity_is_refused() {
+    use wren::bytecode::code;
+
+    let wrong_arity = wren::wrenc::LoadError::Malformed("an operator with the wrong arity");
+    // (program, the opcode it compiles to, the opcode written instead, the
+    // arity written)
+    let cases = [
+        ("var x = true\nSystem.print(!x)", code::CALL_NOT, code::CALL_NOT, 1),
+        ("var a = 1\nvar b = 2\nSystem.print(a == b)", code::CALL_EQUAL, code::CALL_EQUAL, 0),
+        ("var a = 1\nvar b = 2\nSystem.print(a + b)", code::CALL_ADD, code::CALL_ADD, 2),
+        // The opcode's own arity agrees, but the signature's does not: `!`
+        // takes nothing, `==(_)` one.
+        ("var a = 1\nvar b = 2\nSystem.print(a == b)", code::CALL_EQUAL, code::CALL_NOT, 0),
+    ];
+    for (source, from, to, arity) in cases {
+        let bytes = crafted(source, from, to, Some(arity));
+        match wren::wrenc::load(&mut Vm::new(), &bytes) {
+            Ok(_) => panic!("{source:?} with opcode {to} of arity {arity} loaded"),
+            Err(error) => assert_eq!(error, wrong_arity, "{source:?}"),
+        }
+    }
+
+    // The right arity, written the same way, loads and runs: the refusal is
+    // the arity's, not the rewriting's.
+    let bytes = crafted("var x = true\nSystem.print(!x)", code::CALL_NOT, code::CALL_NOT, Some(0));
+    let mut vm = Vm::new();
+    let loaded = wren::wrenc::load(&mut vm, &bytes).expect("loads");
+    vm.run_closure(loaded.closure).expect("runs");
+    assert_eq!(vm.output_str(), "false\n");
+}
+
+/// An operator opcode on a method that is no operator is refused on load.
+///
+/// The compiler gives an operator's opcode only to the fourteen signatures in
+/// `operator::of`; a file that gives one to `count` was not written by it.
+#[test]
+fn an_operator_opcode_on_a_plain_method_is_refused() {
+    use wren::bytecode::code;
+
+    let bytes = crafted("System.print(\"abc\".count)", code::CALL, code::CALL_NOT, None);
+    match wren::wrenc::load(&mut Vm::new(), &bytes) {
+        Ok(_) => panic!("`count` as an operator loaded"),
+        Err(error) => assert_eq!(
+            error,
+            wren::wrenc::LoadError::Malformed("an operator names a method that is no operator")
+        ),
+    }
+}
+
 /// A manifest that never names `List` must still let a program declare a class.
 ///
 /// **The regression this guards.** A class a manifest rules out keeps

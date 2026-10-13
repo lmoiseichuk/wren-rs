@@ -140,7 +140,8 @@ fn table_operands(code: &[u16]) -> Result<Vec<(Table, usize)>, LoadError> {
                 found.push((Table::Symbol, at + 1))
             }
             // An operator is laid out as a call, so its symbol is in the same
-            // place. Its arity is settled on load; see `settle_operators`.
+            // place. Its arity is checked, and its opcode settled, on load;
+            // see `settle_operators`.
             op if crate::bytecode::operator::is_operator(op) => found.push((Table::Symbol, at + 1)),
             Op::LoadModuleVar | Op::StoreModuleVar => found.push((Table::Variable, at + 1)),
             _ => {}
@@ -676,7 +677,7 @@ fn read_function(
     }
 
     remap(&mut code, symbols, variables)?;
-    settle_operators(vm, &mut code);
+    settle_operators(vm, &mut code)?;
 
     let chunk = Chunk::from_parts(code, constants, lines);
     let max_slots = chunk.max_slots();
@@ -761,49 +762,78 @@ fn read_constant(
 /// that leaves `-(_)` out does not, and there `1 - 2` must report the method
 /// missing, as dispatch would. So each operator is asked the same question
 /// the compiler asks -- [`Vm::operator_for`] on its signature -- and becomes a
-/// plain `Call` if the answer is no.
+/// plain `Call` if the answer is no. That is the only downgrade there is.
 ///
 /// **The operator is taken from the signature, not from the file.** A file
 /// that paired `-(_)` with `CallAdd` would add numbers and subtract
-/// everything else; settled here it cannot. And an operator whose inline
-/// arity is not its method's becomes a plain `Call` of that arity: the
+/// everything else; settled here it cannot, and `3 - 1` is `2` whichever
+/// operator opcode the file wrote.
+///
+/// **An operator whose inline arity is not its operator's is refused.** The
 /// handlers take an operator's arity as given -- the threaded ones as a
-/// constant -- so by the time one runs, the two must agree.
+/// constant, from [`operator::arity`] -- so the arity the unit carries and
+/// the one its handler assumes must be the same number, or the stack ends up
+/// a slot deeper or shallower than `max_slots` measured. The compiler never
+/// writes such a unit, so a file holding one was not written by it.
+/// Downgrading it to a plain `Call` would not save it either: a `Call` of
+/// arity 0 to `==(_)` reaches the primitive with its argument missing, and
+/// the primitive reads past the stack. The same goes for an operator opcode
+/// whose symbol names no operator at all.
+///
+/// [`operator::arity`]: crate::bytecode::operator::arity
 ///
 /// **Only the opcode changes.** An operator carries its arity and symbol
 /// where a `Call` does, so the length bits and the inline arity stay, the
 /// instruction does not move, and the stack depths `max_slots` measures after
 /// this are the ones the compiler measured.
-fn settle_operators(vm: &Vm, code: &mut [u16]) {
+fn settle_operators(vm: &Vm, code: &mut [u16]) -> Result<(), LoadError> {
+    use crate::bytecode::operator;
+
     let mut at = 0;
     while at < code.len() {
         let unit = code[at];
         let written = match Op::from_byte(Chunk::opcode_of(unit)) {
             Some(op) => op,
             // The walk in `remap` has already refused an unknown opcode.
-            None => return,
+            None => return Ok(()),
         };
-        if crate::bytecode::operator::is_operator(written) {
+        if operator::is_operator(written) {
             let arity = Chunk::inline_operand(unit) as usize;
             let symbol = code[at + 1] as usize;
-            let decided = match vm.method_names.name(symbol) {
-                Some(signature) => vm.operator_for(signature),
-                None => None,
+            // The signature the call names, and the operator that signature
+            // is -- regardless of what this VM has, which is the next
+            // question. `remap` has made `symbol` one of this VM's own, so a
+            // missing name is a symbol table the file did not describe.
+            let signature = match vm.method_names.name(symbol) {
+                Some(signature) => signature,
+                None => return Err(LoadError::Malformed("an operator names no method")),
             };
+            let named = match operator::of(signature) {
+                Some(op) => op,
+                None => return Err(LoadError::Malformed("an operator names a method that is no operator")),
+            };
+            if operator::arity(named as u8) != arity {
+                return Err(LoadError::Malformed("an operator with the wrong arity"));
+            }
             // Everything but the opcode: the length and the inline arity.
             let rest = unit & !crate::bytecode::OPCODE_MASK;
-            code[at] = match decided {
-                Some(op) if crate::bytecode::operator::arity(op as u8) == arity => op as u16 | rest,
-                _ => Op::Call as u16 | rest,
+            code[at] = match vm.operator_for(signature) {
+                // This VM answers it in place: the operator the signature
+                // names, whatever the file wrote.
+                Some(op) => op as u16 | rest,
+                // A numeric operator this VM's `Num` lacks: a method call,
+                // which will report it missing.
+                None => Op::Call as u16 | rest,
             };
         }
         // The walk in `remap` has already refused a stream that does not
         // decode, so every length here is present.
         match Chunk::instruction_units(code, at) {
             Some(length) => at += length,
-            None => return,
+            None => return Ok(()),
         }
     }
+    Ok(())
 }
 
 /// Rewrite the symbol and variable operands to this VM's indices.
