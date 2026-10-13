@@ -1578,10 +1578,13 @@ fast path declines is handed to the method call unchanged.
 The threaded handlers are two definitions generic over the opcode,
 `call_numeric` and `call_intrinsic`; each instance has its operation as a
 constant, and `arithmetic`, shared with the `match` loop, folds to that one
-operation. The `match` loop keeps one call arm, because its long call cannot
-be fallen into from another arm, and dispatches inside it on the opcode -- but
-only when the opcode is in the operators' range, so a `Call` or a `Super`
-never enters that `match` at all.
+operation. The `match` loop was built twice. The first form is kept below as
+history, because what it got wrong is what the second form was built from.
+
+**The first form: one arm with a `match` inside.** The `match` loop kept one
+call arm, because its long call cannot be fallen into from another arm, and
+dispatched inside it on the opcode -- but only when the opcode was in the
+operators' range, so a `Call` or a `Super` never entered that `match` at all.
 
 **Measured on `c6b`, not on the board the tables above came from.** Both sides
 were built and flashed there -- `main` at 77a986c in a worktree, the branch at
@@ -1591,7 +1594,7 @@ placement gives `binary_trees` 2.528 s and `fib` 4.067 s, where the README
 has 2.530 and 4.068. Every image was flashed twice: the two runs agree to
 30 µs or better, and instructions retired to 1,400 in 70 million.
 
-| | f64 work | f64 time | `nofp` work | `nofp` time |
+| first form | f64 work | f64 time | `nofp` work | `nofp` time |
 |---|---|---|---|---|
 | threaded `binary_trees` | −3.87% | −3.47 to −3.88% | −3.86% | −3.24 to −4.26% |
 | threaded `fib` | −5.78% | −6.19 to −6.46% | −8.87% | −9.15 to −9.50% |
@@ -1620,40 +1623,38 @@ not `fib`: a `for` over a list reached `list_iterate` after 89 instructions
 before -- 20 in the operator handler deciding to hand over, 69 in
 `call_intrinsic` with a nine-register frame and its own switch on the
 operation -- and after 57 now, in an instance that saves seven registers and
-switches on nothing.
+switches on nothing. The threaded code is the same in both forms, so these
+figures are the threaded build's for X19 as a whole.
 
-**The `match` loop does less work and takes longer.** Every benchmark retires
-fewer instructions, in both modes, and none is reliably faster: `method_call`
-is 2.2-3.3% slower in f64 and up to 1.9% slower in `nofp` at every placement.
-Wall time over instructions at 160 MHz, at the committed placement, puts the
-cycles per instruction of the `match` loop at 1.25-1.29 before and 1.28-1.34
-after, on all four and in both
-modes, where the threaded build's did not move (`method_call` 1.149 and 1.151).
-So the instructions that went were cheap ones, or what is left stalls more.
-Which, is not yet measured: the cycle count (event 0) beside instructions
-retired, on the two `match` builds, is the reading that would say, and the
-disassembly of the call arm the place to look. What this rules out is
+**The first form's `match` loop does less work and takes longer.** Every
+benchmark retires fewer instructions, in both modes, and none is reliably
+faster: `method_call` is 2.2-3.3% slower in f64 and up to 1.9% slower in
+`nofp` at every placement. Wall time over instructions at 160 MHz, at the
+committed placement, puts the cycles per instruction of the `match` loop at
+1.25-1.29 before and 1.28-1.34 after, on all four and in both modes, where the
+threaded build's did not move (`method_call` 1.149 and 1.151). So the
+instructions that went were cheap ones, or what was left stalled more; the
+disassembly read for the second form below says which. What this rules out is
 placement: three paddings agree on the sign of `method_call` and of the f64
 sum.
 
-**By the acceptance rule** -- at least 1% on the four-benchmark sum of work,
-with time across placements deciding whether it holds:
+At the committed placement the first form moved the images by +1,808 B
+(threaded f64), +1,040 B (threaded `nofp`), +560 B (`match` f64) and +256 B
+(`match` `nofp`), and µwren by +80 B. No RAM: VM resident and every peak are
+unchanged. (`list_build`'s peak in threaded f64 read 8 B lower in one run; the
+same image's other run, and the tip's run below, read `main`'s 132,292 B, so
+that was the run and not the code.)
 
-| | work | time | by the rule |
-|---|---|---|---|
-| threaded f64 | −5.28% | −5.3 to −5.6% | **holds** |
-| threaded `nofp` | −6.87% | −7.0 to −7.3% | **holds** |
-| `match` f64 | −4.19% | +0.3 to +1.2% | **does not hold**: slower at every placement |
-| `match` `nofp` | −3.03% | −0.2 to +0.5% | **does not hold**: no gain in time |
-
-The two interpreters share the opcodes, so keeping the threaded gain and
-refusing the `match` loop's loss is not two independent choices: either the
-`match` loop's call arm is rebuilt until its time follows its work, or the
+By the acceptance rule the first form held for the threaded build and not
+for the `match` loop -- slower at every placement in f64, no gain in time in
+`nofp`. The two interpreters share the opcodes, so keeping the threaded gain
+and refusing the `match` loop's loss is not two independent choices: either
+the `match` loop's call arm is rebuilt until its time follows its work, or the
 change is weighed whole.
 
-**The call arm, rebuilt: each operator an arm of its own.** The `Call` and
-`Super` arm is back to the shape it had before the operators had opcodes,
-and each of the fourteen operators has an arm that is only its fast path --
+**The second form: each operator an arm of its own.** The `Call` and `Super`
+arm is back to the shape it had before the operators had opcodes, and each of
+the fourteen operators has an arm that is only its fast path --
 `answer_operator::<OPERATION>`, the same const-generic folding the threaded
 handlers use. What a fast path declines leaves its arm by a labelled `break`
 to one block after the `match`, which reads the arity and symbol again and
@@ -1665,7 +1666,7 @@ Read from the speed build's disassembly, from an arm's entry back to the
 dispatch (soft-float, `class_of`, `call_target` and `intrinsic` counted as
 the call to them):
 
-| path | `main` 77a986c | X19 ca4da8e | rebuilt |
+| path | `main` 77a986c | first form ca4da8e | second form |
 |---|---|---|---|
 | `f64` `+` | 64 | 47 | **28** |
 | `f64` `<` | 67 | 50 | **31** |
@@ -1676,52 +1677,85 @@ the call to them):
 | `nofp` method call | 109 | 104 | 101 |
 
 The method call is a Wren closure on an instance; to the call of `class_of`
-it is 16 instructions in both modes, against 20 and 19 on `main`. The loop's
-frame is unchanged -- 0x170 B in `f64`, 0x150 B in `nofp`, all twelve saved
-registers, the constant pool and field offset in stack slots as before --
-and the numeric arms make no stack access at all, where every operator on
-`main` passed through a call arm that spilled one register on entry in `f64`
-and two in `nofp`. The `Call` arm still spills two in `nofp`, as `main`'s
-did. The threaded build's code is byte for byte what it was.
+it is 16 instructions in both modes, against 20 and 19 on `main`. **What the
+comparison shows is where the first form's cycles went.** On `main` and in
+the first form every operator passed through the one call arm, whose entry
+spilled a register in `f64` and two in `nofp` and whose exit rebuilt the jump
+table's base: the first form took the lookup and the operation's switch out
+of that path but kept the arm's spills and reloads around it, so it removed
+cheap instructions and kept the ones that wait on memory. In the second form
+the numeric arms make no stack access at all. The loop's frame is unchanged
+-- 0x170 B in `f64`, 0x150 B in `nofp`, all twelve saved registers, the
+constant pool and field offset in stack slots as before -- and the `Call` arm
+still spills two in `nofp`, as `main`'s did. The method call is seven or eight
+instructions shorter than on `main`, and within three of the first form. The threaded build's code is byte for byte the first form's.
 
-Measured on `c6b` as above, all three trees in the same session, every image
-twice at padding 0, 4 and 8:
+Measured on `c6b` at the branch tip b6f66a5 against `main` 77a986c, both
+built and run in one session, every image twice at padding 0, 4 and 8. `main`
+was measured again in full rather than reused, and agrees with the first
+form's run: the same image sizes, every time within 11 µs, and the same
+instructions retired to within that run's spread.
 
-| against X19 (ca4da8e) | f64 work | f64 time | `nofp` work | `nofp` time |
+| second form, against `main` | f64 work | f64 time | `nofp` work | `nofp` time |
 |---|---|---|---|---|
-| `binary_trees` | −2.51% | −4.55 to −5.61% | −3.17% | −4.72 to −5.68% |
-| `fib` | −7.36% | −11.20 to −11.78% | −10.59% | −13.24 to −13.41% |
-| `list_build` | −3.27% | −4.83% | −7.96% | −9.20 to −9.46% |
-| `method_call` | −2.98% | −5.95 to −6.24% | −3.99% | −6.27 to −6.47% |
-| sum | **−5.18%** | **−8.35 to −9.01%** | **−7.14%** | **−9.44 to −9.74%** |
-| **against `main` (77a986c), sum** | **−9.15%** | **−7.35 to −8.65%** | **−9.96%** | **−9.10 to −9.51%** |
+| `match` `binary_trees` | −4.58% | −3.92 to −4.73% | −4.72% | −4.70 to −5.43% |
+| `match` `fib` | −12.89% | −10.35 to −11.99% | −14.50% | −12.99 to −13.60% |
+| `match` `list_build` | −5.21% | −4.33 to −4.39% | −11.33% | −9.44 to −10.11% |
+| `match` `method_call` | −4.45% | −2.89 to −4.16% | −5.13% | −4.73 to −5.30% |
+| `match` loop, sum | **−9.15%** | **−7.35 to −8.65%** | **−9.96%** | **−9.10 to −9.51%** |
 
-**Time follows work again, and then some.** Cycles per instruction at the
-committed placement are 1.26-1.29 in `f64` and 1.27-1.31 in `nofp`, back to
-`main`'s 1.25-1.29 from X19's 1.28-1.34. So what X19's `match` loop lost was
-not the instructions it removed but the shape it left: one arm whose
-registers served sixteen opcodes. Every benchmark is faster than `main` at
-every placement, in both modes. By the acceptance rule X19 now holds for both
-interpreters.
+Against the first form, measured the same way in an earlier session the same
+day with all three trees, the `match` loop's sums are −5.18% work and −8.35 to
+−9.01% time in f64, −7.14% and −9.44 to −9.74% in `nofp`; the tip's times
+agree with that session's images of the same code to 12 µs. The threaded
+build was flashed again at the tip at padding 4 in both modes: the same image
+sizes, every benchmark's instructions retired inside the first run's spread,
+times within 15 µs. Its figures above stand.
 
-µwren's `fib` (`-Os`, `nofp`, the `match` loop): 5.187 s on `main`, 5.140 s
-at ca4da8e and 4.373 s rebuilt as committed (−15.7% against `main`); 5.107,
-5.163 and 4.329 s with branch targets padded to four bytes (−15.2%). The X19
-figure is 5.140 s here against 5.236 s in the run above, the same source
-built in another directory: a path in the image moves the code, and at `-Os`
-with no padding that alone is worth 2%.
+**Time follows work again, nearly.** Every benchmark is faster than `main` at
+every placement, in both modes, the least of them `method_call` in f64 at
+padding 0, −2.9%. Cycles per instruction at the committed placement are
+1.26-1.28 in `f64` and 1.26-1.31 in `nofp`, against `main`'s 1.25-1.28 and
+1.27-1.29 in the same session and the first form's 1.28-1.34. Time trails
+work by up to 2.5 points, most in `fib`, where most came off -- so what
+remains of each instruction is slightly dearer, but the first form's loss is
+gone.
 
-**Flash and RAM.** At the committed placement the default build is 478,608
-B, +1,680 B on ca4da8e and +2,240 B on `main`; `nofp` 404,768 B, +1,760 B and
-+2,016 B; µwren 168,240 B, +1,296 B and +1,376 B. The fourteen arms each
-inline their arithmetic and its soft-float call. No RAM: VM resident and
-every peak are unchanged.
+µwren's `fib` (`-Os`, `nofp`, the `match` loop): 5.187 s on `main` and
+4.373 s at the tip as committed (−15.7%); 5.107 and 4.329 s with branch targets
+padded to four bytes (−15.2%). `main` repeats the first form's run to 1 µs.
+The first form's figure moved with the directory it was built in -- 5.236 s
+above, 5.140 s from a worktree in the session that measured all three trees,
+the same source: a path in the image moves the code, and at `-Os` with no
+padding that alone is worth 2%. The second form's gain is far past that.
 
-**Flash and RAM.** At the committed placement the images move by +1,808 B
-(threaded f64), +1,040 B (threaded `nofp`), +560 B (`match` f64) and +256 B
-(`match` `nofp`) -- 476,368 B to 476,928 B for the default build -- and µwren
-by +80 B. No RAM: VM resident and every peak are unchanged, but for
-`list_build`'s in threaded f64, 8 B lower.
+**Flash and RAM.** At the committed placement the `match` loop's default build
+is 478,608 B, +2,240 B on `main` (+1,680 B on the first form); `nofp` 404,768 B,
++2,016 B (+1,760 B); µwren 168,240 B, +1,376 B (+1,296 B). The fourteen arms
+each inline their arithmetic and its soft-float call. The threaded images are
+the first form's: +1,808 B and +1,040 B on `main`. No RAM: VM resident and
+every peak are `main`'s in every image measured, µwren's object peak too.
+
+**By the acceptance rule** -- at least 1% on the four-benchmark sum of work,
+with time across placements deciding whether it holds:
+
+| | work | time | by the rule |
+|---|---|---|---|
+| threaded f64 | −5.28% | −5.3 to −5.6% | **holds** |
+| threaded `nofp` | −6.87% | −7.0 to −7.3% | **holds** |
+| `match` f64, first form | −4.19% | +0.3 to +1.2% | does not hold: slower at every placement |
+| `match` `nofp`, first form | −3.03% | −0.2 to +0.5% | does not hold: no gain in time |
+| `match` f64, second form | −9.15% | −7.4 to −8.7% | **holds** |
+| `match` `nofp`, second form | −9.96% | −9.1 to −9.5% | **holds** |
+| µwren `fib`, second form | not counted | −15.7% and −15.2% | **holds** |
+
+**X19 holds as a whole, in its second form**: both interpreters, both modes,
+every benchmark at every placement faster than `main`, for 1.0-2.2 KB of flash
+and no RAM. What it costs in source is the decline path: `call_declined`
+repeats the `Call` arm's method call -- error delivery, fiber switch, halt,
+frame push -- so a change to one has to be made to the other.
+`a_declined_operator_runs_in_its_methods_own_frame` holds the reload of the
+module and field offset and the line an error carries.
 
 **A version-4 `.wrenc` is refused on load**, with a message naming both
 versions. Its opcode 40 was `CallOperator`, carrying an operation where a
