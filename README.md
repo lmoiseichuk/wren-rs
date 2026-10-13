@@ -67,80 +67,158 @@ The gap on the small parts is not another feature flag. Dropping the compiler,
 the transcendentals and 64-bit numbers is already possible — what is left is
 **the core library itself**, and it is now measured rather than asserted.
 
-**The crate is 111,640 B of flash** in a bytecode-only `-Os` build, the ESP
-HAL excluded because a CH32 would not link it. Where that goes:
+**The crate is 108,890 B of flash** in a bytecode-only `-Os` build at
+cac0550, the ESP HAL excluded because a CH32 would not link it. It was
+111,640 B when first counted, on 2026-09-20 at 7e864d3. Both columns are one
+configuration: `ports/esp32c6-wrenc-rs` with `wren`'s `alloc` and `libm` --
+64-bit numbers and the whole core library -- built `opt-level = "z"`, fat LTO,
+one codegen unit. Where it goes:
 
-| | bytes | |
-|---|---|---|
-| the machine — interpreter 23,962, heap and collector 8,564, handles 3,470, loader 3,398, value/object/bytecode/symbol 2,622 | **42,016** | 38% |
-| `Num` | 15,008 | 13% |
-| `core::install` — the signature strings and the binding calls | 9,306 | 8% |
-| `String` | 8,638 | 8% |
-| `List` 6,016, `Map` 3,372, `Sequence` 3,008 | 12,396 | 11% |
-| core helpers — indexing, bitwise, the hash probe | 2,912 | 3% |
-| `random` 2,460, `meta` 746 | 3,206 | 3% |
-| Rust monomorphisations — `BTreeMap<String, usize>` 1,320, two sorts 1,412, `str` pattern search 368 | 3,100 | 3% |
-| `Range` 1,320, `Fiber` 1,018, `System` 858, `Object`/`Class` 752, `Bool`/`Null` 398, `Fn` 308 | 4,654 | 4% |
+| | 7e864d3 | cac0550 | |
+|---|---|---|---|
+| **the machine** | 42,016 | **43,032** | 40% |
+| — interpreter | 23,962 | 26,476 | |
+| — heap and collector | 8,564 | 8,830 | |
+| — handles | 3,470 | 206 | |
+| — loader | 3,398 | 4,492 | |
+| — value, object, bytecode, symbol | 2,622 | 3,028 | |
+| `Num` | 15,008 | **15,064** | 14% |
+| `core::install` — the binding calls | 9,306 | **7,962** | 7% |
+| `String` | 8,638 | **6,798** | 6% |
+| `List`, `Map`, `Sequence` | 6,016, 3,372, 4,356 | 5,950, 3,370, 4,358 | 13% |
+| core helpers — indexing, bitwise, the hash probe, search and trim, iteration | 7,012 | **8,782** | 8% |
+| `random`, `meta` | 2,460, 746 | 2,466, 688 | 3% |
+| Rust monomorphisations — `BTreeMap`, sorts, `str`, `Vec` and the rest | 7,822 | **5,772** | 5% |
+| `Range`, `Fiber`, `System`, `Object`/`Class`, `Bool`/`Null`, `Fn` | 4,654 | 4,342 | 4% |
+| `math` | 234 | 234 | |
+| the frozen core's class lookup | — | 72 | |
+| **total** | **111,640** | **108,890** | |
 
-**The core library is 55 KB of the 111 KB — about half**, which is what the
-paragraph above used to claim without a number behind it. The machine is the
-other 42 KB, and a 62 KB part needs both to come down.
+**The core library is 59,852 B of the 108,890 -- 55%**, which is what this
+section used to claim without a number behind it; it was 61,568 B. The machine
+is 43,032 B, and a 62 KB part needs both to come down.
+
+**Counted by [`tools/uwren-breakdown.py`](tools/uwren-breakdown.py)**, which
+builds the port at any commit in a worktree of its own and attributes the
+image's symbols; its header says how every byte is assigned. A symbol is
+`wren`'s when its mangled name carries the crate, so generic code `wren`
+instantiated counts, and its row is the first `wren::` module in its demangled
+name; inside `wren::core`, the class an `install_` function is named for. The
+rows add up to the total, and the tool checks that they do.
+
+**The table first published here left 10,404 B in no row.** It was the same
+build's symbols grouped by hand, from rules that missed `wren::core`'s own
+module -- it is mangled `s_4core`, not `4core` -- and `install_lazy_sequences`;
+its core helpers were seven named functions and its monomorphisations four, and
+its percentages added to 91. `--rules 2026-09-20` reproduces every row of it
+to the byte; the 7e864d3 column above is the same image counted completely.
+
+Three limits on what a row means:
+
+- **What fat LTO inlines is counted where it landed**, and generic code under
+  the `wren` type it was instantiated for: 4,472 B of the total, 1,616 B of it
+  `drop_glue::<Vm>` in the interpreter's row. `--detail` lists every symbol
+  under its row.
+- **`core::install`'s row is code.** The signature strings it passes are
+  anonymous `.rodata`, which no symbol owns; they are not in any figure here
+  and were not measured.
+- **The checkout's path moves the build by a few tens of bytes.** Cargo hashes
+  a path dependency's location into every symbol name, and fat LTO's inlining
+  follows the order that gives: 7e864d3 built in four directories came out at
+  111,640 (twice), 111,682 and 111,698 B. The tool builds each commit at a
+  path fixed by the commit, so its own figure repeats -- 111,698 for 7e864d3
+  in both of two runs, 108,890 for cac0550 in all of five -- but a difference
+  of that size between two commits is not a finding.
+
+What moved since 2026-09-20, read from `--detail` on both sides:
+
+- **The interpreter, +2,514 B.** Start-up became `Vm::build` and the frozen
+  core's path, 2,062 B to 2,768; `intrinsic`, which answers iteration, equality
+  and `!` on built-in types without a call, arrived with b9aadc2, 816 B; and
+  X19 gave `run_frames` an arm per operator, +504 B, and `call_declined`,
+  782 B.
+- **Handles, −3,264 B, and `BTreeMap`, −2,124 B**, both in e1bf704: 3,264 of
+  the old 3,470 B of handles were a stable sort of `(usize, ObjectId)` pairs,
+  replaced by counting, and the symbol table's `BTreeMap<String, usize>` was
+  replaced by a scan.
+- **The loader, +1,094 B**: the manifest read back, the stack-depth check,
+  X18's operator names and `LoadError::message`.
+- **`String` −1,840 B and the core helpers +1,770 B.** 2238f4f folded the
+  search and trim families into three shared helpers, 918 B; b9aadc2 moved
+  iteration into `range_iterate` and `list_iterate`, 558 B, which is also why
+  `Range` fell by 258 B; 89eeb84 added `new_metaclass`, 218 B.
+- **`core::install`, −1,344 B**: `Sequence`'s bindings became a table walked
+  by one loop (506ec07), and the metaclass block one helper (89eeb84).
+
+X18 and X19 counted alone, each side built and counted the same way: +478 B
+and +1,546 B, the second inside the 1.0-2.2 KB X19 added to the images in
+[`profiling.md`](doc/wren-rs/profiling.md).
+
+**As shipped the port builds `uwren`**, integer-only: 89,274 B by the same
+count (`--as-shipped`), of which `Num` is 3,186 B. There `core::install` has no
+row of its own -- fat LTO inlined it into `Vm::build_frozen`, in the
+interpreter's 32,492 B.
 
 What the table says to remove, largest first:
 
-- **`Num`, 15,008 B, and almost none of it is arithmetic.** The operators are
+- **`Num`, 15,064 B, and almost none of it is arithmetic.** The operators are
   a few hundred bytes; the bulk is `toString` — float-to-decimal formatting
   pulls in a large chunk of Rust's formatting machinery — plus parsing and the
   numeric conversions. An integer-only `toString` is the single biggest cut
   available anywhere in the crate.
-- **`core::install`, 9,306 B**, is the signature strings and one `define` call
-  per method. It shrinks in direct proportion to how many methods survive, so
-  every class dropped below is paid twice.
-- **`String`, 8,638 B** — interpolation, `split`, `indexOf`, the UTF-8 rules,
-  and Rust's substring search with it. A node that formats one number wants a
-  fraction of this.
-- **`Map`, `Sequence` and `List` together, 12,396 B.** A program that reports a
+- **`core::install`, 7,962 B**, is one `define` call per method, with the
+  signature strings beside it in `.rodata`. It shrinks in direct proportion to
+  how many methods survive, so every class dropped below is paid twice.
+- **`String`, 6,798 B**, and 918 B of search and trim helpers — interpolation,
+  `split`, `indexOf`, the UTF-8 rules, and Rust's substring search with it. A
+  node that formats one number wants a fraction of this.
+- **`Map`, `Sequence` and `List` together, 13,678 B.** A program that reports a
   reading needs a list at most; the lazy `map`/`where`/`take`/`skip` protocol
   and a hash table are what a workstation language is for.
-- **The `.wrenc` loader, 3,398 B**, is only needed to *parse* bytecode. A part
+- **The `.wrenc` loader, 4,492 B**, is only needed to *parse* bytecode. A part
   that links one program at a fixed layout does not parse anything.
-- **`random` and `meta`, 3,206 B**, are optional modules already built lazily.
-- **The symbol table's `BTreeMap<String, usize>`, 1,320 B plus its sorts.**
-  Method signatures are fixed once the core is installed, so a sorted `Vec` or
-  a table computed at build time would remove the map and the string
-  comparisons behind it.
-- **`Fiber`, 1,018 B** plus the switch and park machinery inside the
-  interpreter's 23,962 B.
+- **`random` and `meta`, 3,154 B**, are optional modules already built lazily.
+- **The one sort left, 2,540 B**, is compaction's, of `(u32, u32, u32)` runs of
+  instance fields; the symbol table's map and the handles' sort are gone.
+- **`Fiber`, 1,020 B** plus the switch and park machinery inside the
+  interpreter's 26,476 B.
 
 That is a route to roughly 55 KB, which fits a CH32V006's flash and leaves
 little for the program. Two changes go further, and both are changes to the
 *language* rather than to this build of it — which is what makes µwren a
 separate deliverable rather than a feature flag.
 
-**No floating point at all — 34,654 B, and it is not in the figures above.**
+**No floating point at all — 34,912 B, and it is not in the figures above.**
 Those counted `wren`-crate symbols; this is Rust's own `core`, linked because
-Wren has one numeric type and it is an `f64`:
+Wren has one numeric type and it is an `f64`. Counted in the same cac0550
+image (`tools/uwren-breakdown.py --keep` leaves it in place) with `llvm-nm -S`:
+every sized symbol under `core::num::imp::dec2flt`, `flt2dec` and `bignum`,
+`core::fmt::float`, and `f64::from_str`:
 
 | | bytes |
 |---|---|
 | `dec2flt::POWER_OF_FIVE_128` — one table, for parsing decimals | 10,416 |
-| Dragon and Grisu, shortest and exact formatting | 13,700 |
+| Dragon and Grisu, shortest and exact formatting, and Dragon's big integers | 13,500 |
 | `f64::from_str` | 3,712 |
-| `CACHED_POW10`, `digits_to_dec_str`, the `fmt::float` entry points | 6,826 |
+| the rest of parsing — Lemire's algorithm and the slow-path decimal | 2,486 |
+| `CACHED_POW10`, `digits_to_dec_str`, the `fmt::float` entry points | 4,798 |
+
+(The 2026-09-20 count was 34,654 B, grouped by a rule that was not recorded.)
 
 `--features f32` narrows this; it does not remove it, because an `f32` still
 formats and still parses. An integer-only µwren removes all of it — and takes
 the NaN tagging with it, because that representation *is* an `f64` bit
 pattern, so the value type would become a tagged 32-bit word. Between this and
-`Num`'s own 15,008 B, **arithmetic that is not floating point is the single
-largest saving available**, worth more than the whole core library.
+`Num`'s own 15,064 B, **arithmetic that is not floating point is the single
+largest saving available**: 49,976 B, more than the rest of the core library
+put together (44,788 B).
 
 **And the compiler already knows what a program uses.** A `.wrenc` names every
 method signature it calls and every class it touches — that is what the symbol
 and variable tables in the file *are*. Emitting that as a manifest beside the
 bytecode would let a firmware build link only the core it needs: `core::install`
-is 9,306 B of signature strings and one binding call per method, and it shrinks
-in exact proportion to what the manifest asks for. A program that never sorts a
+is 7,962 B of binding calls, one per method, beside their signature strings,
+and it shrinks in exact proportion to what the manifest asks for. A program that never sorts a
 list does not need `Sequence`; one that never interpolates does not need most of
 `String`; and neither has to be decided by hand or by a cargo feature, because
 the program already said.
